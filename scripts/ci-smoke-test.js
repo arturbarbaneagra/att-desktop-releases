@@ -145,6 +145,24 @@ function dumpUninstallEntries() {
   try { return ps(script) || '(none)'; } catch (e) { return '(dump failed: ' + e.message + ')'; }
 }
 
+// Pull a .exe path out of an (Quiet)UninstallString value.
+function parseExePath(s) {
+  if (!s) return null;
+  const m = String(s).match(/"([^"]+\.exe)"/i) || String(s).match(/([A-Za-z]:\\[^"]+?\.exe)/i);
+  return m ? m[1] : null;
+}
+
+// electron-builder per-user oneClick installs frequently leave InstallLocation
+// EMPTY in the uninstall key, so derive the install dir + uninstaller path from
+// the UninstallString / QuietUninstallString (which always carry the real path).
+function resolvePaths(entry) {
+  const uninst = parseExePath(entry.QuietUninstallString) || parseExePath(entry.UninstallString);
+  const dir = (entry.InstallLocation && entry.InstallLocation.trim())
+    ? entry.InstallLocation.trim()
+    : (uninst ? path.dirname(uninst) : null);
+  return { installDir: dir, uninstExe: uninst || (dir ? path.join(dir, `Uninstall ${PRODUCT}.exe`) : null) };
+}
+
 function main() {
   if (process.platform !== 'win32') {
     fail('this smoke test must run on Windows (windows-latest CI runner)');
@@ -194,10 +212,10 @@ function main() {
     log(`registered uninstall entries: ${dumpUninstallEntries()}`);
     fail('no uninstall registry entry after base install');
   }
-  if (!entry.InstallLocation) fail('registry entry has no InstallLocation');
-  const installDir = entry.InstallLocation;
+  const { installDir, uninstExe } = resolvePaths(entry);
+  if (!installDir) fail(`could not determine install dir from registry entry: ${JSON.stringify(entry)}`);
+  if (!uninstExe) fail(`could not determine uninstaller path from registry entry: ${JSON.stringify(entry)}`);
   const appExe = path.join(installDir, `${PRODUCT}.exe`);
-  const uninstExe = path.join(installDir, `Uninstall ${PRODUCT}.exe`);
 
   if (!waitFor(() => fs.existsSync(appExe), 30000, 1500)) fail(`app exe missing after install: ${appExe}`);
   if (!waitFor(() => fs.existsSync(uninstExe), 30000, 1500)) fail(`uninstaller missing after install: ${uninstExe}`);
