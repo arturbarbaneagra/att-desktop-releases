@@ -170,13 +170,14 @@ function main() {
 
   log(`product="${PRODUCT}" base=${BASE_VER} next=${NEXT_VER}`);
 
-  // Make sure any stale registration from a previous run is gone.
+  // Make sure any stale registration from a previous run is gone. Per-user
+  // oneClick installs leave InstallLocation empty, so resolve via resolvePaths.
   const stale = registryEntry();
-  if (stale && stale.InstallLocation) {
-    const staleUninst = path.join(stale.InstallLocation, `Uninstall ${PRODUCT}.exe`);
-    if (fs.existsSync(staleUninst)) {
+  if (stale) {
+    const { installDir: staleDir, uninstExe: staleUninst } = resolvePaths(stale);
+    if (staleUninst && fs.existsSync(staleUninst)) {
       log('removing stale prior install…');
-      try { silentUninstall(staleUninst, stale.InstallLocation); } catch (e) { /* best effort */ }
+      try { silentUninstall(staleUninst, staleDir); } catch (e) { /* best effort */ }
     }
   }
 
