@@ -51,9 +51,11 @@ function ps(command) {
 }
 
 // Run a command, streaming output; throw on non-zero exit.
+// shell:true is required on Windows so `npx` resolves to `npx.cmd` (otherwise
+// execFileSync throws ENOENT — it won't append the .cmd extension itself).
 function run(cmd, args, opts) {
   log(`$ ${cmd} ${args.join(' ')}`);
-  execFileSync(cmd, args, Object.assign({ stdio: 'inherit', cwd: ROOT }, opts || {}));
+  execFileSync(cmd, args, Object.assign({ stdio: 'inherit', cwd: ROOT, shell: true }, opts || {}));
 }
 
 const setupName = (ver) => `A-Traders-Tool-${ver}-setup.exe`;
