@@ -1,0 +1,63 @@
+{
+  "name": "a-traders-tool-desktop",
+  "productName": "A Trader's Tool",
+  "version": "1.1.9",
+  "description": "Desktop shell for atraderstool.com",
+  "main": "main.js",
+  "private": true,
+  "author": "A Trader's Tool",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win portable --publish never",
+    "build:win:installer": "electron-builder --win nsis --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.atraderstool.desktop",
+    "productName": "A Trader's Tool",
+    "compression": "store",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "fallback.html",
+      "assets/**"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "arturbarbaneagra",
+        "repo": "att-desktop-releases"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "A-Traders-Tool-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "A-Traders-Tool-${version}-setup.exe"
+    },
+    "portable": {
+      "artifactName": "A-Traders-Tool-${version}-portable.exe"
+    }
+  }
+}

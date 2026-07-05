@@ -1,0 +1,9 @@
+# Desktop source repo (att-desktop) ignore rules. Mirrors the monorepo's rules
+# for the desktop/ folder so the standalone source repo stays clean.
+node_modules/
+dist/
+dist-next/
+
+# Keep only the committed exe icon out of build/ (regenerated from assets/icon.png)
+build/*
+!build/icon.ico
