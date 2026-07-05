@@ -112,6 +112,39 @@ function waitFor(predicate, timeoutMs, everyMs) {
   return predicate();
 }
 
+// Poll for the uninstall registry entry to appear (optionally with a specific
+// DisplayVersion). NSIS silent installs commit the registry write after the
+// launcher process returns, so a single immediate lookup races the installer.
+// Returns the entry object once matched, or the last-seen value on timeout.
+function waitForRegistry(expectedVer, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let e = registryEntry();
+  while (Date.now() < deadline) {
+    if (e && (!expectedVer || e.DisplayVersion === expectedVer)) return e;
+    ps('Start-Sleep -Milliseconds 2000');
+    e = registryEntry();
+  }
+  return e;
+}
+
+// Diagnostics: dump every registered uninstall DisplayName/Version so a naming
+// mismatch (vs the exact PRODUCT string) is visible in the log immediately.
+function dumpUninstallEntries() {
+  const script = `
+    $paths = @(
+      'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+      'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+      'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+    )
+    Get-ChildItem $paths -ErrorAction SilentlyContinue |
+      ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+      Where-Object { $_.DisplayName } |
+      Select-Object DisplayName,DisplayVersion |
+      ConvertTo-Json -Compress
+  `;
+  try { return ps(script) || '(none)'; } catch (e) { return '(dump failed: ' + e.message + ')'; }
+}
+
 function main() {
   if (process.platform !== 'win32') {
     fail('this smoke test must run on Windows (windows-latest CI runner)');
@@ -156,15 +189,18 @@ function main() {
   log('installing base version silently…');
   silentInstall(baseSetup);
 
-  let entry = registryEntry();
-  if (!entry) fail('no uninstall registry entry after base install');
+  let entry = waitForRegistry(BASE_VER, 120000);
+  if (!entry) {
+    log(`registered uninstall entries: ${dumpUninstallEntries()}`);
+    fail('no uninstall registry entry after base install');
+  }
   if (!entry.InstallLocation) fail('registry entry has no InstallLocation');
   const installDir = entry.InstallLocation;
   const appExe = path.join(installDir, `${PRODUCT}.exe`);
   const uninstExe = path.join(installDir, `Uninstall ${PRODUCT}.exe`);
 
-  if (!fs.existsSync(appExe)) fail(`app exe missing after install: ${appExe}`);
-  if (!fs.existsSync(uninstExe)) fail(`uninstaller missing after install: ${uninstExe}`);
+  if (!waitFor(() => fs.existsSync(appExe), 30000, 1500)) fail(`app exe missing after install: ${appExe}`);
+  if (!waitFor(() => fs.existsSync(uninstExe), 30000, 1500)) fail(`uninstaller missing after install: ${uninstExe}`);
   if (entry.DisplayVersion !== BASE_VER) {
     fail(`registered version ${entry.DisplayVersion} != base ${BASE_VER}`);
   }
@@ -174,9 +210,9 @@ function main() {
   log('installing next version over the base (simulated auto-update)…');
   silentInstall(nextSetup);
 
-  entry = registryEntry();
+  entry = waitForRegistry(NEXT_VER, 120000);
   if (!entry) fail('no registry entry after in-place update');
-  if (!fs.existsSync(appExe)) fail(`app exe missing after update: ${appExe}`);
+  if (!waitFor(() => fs.existsSync(appExe), 30000, 1500)) fail(`app exe missing after update: ${appExe}`);
   if (entry.DisplayVersion !== NEXT_VER) {
     fail(`after update, registered version ${entry.DisplayVersion} != next ${NEXT_VER}`);
   }
