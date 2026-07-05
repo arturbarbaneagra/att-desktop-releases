@@ -71,7 +71,7 @@ function registryEntry() {
     )
     $e = Get-ChildItem $paths -ErrorAction SilentlyContinue |
       ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-      Where-Object { $_.DisplayName -eq "${PRODUCT}" } |
+      Where-Object { $_.DisplayName -like "${PRODUCT}*" } |
       Select-Object -First 1 DisplayName,DisplayVersion,InstallLocation,QuietUninstallString,UninstallString
     if ($e) { $e | ConvertTo-Json -Compress } else { '' }
   `;
