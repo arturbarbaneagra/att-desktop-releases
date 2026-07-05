@@ -31,7 +31,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      # npm 10.x (bundled with older Node) intermittently crashes on the Windows
+      # runner with "Exit handler never called!" — it exits 0 but installs
+      # nothing, leaving node_modules empty (so electron-builder can't find
+      # Electron). npm 11 fixes this. Node 22 also clears the EBADENGINE warnings
+      # from node-abi / @electron/rebuild (they require Node >= 22.12).
+      - name: Upgrade npm to 11 (fixes "Exit handler never called!")
+        run: npm install -g npm@11
 
       - name: Install dependencies
         run: npm ci
