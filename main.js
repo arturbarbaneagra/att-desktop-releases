@@ -26,6 +26,10 @@ const RELEASES_URL = 'https://github.com/arturbarbaneagra/att-desktop-releases/r
 const FEATURE_IDS = [
   'main', 'terminal', 'mywallets', 'wallets', 'splashes', 'arbs', 'oracle', 'marklast',
   'indexlast', 'stockarb', 'biglimits', 'screener', 'listings',
+  // A throwaway "scratch" Terminal workspace in its own window. Opens empty every
+  // launch (its layout is deliberately not saved) but the WINDOW itself is
+  // reopened-on-launch like any other feature window via the machinery below.
+  'terminal_scratch',
 ];
 
 let mainWindow = null;
@@ -241,6 +245,31 @@ function wireWindowNav(win) {
     if (errorCode === -3) return; // ERR_ABORTED (in-page nav etc.)
     showFallback(win, validatedURL);
   });
+
+  // Games-style fullscreen escape hatch (MANDATORY): F11 toggles fullscreen and
+  // Esc exits it at the MAIN-PROCESS level, so a user can never be trapped with
+  // the taskbar/Start button hidden even if the renderer button is broken or
+  // off-screen. Handled here (before-input-event) so it works in every window.
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    if (input.key === 'F11') {
+      event.preventDefault();
+      try { win.setFullScreen(!win.isFullScreen()); } catch (e) { /* non-fatal */ }
+    } else if (input.key === 'Escape' && win.isFullScreen()) {
+      event.preventDefault();
+      try { win.setFullScreen(false); } catch (e) { /* non-fatal */ }
+    }
+  });
+
+  // Reflect the REAL fullscreen state back to the renderer button (covers the
+  // panel toggle, tray toggle, F11/Esc, and any OS-driven change), and re-push
+  // it after each (re)load so the button label is right on Ctrl+R / offline retry.
+  const notifyFullscreen = () => {
+    try { win.webContents.send('att:fullscreen-changed', win.isFullScreen()); } catch (e) { /* non-fatal */ }
+  };
+  win.on('enter-full-screen', notifyFullscreen);
+  win.on('leave-full-screen', notifyFullscreen);
+  win.webContents.on('did-finish-load', notifyFullscreen);
 }
 
 // Permission allowlist for the shared app session (set once; all windows on the
@@ -755,6 +784,46 @@ ipcMain.on('att:zoom-changed', (event, factor) => {
 });
 
 // ---------------------------------------------------------------------------
+// Restart + games-style fullscreen (renderer bridge → window.attApp)
+// ---------------------------------------------------------------------------
+// The bridge exposes only parameterless/boolean calls; the main process owns all
+// behavior (no renderer-supplied data). Fullscreen acts on the SENDER's window
+// (default main), so a feature pop-out toggles itself.
+function senderWindow(event) {
+  try {
+    const w = BrowserWindow.fromWebContents(event.sender);
+    if (w && !w.isDestroyed()) return w;
+  } catch (e) { /* non-fatal */ }
+  return mainWindow;
+}
+
+// Restart the whole app cleanly. isQuitting is flipped first so the main
+// window's close handler / feature-window bookkeeping behave as on a normal quit
+// (arrangement restored on relaunch).
+ipcMain.handle('att:app-restart', () => {
+  isQuitting = true;
+  try { app.relaunch(); } catch (e) { /* non-fatal */ }
+  app.quit();
+  return true;
+});
+
+// setFullScreen(true) on Windows gives borderless fullscreen that COVERS the
+// taskbar/Start button — the games-style behavior requested. Returns the new
+// state so the button can update immediately (the enter/leave events also fire).
+ipcMain.handle('att:toggle-fullscreen', (event) => {
+  const win = senderWindow(event);
+  if (!win || win.isDestroyed()) return false;
+  const next = !win.isFullScreen();
+  try { win.setFullScreen(next); } catch (e) { return win.isFullScreen(); }
+  return next;
+});
+
+ipcMain.handle('att:get-fullscreen', (event) => {
+  const win = senderWindow(event);
+  return !!(win && !win.isDestroyed() && win.isFullScreen());
+});
+
+// ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
 function createWindow() {
@@ -783,6 +852,15 @@ function createWindow() {
   });
 
   if (bounds.maximized) mainWindow.maximize();
+  // Restore the main window's games-style fullscreen across restart/update
+  // (optional, low-risk — the F11/Esc escape hatch always applies).
+  if (settings.fullscreen) { try { mainWindow.setFullScreen(true); } catch (e) { /* non-fatal */ } }
+  const persistFullscreen = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    try { saveSettings({ fullscreen: mainWindow.isFullScreen() }); } catch (e) { /* non-fatal */ }
+  };
+  mainWindow.on('enter-full-screen', persistFullscreen);
+  mainWindow.on('leave-full-screen', persistFullscreen);
 
   // The loaded panel sets its own document.title, which would override the
   // BrowserWindow title. Re-append the build version on every page-title change
@@ -899,6 +977,25 @@ function buildTrayMenu() {
           mainWindow.show();
           mainWindow.focus();
         }
+      },
+    },
+    // Fullscreen toggle + Restart — discoverable here and an extra escape hatch
+    // (the tray stays reachable even when fullscreen hides the taskbar).
+    {
+      label: (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen())
+        ? 'Exit fullscreen' : 'Fullscreen',
+      click: () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        try { mainWindow.setFullScreen(!mainWindow.isFullScreen()); } catch (e) { /* non-fatal */ }
+        refreshTrayMenu();
+      },
+    },
+    {
+      label: 'Restart',
+      click: () => {
+        isQuitting = true;
+        try { app.relaunch(); } catch (e) { /* non-fatal */ }
+        app.quit();
       },
     },
     { type: 'separator' },

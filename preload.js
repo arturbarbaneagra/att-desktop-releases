@@ -49,6 +49,27 @@ ipcRenderer.on('att:proxy-open-settings', () => {
 });
 
 // ---------------------------------------------------------------------------
+// App control bridge (Restart + games-style fullscreen) — window.attApp
+// ---------------------------------------------------------------------------
+// Slim, shell-owned API: only parameterless / boolean calls (no renderer-supplied
+// data), matching the proxy card's security rule — the main process owns all
+// behavior. Its presence (window.attApp) is also how the panel tells it's running
+// inside a desktop build new enough to show the Restart + Fullscreen buttons.
+let _fullscreenChangeCb = null;
+try {
+  contextBridge.exposeInMainWorld('attApp', {
+    restart: () => ipcRenderer.invoke('att:app-restart'),
+    toggleFullscreen: () => ipcRenderer.invoke('att:toggle-fullscreen'),
+    getFullscreen: () => ipcRenderer.invoke('att:get-fullscreen'),
+    onFullscreenChange: (cb) => { _fullscreenChangeCb = (typeof cb === 'function') ? cb : null; },
+  });
+} catch (e) { /* non-fatal — bridge unavailable, panel simply hides the buttons */ }
+
+ipcRenderer.on('att:fullscreen-changed', (_e, isFull) => {
+  try { if (_fullscreenChangeCb) _fullscreenChangeCb(!!isFull); } catch (e) { /* non-fatal */ }
+});
+
+// ---------------------------------------------------------------------------
 // Ctrl+scroll page zoom (shell-owned, every window shares this preload)
 // ---------------------------------------------------------------------------
 // Electron disables Chromium's default Ctrl+wheel zoom, so nothing happens

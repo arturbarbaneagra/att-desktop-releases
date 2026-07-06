@@ -1,7 +1,7 @@
 {
   "name": "a-traders-tool-desktop",
   "productName": "A Trader's Tool",
-  "version": "1.1.9",
+  "version": "1.2.1",
   "description": "Desktop shell for atraderstool.com",
   "main": "main.js",
   "private": true,
