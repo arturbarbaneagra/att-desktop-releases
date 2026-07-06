@@ -31,6 +31,13 @@ const FEATURE_IDS = [
   // reopened-on-launch like any other feature window via the machinery below.
   'terminal_scratch',
 ];
+// Transient, open-on-demand Terminal SECTION pop-outs ("Your trades" / "Phemex
+// markets"). They ARE recognized as feature URLs so window.open spawns a proper
+// new OS window (createFeatureWindow) instead of navigating the current window in
+// place — but they are kept OUT of FEATURE_IDS on purpose so reopenFeatureWindows
+// never persists/reopens them on launch (they are throwaway views). Lockstep with
+// the terminal_trades / terminal_watchlist entries in POPOUT_FEATURES (panel.html).
+const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist'];
 
 let mainWindow = null;
 let tray = null;
@@ -122,7 +129,10 @@ function showFallback(win, retryUrl) {
 function featureIdFromUrl(url) {
   try {
     const f = new URL(url).searchParams.get('feature');
-    return FEATURE_IDS.includes(f) ? f : null;
+    // Recognize both the persisted feature windows AND the transient section
+    // pop-outs so window.open spawns a real new window for either; only
+    // FEATURE_IDS entries are reopened on launch (see reopenFeatureWindows).
+    return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f)) ? f : null;
   } catch (e) {
     return null;
   }
