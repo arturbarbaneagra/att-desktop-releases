@@ -306,6 +306,9 @@ function registerFeatureWindow(win, id) {
 
   const persistBounds = () => {
     if (!win || win.isDestroyed()) return;
+    // Same guard as the main window: never capture whole-screen bounds while a
+    // pop-out is fullscreened (F11), or they'd clobber its real windowed size.
+    if (win.isFullScreen()) return;
     if (win.isMaximized()) {
       saveFeatureWindowState(id, {
         bounds: Object.assign({}, featureWindowState(id).bounds, { maximized: true }),
@@ -852,15 +855,11 @@ function createWindow() {
   });
 
   if (bounds.maximized) mainWindow.maximize();
-  // Restore the main window's games-style fullscreen across restart/update
-  // (optional, low-risk — the F11/Esc escape hatch always applies).
-  if (settings.fullscreen) { try { mainWindow.setFullScreen(true); } catch (e) { /* non-fatal */ } }
-  const persistFullscreen = () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    try { saveSettings({ fullscreen: mainWindow.isFullScreen() }); } catch (e) { /* non-fatal */ }
-  };
-  mainWindow.on('enter-full-screen', persistFullscreen);
-  mainWindow.on('leave-full-screen', persistFullscreen);
+  // Fullscreen is a SESSION-ONLY toggle (F11 / Esc / tray) — deliberately NOT
+  // persisted or auto-restored. Auto-restoring it on every launch trapped users
+  // who toggled it once into always-fullscreen; the window must instead reopen
+  // where it last was (bounds/maximize above). Any stale `fullscreen` flag left
+  // in an older settings.json is simply ignored now.
 
   // The loaded panel sets its own document.title, which would override the
   // BrowserWindow title. Re-append the build version on every page-title change
@@ -891,6 +890,9 @@ function createWindow() {
   // Persist bounds
   const persistBounds = () => {
     if (!mainWindow) return;
+    // Never capture bounds while fullscreen — they'd be the whole-screen size and
+    // would clobber the user's real windowed position/size for the next launch.
+    if (mainWindow.isFullScreen()) return;
     if (mainWindow.isMaximized()) {
       saveSettings({ bounds: Object.assign({}, loadSettings().bounds, { maximized: true }) });
     } else {
