@@ -26,17 +26,27 @@ const RELEASES_URL = 'https://github.com/arturbarbaneagra/att-desktop-releases/r
 const FEATURE_IDS = [
   'main', 'terminal', 'mywallets', 'wallets', 'splashes', 'arbs', 'oracle', 'marklast',
   'indexlast', 'stockarb', 'biglimits', 'screener', 'listings',
-  // A throwaway "scratch" Terminal workspace in its own window. Opens empty every
-  // launch (its layout is deliberately not saved) but the WINDOW itself is
-  // reopened-on-launch like any other feature window via the machinery below.
-  'terminal_scratch',
 ];
-// Transient, open-on-demand Terminal SECTION pop-outs ("Your trades" / "Phemex
-// markets"). They ARE recognized as feature URLs so window.open spawns a proper
-// new OS window (createFeatureWindow) instead of navigating the current window in
-// place — but they are kept OUT of FEATURE_IDS on purpose so reopenFeatureWindows
-// never persists/reopens them on launch (they are throwaway views). Lockstep with
-// the terminal_trades / terminal_watchlist entries in POPOUT_FEATURES (panel.html).
+// Scratch Terminal windows: throwaway DOM/chart workspaces, each in its OWN window.
+// The user can open ANY NUMBER of them, so their ids are dynamic ('terminal_scratch'
+// legacy, or 'terminal_scratch_<n>') rather than a fixed list — isScratchFeatureId
+// recognizes the whole family. Like feature windows they are reopened-on-launch when
+// they were open at last quit (registerFeatureWindow persists bounds + open), but
+// they have no ⧉ launcher of their own (opened from the panel's workspace-tab bar).
+// Kept OUT of FEATURE_IDS because the family is open-ended; recognition is by
+// predicate. Lockstep with _scratchIdOf / POPOUT_FEATURES in panel.html.
+function isScratchFeatureId(f) {
+  return typeof f === 'string' && /^terminal_scratch(_\d+)?$/.test(f);
+}
+// Open-on-demand Terminal SECTION pop-outs ("Your trades" / "Phemex markets").
+// They ARE recognized as feature URLs so window.open spawns a proper new OS
+// window (createFeatureWindow) instead of navigating the current window in place.
+// Kept OUT of FEATURE_IDS so they are never spawned UNPROMPTED on a fresh install,
+// but reopenFeatureWindows DOES restore them when they were open at last quit (the
+// user asked that these windows survive a restart and stay where they were put) —
+// registerFeatureWindow persists their bounds + open flag like any feature window.
+// Lockstep with the terminal_trades / terminal_watchlist entries in POPOUT_FEATURES
+// (panel.html).
 const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist'];
 
 let mainWindow = null;
@@ -129,10 +139,11 @@ function showFallback(win, retryUrl) {
 function featureIdFromUrl(url) {
   try {
     const f = new URL(url).searchParams.get('feature');
-    // Recognize both the persisted feature windows AND the transient section
-    // pop-outs so window.open spawns a real new window for either; only
-    // FEATURE_IDS entries are reopened on launch (see reopenFeatureWindows).
-    return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f)) ? f : null;
+    // Recognize the persisted feature windows, the transient section pop-outs, AND
+    // dynamic scratch windows so window.open spawns a real new window for any of
+    // them. Feature windows + scratch windows are reopened on launch when they were
+    // open at last quit; section pop-outs likewise (see reopenFeatureWindows).
+    return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f) || isScratchFeatureId(f)) ? f : null;
   } catch (e) {
     return null;
   }
@@ -364,7 +375,7 @@ function createFeatureWindow(id) {
 function reopenFeatureWindows() {
   const fw = loadSettings().featureWindows || {};
   Object.keys(fw).forEach((id) => {
-    if (FEATURE_IDS.includes(id) && fw[id] && fw[id].open) createFeatureWindow(id);
+    if ((FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id)) && fw[id] && fw[id].open) createFeatureWindow(id);
   });
 }
 
