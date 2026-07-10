@@ -678,9 +678,21 @@ function closeNativeSocket(id) {
   const rec = nativeSockets.get(id);
   if (!rec) return;
   nativeSockets.delete(id);
-  try { rec.ws.removeAllListeners(); } catch (e) { /* non-fatal */ }
-  try { rec.ws.close(); } catch (e) { /* non-fatal */ }
-  try { rec.ws.terminate(); } catch (e) { /* non-fatal */ }
+  const ws = rec.ws;
+  // Stop forwarding this socket's frames to the renderer, but keep a no-op
+  // 'error' listener attached while we tear it down. Closing/terminating a
+  // socket that is still CONNECTING makes `ws` emit an 'error' ("WebSocket was
+  // closed before the connection was established"). removeAllListeners() strips
+  // the open-time error handler, so without re-attaching one that error would
+  // have NO listener and Node re-throws it as an uncaught exception — crashing
+  // the whole main process (the exact crash seen when a board is closed or the
+  // transport switch live-reconnects before the handshake completes).
+  try { ws.removeAllListeners(); } catch (e) { /* non-fatal */ }
+  try { ws.on('error', () => { /* swallow teardown-race errors */ }); } catch (e) { /* non-fatal */ }
+  try {
+    if (ws.readyState === 0 /* CONNECTING */) ws.terminate(); // abort the pending handshake
+    else ws.close();
+  } catch (e) { /* non-fatal */ }
 }
 
 // Tear down every native socket owned by a webContents (reload / nav / close).
