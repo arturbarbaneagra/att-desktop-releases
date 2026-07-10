@@ -291,6 +291,14 @@ function wireWindowNav(win) {
   win.on('enter-full-screen', notifyFullscreen);
   win.on('leave-full-screen', notifyFullscreen);
   win.webContents.on('did-finish-load', notifyFullscreen);
+
+  // Native-WS teardown: any (re)load orphans the shim's socket ids in the old
+  // renderer, so drop every native socket this webContents owns on load-start and
+  // on destroy. did-start-loading fires on Ctrl+R / offline-retry / proxy-reload
+  // (a no-op on the very first load, when nothing is open yet).
+  const wcId = win.webContents.id;
+  win.webContents.on('did-start-loading', () => closeNativeSocketsFor(wcId));
+  win.webContents.on('destroyed', () => closeNativeSocketsFor(wcId));
 }
 
 // Permission allowlist for the shared app session (set once; all windows on the
@@ -472,6 +480,10 @@ async function setProxyAndReconnect(cfg) {
   for (const ses of proxyTargetSessions()) {
     try { await ses.closeAllConnections(); } catch (e) { /* non-fatal */ }
   }
+  // Native market-data sockets bypass the Electron session, so closeAllConnections
+  // won't drop them — close them explicitly so they re-open through the new agent
+  // when each window reloads below.
+  closeAllNativeSockets();
   reloadAllWindows();
   refreshTrayMenu();
 }
@@ -596,6 +608,157 @@ function openProxySettings() {
     try { mainWindow.webContents.send('att:proxy-open-settings'); } catch (e) { /* non-fatal */ }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Native market-data WebSocket bridge (desktop-only)
+// ---------------------------------------------------------------------------
+// WHY: Binance silently withholds futures @aggTrade from Chromium (browser AND
+// Electron renderer) — the socket stays healthy but the trade stream never
+// arrives, so the Terminal's tape/cluster fall back to REST polling (visibly
+// laggy). A NATIVE client (like Metascalp) gets the stream fine. So we open the
+// Binance market-data sockets in the Node MAIN process (a native runtime, not
+// Chromium) and pipe frames to the renderer over IPC via a WebSocket-like shim.
+//
+// SECURITY: the renderer can NEVER open an arbitrary native socket. Every URL is
+// validated against a strict allowlist of Binance market-data hosts (wss only),
+// and only a top-level frame on the app origin may open/send/close. This mirrors
+// the proxy bridge's "never trust renderer-supplied strings" rule.
+const WSNative = (() => { try { return require('ws'); } catch (e) { return null; } })();
+let SocksProxyAgent = null, HttpsProxyAgent = null;
+try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
+try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e) { /* optional */ }
+
+// Strict allowlist: only Terminal market-data WS hosts (Phemex + Binance), wss
+// only. Anything else is refused so the shim can never be turned into an
+// arbitrary-socket primitive. The renderer only picks a transport MODE per
+// venue — it never supplies arbitrary hosts.
+const NATIVE_WS_HOSTS = new Set([
+  'ws.phemex.com',              // Phemex spot + USDT-M perp market data
+  'fstream.binance.com',        // USDT-M futures combined streams
+  'stream.binance.com',         // spot combined streams (:9443)
+  'data-stream.binance.com',    // spot market-data mirror
+]);
+function nativeWsUrlOk(url) {
+  try {
+    const u = new URL(String(url || ''));
+    if (u.protocol !== 'wss:') return false;
+    return NATIVE_WS_HOSTS.has(u.hostname);
+  } catch (e) { return false; }
+}
+
+// id -> { ws, wcId }. One entry per live native socket, tagged with its owning
+// webContents so a reload / navigation / window-close tears down its sockets.
+const nativeSockets = new Map();
+let nativeSockSeq = 1;
+
+// Build the outbound proxy agent from the SAME persisted desktop proxy config as
+// the Chromium session (native sockets bypass Electron's session proxy, so they
+// must tunnel themselves). Returns undefined when no proxy is enabled → direct.
+function nativeWsAgent() {
+  const cfg = getProxyConfig();
+  if (!cfg || !cfg.enabled) return undefined;
+  const proxyUrl = cfg.scheme + '://' + cfg.host + ':' + cfg.port;
+  try {
+    if (cfg.scheme === 'socks5' && SocksProxyAgent) return new SocksProxyAgent(proxyUrl);
+    if (cfg.scheme === 'http' && HttpsProxyAgent) return new HttpsProxyAgent(proxyUrl);
+  } catch (e) { /* fall through to direct — never block a connect on agent build */ }
+  return undefined;
+}
+
+// Only a top-level frame on the app origin may drive native sockets.
+function nativeWsSenderOk(event) {
+  try {
+    const f = event.senderFrame;
+    if (!f || f.parent) return false;
+    return isAppOrigin(String(f.url || ''));
+  } catch (e) { return false; }
+}
+
+function closeNativeSocket(id) {
+  const rec = nativeSockets.get(id);
+  if (!rec) return;
+  nativeSockets.delete(id);
+  try { rec.ws.removeAllListeners(); } catch (e) { /* non-fatal */ }
+  try { rec.ws.close(); } catch (e) { /* non-fatal */ }
+  try { rec.ws.terminate(); } catch (e) { /* non-fatal */ }
+}
+
+// Tear down every native socket owned by a webContents (reload / nav / close).
+function closeNativeSocketsFor(wcId) {
+  for (const [id, rec] of nativeSockets.entries()) {
+    if (rec.wcId === wcId) closeNativeSocket(id);
+  }
+}
+
+// Tear down ALL native sockets (proxy change → force a clean reconnect through
+// the new agent, mirroring session.closeAllConnections()).
+function closeAllNativeSockets() {
+  for (const id of Array.from(nativeSockets.keys())) closeNativeSocket(id);
+}
+
+// Open a validated native socket. Returns { ok, id } to the shim; frames stream
+// back over the per-window 'att:ws-event' channel keyed by id.
+ipcMain.handle('att:ws-open', (event, url) => {
+  if (!WSNative) return { ok: false, error: 'unavailable' };
+  if (!nativeWsSenderOk(event)) return { ok: false, error: 'forbidden' };
+  if (!nativeWsUrlOk(url)) return { ok: false, error: 'blocked' };
+  const wc = event.sender;
+  const wcId = wc.id;
+  const id = nativeSockSeq++;
+  let ws;
+  try {
+    ws = new WSNative(String(url), {
+      agent: nativeWsAgent(),
+      handshakeTimeout: 15000,
+      perMessageDeflate: false,
+    });
+  } catch (e) {
+    return { ok: false, error: 'open-failed' };
+  }
+  nativeSockets.set(id, { ws, wcId });
+  const emit = (msg) => {
+    try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
+  };
+  ws.on('open', () => emit({ id, type: 'open' }));
+  ws.on('message', (data, isBinary) => {
+    // Binance market data is text JSON; forward verbatim as a string. Binary
+    // frames (none expected) are dropped rather than guessed at.
+    if (isBinary) return;
+    let s = '';
+    try { s = data.toString('utf8'); } catch (e) { return; }
+    emit({ id, type: 'message', data: s });
+  });
+  ws.on('close', (code, reason) => {
+    nativeSockets.delete(id);
+    let r = '';
+    try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
+    emit({ id, type: 'close', code: code, reason: r });
+  });
+  ws.on('error', (err) => {
+    emit({ id, type: 'error', message: (err && err.message) || 'error' });
+  });
+  return { ok: true, id };
+});
+
+// Forward an outbound text frame verbatim to the owning native socket.
+ipcMain.on('att:ws-send', (event, payload) => {
+  if (!nativeWsSenderOk(event)) return;
+  const id = payload && payload.id;
+  const rec = nativeSockets.get(id);
+  if (!rec || rec.wcId !== event.sender.id) return;
+  try {
+    if (rec.ws.readyState === 1 /* OPEN */) rec.ws.send(String(payload.data == null ? '' : payload.data));
+  } catch (e) { /* non-fatal */ }
+});
+
+// Close a native socket on the renderer's request.
+ipcMain.on('att:ws-close', (event, payload) => {
+  if (!nativeWsSenderOk(event)) return;
+  const id = payload && payload.id;
+  const rec = nativeSockets.get(id);
+  if (!rec || rec.wcId !== event.sender.id) return;
+  closeNativeSocket(id);
+});
 
 // ---------------------------------------------------------------------------
 // Auto-update (electron-updater; NSIS installer builds only)

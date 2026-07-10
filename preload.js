@@ -70,6 +70,32 @@ ipcRenderer.on('att:fullscreen-changed', (_e, isFull) => {
 });
 
 // ---------------------------------------------------------------------------
+// Native market-data WebSocket bridge — window.attNativeWS
+// ---------------------------------------------------------------------------
+// Slim, validated bridge over the main-process native sockets. The page builds a
+// WebSocket-like shim on top of these primitives and uses it for Terminal DOM
+// connections whose venue is set to "native" (Phemex and/or Binance — Binance
+// futures @aggTrade is silently withheld by Chromium; the Node runtime gets it).
+// The main process validates every URL against a Terminal market-data host
+// allowlist and refuses anything else. Its presence (window.attNativeWS) is how
+// the panel detects a native-WS-capable build — same pattern as attProxy / attApp.
+let _nativeWsCb = null;
+try {
+  contextBridge.exposeInMainWorld('attNativeWS', {
+    // Returns a Promise<{ok, id}> — id keys all later send/close + inbound events.
+    open: (url) => ipcRenderer.invoke('att:ws-open', String(url || '')),
+    send: (id, data) => ipcRenderer.send('att:ws-send', { id: id, data: String(data == null ? '' : data) }),
+    close: (id, code, reason) => ipcRenderer.send('att:ws-close', { id: id, code: code, reason: reason }),
+    // Single fan-out dispatcher; the page routes {id, type, ...} to its shims.
+    onEvent: (cb) => { _nativeWsCb = (typeof cb === 'function') ? cb : null; },
+  });
+} catch (e) { /* non-fatal — bridge unavailable, panel keeps browser WS + REST fallback */ }
+
+ipcRenderer.on('att:ws-event', (_e, msg) => {
+  try { if (_nativeWsCb) _nativeWsCb(msg); } catch (e) { /* non-fatal */ }
+});
+
+// ---------------------------------------------------------------------------
 // Ctrl+scroll page zoom (shell-owned, every window shares this preload)
 // ---------------------------------------------------------------------------
 // Electron disables Chromium's default Ctrl+wheel zoom, so nothing happens
