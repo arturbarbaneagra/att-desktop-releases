@@ -644,6 +644,7 @@ const NATIVE_WS_HOSTS = new Set([
   'api.gateio.ws',              // Gate spot market data WS (wss only — REST on this host is NOT reachable via this shim)
   'fx-ws.gateio.ws',            // Gate USDT-futures market data WS
   'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
+  'ws.bitmex.com',              // BitMEX realtime WS (spot + USDT-linear perps)
 ]);
 function nativeWsUrlOk(url) {
   try {
