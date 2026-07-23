@@ -84,6 +84,11 @@ try {
   contextBridge.exposeInMainWorld('attNativeWS', {
     // Returns a Promise<{ok, id}> — id keys all later send/close + inbound events.
     open: (url) => ipcRenderer.invoke('att:ws-open', String(url || '')),
+    // KuCoin direct dial: the renderer names ONLY the market ('spot'|'futures');
+    // main does the bullet-public token dance itself and validates the returned
+    // wss endpoint (its host varies per token, so the fixed allowlist can't
+    // cover it). Presence of this method gates the panel's KuCoin Native button.
+    openKucoin: (market) => ipcRenderer.invoke('att:ws-open-kucoin', String(market || '')),
     send: (id, data) => ipcRenderer.send('att:ws-send', { id: id, data: String(data == null ? '' : data) }),
     close: (id, code, reason) => ipcRenderer.send('att:ws-close', { id: id, code: code, reason: reason }),
     // Single fan-out dispatcher; the page routes {id, type, ...} to its shims.

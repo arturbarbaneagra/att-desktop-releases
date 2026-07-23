@@ -624,11 +624,15 @@ function openProxySettings() {
 // and only a top-level frame on the app origin may open/send/close. This mirrors
 // the proxy bridge's "never trust renderer-supplied strings" rule.
 const WSNative = (() => { try { return require('ws'); } catch (e) { return null; } })();
+const https = require('https');
+// Pure KuCoin bullet helpers (separate module so they node-unit-test without
+// Electron): bullet-response validation + keepalive clamp + dial-URL builder.
+const { KC_BULLET_HOSTS, kcBulletParse, kcDialUrl } = require('./kucoin_bullet');
 let SocksProxyAgent = null, HttpsProxyAgent = null;
 try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
 try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e) { /* optional */ }
 
-// Strict allowlist: only Terminal market-data WS hosts (Phemex + Binance), wss
+// Strict allowlist: only Terminal market-data WS hosts (Phemex + Binance + Gate), wss
 // only. Anything else is refused so the shim can never be turned into an
 // arbitrary-socket primitive. The renderer only picks a transport MODE per
 // venue — it never supplies arbitrary hosts.
@@ -637,6 +641,9 @@ const NATIVE_WS_HOSTS = new Set([
   'fstream.binance.com',        // USDT-M futures combined streams
   'stream.binance.com',         // spot combined streams (:9443)
   'data-stream.binance.com',    // spot market-data mirror
+  'api.gateio.ws',              // Gate spot market data WS (wss only — REST on this host is NOT reachable via this shim)
+  'fx-ws.gateio.ws',            // Gate USDT-futures market data WS
+  'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
 ]);
 function nativeWsUrlOk(url) {
   try {
@@ -678,6 +685,8 @@ function closeNativeSocket(id) {
   const rec = nativeSockets.get(id);
   if (!rec) return;
   nativeSockets.delete(id);
+  // KuCoin-native sockets carry a main-owned keepalive timer — always stop it.
+  if (rec.kaT) { try { clearInterval(rec.kaT); } catch (e) { /* non-fatal */ } rec.kaT = null; }
   const ws = rec.ws;
   // Stop forwarding this socket's frames to the renderer, but keep a no-op
   // 'error' listener attached while we tear it down. Closing/terminating a
@@ -741,6 +750,102 @@ ipcMain.handle('att:ws-open', (event, url) => {
     emit({ id, type: 'message', data: s });
   });
   ws.on('close', (code, reason) => {
+    nativeSockets.delete(id);
+    let r = '';
+    try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
+    emit({ id, type: 'close', code: code, reason: r });
+  });
+  ws.on('error', (err) => {
+    emit({ id, type: 'error', message: (err && err.message) || 'error' });
+  });
+  return { ok: true, id };
+});
+
+// POST the KuCoin bullet-public endpoint through the SAME proxy agent the
+// native sockets use (the token dance must originate from the same egress IP
+// as the dial or KuCoin may reject the token). Resolves to kcBulletParse's
+// verdict; rejects on transport failure/timeout.
+function kcBulletFetch(mkt) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(KC_BULLET_HOSTS[mkt] + '/api/v1/bullet-public', {
+      method: 'POST',
+      agent: nativeWsAgent(),
+      timeout: 10000,
+      headers: { 'content-length': 0 },
+    }, (res) => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { if (buf.length < 65536) buf += d; });
+      res.on('end', () => resolve(kcBulletParse(buf)));
+    });
+    req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) { /* non-fatal */ } });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Open a KuCoin market-data socket the MetaScalp way: main does the
+// bullet-public token dance and dials the returned wss endpoint directly.
+// The renderer names ONLY the market ('spot'|'futures') — it can never supply
+// a URL (the bullet endpoint host varies per token, so the fixed-host
+// allowlist can't cover KuCoin; kcBulletParse's wss + *.kucoin.com check is
+// the equivalent gate). Frames stream back over the same 'att:ws-event'
+// channel; main owns the app-level keepalive (KuCoin drops ~18s-idle sockets)
+// and swallows its own natka-* pongs so the renderer's RTT ping stays honest.
+ipcMain.handle('att:ws-open-kucoin', async (event, market) => {
+  if (!WSNative) return { ok: false, error: 'unavailable' };
+  if (!nativeWsSenderOk(event)) return { ok: false, error: 'forbidden' };
+  const mkt = market === 'futures' ? 'futures' : (market === 'spot' ? 'spot' : null);
+  if (!mkt) return { ok: false, error: 'blocked' };
+  const wc = event.sender;
+  const wcId = wc.id;
+  let bullet;
+  try { bullet = await kcBulletFetch(mkt); } catch (e) { return { ok: false, error: 'bullet-failed' }; }
+  if (!bullet || !bullet.ok) return { ok: false, error: 'bullet-failed' };
+  // The webContents may have reloaded/closed while the bullet was in flight —
+  // never register a socket for a dead owner.
+  if (wc.isDestroyed()) return { ok: false, error: 'gone' };
+  const id = nativeSockSeq++;
+  const connectId = 'att' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  let ws;
+  try {
+    ws = new WSNative(kcDialUrl(bullet.endpoint, bullet.token, connectId), {
+      agent: nativeWsAgent(),
+      handshakeTimeout: 15000,
+      perMessageDeflate: false,
+    });
+  } catch (e) {
+    return { ok: false, error: 'open-failed' };
+  }
+  const rec = { ws, wcId, kaT: null };
+  nativeSockets.set(id, rec);
+  const emit = (msg) => {
+    try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
+  };
+  let kaN = 0;
+  ws.on('open', () => {
+    // Main-owned app-level keepalive at the bullet-advertised cadence.
+    rec.kaT = setInterval(() => {
+      try { if (ws.readyState === 1) ws.send(JSON.stringify({ id: 'natka-' + (++kaN), type: 'ping' })); } catch (e) { /* non-fatal */ }
+    }, bullet.pingMs);
+    emit({ id, type: 'open' });
+  });
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    let s = '';
+    try { s = data.toString('utf8'); } catch (e) { return; }
+    // Swallow OUR keepalive pongs (id natka-*) — everything else (incl. the
+    // renderer's own RTT pongs) pipes verbatim.
+    if (s.indexOf('natka-') !== -1) {
+      try {
+        const m = JSON.parse(s);
+        if (m && m.type === 'pong' && String(m.id || '').indexOf('natka-') === 0) return;
+      } catch (e) { /* not JSON — fall through and forward */ }
+    }
+    emit({ id, type: 'message', data: s });
+  });
+  ws.on('close', (code, reason) => {
+    if (rec.kaT) { try { clearInterval(rec.kaT); } catch (e) { /* non-fatal */ } rec.kaT = null; }
     nativeSockets.delete(id);
     let r = '';
     try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
