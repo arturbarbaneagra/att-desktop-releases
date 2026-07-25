@@ -1,7 +1,7 @@
 {
   "name": "a-traders-tool-desktop",
   "productName": "A Trader's Tool",
-  "version": "1.4.4",
+  "version": "1.4.6",
   "description": "Desktop shell for atraderstool.com",
   "main": "main.js",
   "private": true,
@@ -33,6 +33,8 @@
       "main.js",
       "preload.js",
       "kucoin_bullet.js",
+      "proxy_url.js",
+      "route_hosts.js",
       "fallback.html",
       "assets/**"
     ],

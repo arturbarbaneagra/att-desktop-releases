@@ -83,12 +83,20 @@ let _nativeWsCb = null;
 try {
   contextBridge.exposeInMainWorld('attNativeWS', {
     // Returns a Promise<{ok, id}> — id keys all later send/close + inbound events.
-    open: (url) => ipcRenderer.invoke('att:ws-open', String(url || '')),
+    // route ('proxy'|'direct') is the optional per-venue×market ROUTE choice;
+    // main validates it (anything unknown collapses to 'proxy', fail-closed).
+    open: (url, route) => ipcRenderer.invoke('att:ws-open', String(url || ''), String(route || '')),
     // KuCoin direct dial: the renderer names ONLY the market ('spot'|'futures');
     // main does the bullet-public token dance itself and validates the returned
     // wss endpoint (its host varies per token, so the fixed allowlist can't
     // cover it). Presence of this method gates the panel's KuCoin Native button.
-    openKucoin: (market) => ipcRenderer.invoke('att:ws-open-kucoin', String(market || '')),
+    openKucoin: (market, route) => ipcRenderer.invoke('att:ws-open-kucoin', String(market || ''), String(route || '')),
+    // Per-venue×market Proxy/Direct route for BROWSER transports: posts the
+    // venue|market combos set to Direct; main rebuilds the session bypass
+    // rules from its static host map. Presence of THIS method gates the
+    // panel's Route switch row (older builds simply never show it).
+    setRouteHosts: (tokens) => ipcRenderer.invoke('att:route-hosts',
+      Array.isArray(tokens) ? tokens.map((t) => String(t || '')) : []),
     send: (id, data) => ipcRenderer.send('att:ws-send', { id: id, data: String(data == null ? '' : data) }),
     close: (id, code, reason) => ipcRenderer.send('att:ws-close', { id: id, code: code, reason: reason }),
     // Single fan-out dispatcher; the page routes {id, type, ...} to its shims.

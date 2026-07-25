@@ -446,13 +446,20 @@ function proxyTargetSessions() {
   return list;
 }
 
+// Per-venue×market Proxy/Direct route (browser transports): the renderer posts
+// its set of DIRECT venue|market tokens over att:route-hosts; the pure helper
+// derives the Chromium bypass hosts (proxy wins ties on shared hosts — see
+// route_hosts.js). Session-scoped state, default empty (= everything proxied).
+let routeBypassHosts = [];
+
 // Apply (or clear) the proxy on every session. Called once BEFORE the first
-// window loads and again on every runtime change.
+// window loads and again on every runtime change (config OR route change).
 async function applyProxyToSessions(cfg) {
   const rules = (cfg && cfg.enabled) ? proxyRulesFromConfig(cfg) : '';
+  const bypass = routeBypassHosts.join(',');
   for (const ses of proxyTargetSessions()) {
     try {
-      if (rules) await ses.setProxy({ proxyRules: rules, proxyBypassRules: '' });
+      if (rules) await ses.setProxy({ proxyRules: rules, proxyBypassRules: bypass });
       else await ses.setProxy({ mode: 'direct' });
     } catch (e) { /* non-fatal */ }
   }
@@ -571,6 +578,21 @@ ipcMain.handle('att:proxy-test', async (event, input) => {
   };
 });
 
+// Per-venue×market Proxy/Direct route for BROWSER transports: the panel posts
+// the venue|market combos the user set to Direct; the pure helper derives the
+// Chromium bypass hosts (proxy-wins-ties on shared hosts) and the sessions are
+// re-stamped in place. Deliberately NO closeAllConnections / reload here — the
+// panel resyncs exactly the flipped market's socket itself, so the rest of the
+// app (REST, other feeds) never blinks. No-op while the proxy is disabled
+// (state is still stored so an Enable picks it up).
+ipcMain.handle('att:route-hosts', async (event, tokens) => {
+  if (proxySenderKind(event) !== 'app') return { ok: false, error: 'forbidden' };
+  routeBypassHosts = bypassHostsFor(tokens);
+  const cfg = getProxyConfig();
+  if (cfg && cfg.enabled) await applyProxyToSessions(cfg);
+  return { ok: true, hosts: routeBypassHosts.slice() };
+});
+
 ipcMain.handle('att:proxy-clear', async (event) => {
   const kind = proxySenderKind(event);
   if (kind !== 'app' && kind !== 'fallback') return { ok: false, error: 'forbidden' };
@@ -628,6 +650,8 @@ const https = require('https');
 // Pure KuCoin bullet helpers (separate module so they node-unit-test without
 // Electron): bullet-response validation + keepalive clamp + dial-URL builder.
 const { KC_BULLET_HOSTS, kcBulletParse, kcDialUrl } = require('./kucoin_bullet');
+const { nativeProxyUrl } = require('./proxy_url');
+const { routeNorm, bypassHostsFor } = require('./route_hosts');
 let SocksProxyAgent = null, HttpsProxyAgent = null;
 try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
 try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e) { /* optional */ }
@@ -645,6 +669,7 @@ const NATIVE_WS_HOSTS = new Set([
   'fx-ws.gateio.ws',            // Gate USDT-futures market data WS
   'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
   'ws.bitmex.com',              // BitMEX realtime WS (spot + USDT-linear perps)
+  'api.hyperliquid.xyz',        // Hyperliquid public market-data WS (/ws)
 ]);
 function nativeWsUrlOk(url) {
   try {
@@ -661,16 +686,40 @@ let nativeSockSeq = 1;
 
 // Build the outbound proxy agent from the SAME persisted desktop proxy config as
 // the Chromium session (native sockets bypass Electron's session proxy, so they
-// must tunnel themselves). Returns undefined when no proxy is enabled → direct.
+// must tunnel themselves). The URL comes from the pure nativeProxyUrl helper
+// (socks5 → socks5h so DNS resolves AT the proxy, matching Chromium's remote
+// DNS). Returns:
+//   { agent: undefined }  — no proxy enabled → direct dialing is fine
+//   { agent: <Agent> }    — proxy enabled, agent built → tunnel through it
+//   { refuse: true }      — proxy enabled but NO agent could be built (module
+//                           missing / constructor threw). Callers must REFUSE
+//                           the open ('unavailable') instead of dialing direct:
+//                           the renderer shim then fails over to the browser
+//                           WebSocket, which rides the Chromium session proxy —
+//                           data stays tunneled instead of silently leaking.
 function nativeWsAgent() {
   const cfg = getProxyConfig();
-  if (!cfg || !cfg.enabled) return undefined;
-  const proxyUrl = cfg.scheme + '://' + cfg.host + ':' + cfg.port;
+  const proxyUrl = nativeProxyUrl(cfg);
+  if (!proxyUrl) {
+    // Unknown scheme with proxy enabled must also refuse (never dial direct).
+    if (cfg && cfg.enabled) return { refuse: true };
+    return { agent: undefined };
+  }
   try {
-    if (cfg.scheme === 'socks5' && SocksProxyAgent) return new SocksProxyAgent(proxyUrl);
-    if (cfg.scheme === 'http' && HttpsProxyAgent) return new HttpsProxyAgent(proxyUrl);
-  } catch (e) { /* fall through to direct — never block a connect on agent build */ }
-  return undefined;
+    if (cfg.scheme === 'socks5' && SocksProxyAgent) return { agent: new SocksProxyAgent(proxyUrl) };
+    if (cfg.scheme === 'http' && HttpsProxyAgent) return { agent: new HttpsProxyAgent(proxyUrl) };
+  } catch (e) { /* fall through to refuse — never leak direct past an enabled proxy */ }
+  return { refuse: true };
+}
+
+// Route-aware agent pick for one native connection. route comes from the
+// renderer, already collapsed by routeNorm(): 'direct' is an EXPLICIT
+// per-venue×market user choice to skip the tunnel for market data, so it
+// returns a bare { agent: undefined } (no refuse path — direct is the point).
+// Anything else behaves exactly like nativeWsAgent() (proxy, fail-closed).
+function nativeWsAgentFor(route) {
+  if (routeNorm(route) === 'direct') return { agent: undefined };
+  return nativeWsAgent();
 }
 
 // Only a top-level frame on the app origin may drive native sockets.
@@ -720,17 +769,19 @@ function closeAllNativeSockets() {
 
 // Open a validated native socket. Returns { ok, id } to the shim; frames stream
 // back over the per-window 'att:ws-event' channel keyed by id.
-ipcMain.handle('att:ws-open', (event, url) => {
+ipcMain.handle('att:ws-open', (event, url, route) => {
   if (!WSNative) return { ok: false, error: 'unavailable' };
   if (!nativeWsSenderOk(event)) return { ok: false, error: 'forbidden' };
   if (!nativeWsUrlOk(url)) return { ok: false, error: 'blocked' };
   const wc = event.sender;
   const wcId = wc.id;
+  const ag = nativeWsAgentFor(route);
+  if (ag.refuse) return { ok: false, error: 'unavailable' };
   const id = nativeSockSeq++;
   let ws;
   try {
     ws = new WSNative(String(url), {
-      agent: nativeWsAgent(),
+      agent: ag.agent,
       handshakeTimeout: 15000,
       perMessageDeflate: false,
     });
@@ -766,11 +817,15 @@ ipcMain.handle('att:ws-open', (event, url) => {
 // native sockets use (the token dance must originate from the same egress IP
 // as the dial or KuCoin may reject the token). Resolves to kcBulletParse's
 // verdict; rejects on transport failure/timeout.
-function kcBulletFetch(mkt) {
+function kcBulletFetch(mkt, route) {
   return new Promise((resolve, reject) => {
+    const ag = nativeWsAgentFor(route);
+    // Proxy enabled but no agent → refuse rather than fetch the bullet direct
+    // (a direct bullet + proxied dial mismatch is useless anyway).
+    if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
     const req = https.request(KC_BULLET_HOSTS[mkt] + '/api/v1/bullet-public', {
       method: 'POST',
-      agent: nativeWsAgent(),
+      agent: ag.agent,
       timeout: 10000,
       headers: { 'content-length': 0 },
     }, (res) => {
@@ -793,25 +848,33 @@ function kcBulletFetch(mkt) {
 // the equivalent gate). Frames stream back over the same 'att:ws-event'
 // channel; main owns the app-level keepalive (KuCoin drops ~18s-idle sockets)
 // and swallows its own natka-* pongs so the renderer's RTT ping stays honest.
-ipcMain.handle('att:ws-open-kucoin', async (event, market) => {
+ipcMain.handle('att:ws-open-kucoin', async (event, market, route) => {
   if (!WSNative) return { ok: false, error: 'unavailable' };
   if (!nativeWsSenderOk(event)) return { ok: false, error: 'forbidden' };
   const mkt = market === 'futures' ? 'futures' : (market === 'spot' ? 'spot' : null);
   if (!mkt) return { ok: false, error: 'blocked' };
   const wc = event.sender;
   const wcId = wc.id;
+  // Proxy enabled but no agent buildable → refuse up front ('unavailable' so
+  // the renderer shim fails over to the browser WebSocket, which rides the
+  // Chromium session proxy) — never bullet-fetch or dial direct.
+  if (nativeWsAgentFor(route).refuse) return { ok: false, error: 'unavailable' };
   let bullet;
-  try { bullet = await kcBulletFetch(mkt); } catch (e) { return { ok: false, error: 'bullet-failed' }; }
+  try { bullet = await kcBulletFetch(mkt, route); } catch (e) { return { ok: false, error: 'bullet-failed' }; }
   if (!bullet || !bullet.ok) return { ok: false, error: 'bullet-failed' };
   // The webContents may have reloaded/closed while the bullet was in flight —
   // never register a socket for a dead owner.
   if (wc.isDestroyed()) return { ok: false, error: 'gone' };
+  // Re-check at dial time (the proxy config may have changed while the bullet
+  // was in flight) — never dial direct past an enabled proxy.
+  const ag = nativeWsAgentFor(route);
+  if (ag.refuse) return { ok: false, error: 'unavailable' };
   const id = nativeSockSeq++;
   const connectId = 'att' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   let ws;
   try {
     ws = new WSNative(kcDialUrl(bullet.endpoint, bullet.token, connectId), {
-      agent: nativeWsAgent(),
+      agent: ag.agent,
       handshakeTimeout: 15000,
       perMessageDeflate: false,
     });

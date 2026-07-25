@@ -39,6 +39,13 @@ too when installed via the installer (see below).
   Disable / Proxy settings…") and a "Disable proxy & retry" button on the offline
   screen both clear the proxy with no files or reinstall. Proxy auth
   (username/password) is not supported; usernames/passwords are never accepted.
+  **Remote DNS + no direct bypass (v1.4.5+):** with a SOCKS5 proxy enabled, the
+  Terminal's native market-data sockets resolve hostnames *at the proxy*
+  (`socks5h`), matching the Chromium session's remote DNS — so DNS-poisoned or
+  filtered networks work the same in native and browser transport modes. And if
+  the proxy agent can't be built at all, native opens are refused instead of
+  silently dialing direct; the panel falls back to the browser WebSocket, which
+  still rides the session proxy — traffic never bypasses an enabled proxy.
 - Persistent login (cookies survive restarts), remembers window size/position
 - Closing the main window quits the whole app (and closes every feature window with it)
 - System tray: Show/Hide, Quit, and a "Launch on startup" toggle (default OFF)
