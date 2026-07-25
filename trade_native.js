@@ -349,6 +349,16 @@ function validateIntent(it) {
 
 // SL/TP trigger sanity vs the position side + mark (parity with the engine's
 // sltp_trigger_ok): SL sits on the LOSS side of mark, TP on the PROFIT side.
+// Confirmed-path echo for a trade exec response: derives WHAT ACTUALLY
+// happened from the agent pick (never from the requested pref). An agent
+// present = the tunnel is really in use; no agent = the request goes over
+// the plain internet; refuse = the send was REFUSED (proxy enabled but no
+// agent buildable — never silently direct). Pure — node-testable.
+function tradeViaFromAgent(ag) {
+  if (ag && ag.refuse) return { transport: 'native', refused: true };
+  return { transport: 'native', route: (ag && ag.agent) ? 'proxy' : 'direct' };
+}
+
 function sltpTriggerOk(kind, posSide, trigger, mark) {
   const t = Number(trigger);
   if (!isFinite(t)) return 'Invalid trigger price';
@@ -3386,9 +3396,18 @@ function createTradeNative(opts) {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
     return credsStatus();
   });
-  ipcMain.handle('att:trade-exec', (event, intent) => {
+  ipcMain.handle('att:trade-exec', async (event, intent) => {
     if (!senderOk(event)) return { ok: false, message: 'forbidden' };
-    return execIntent(intent);
+    const r = await execIntent(intent);
+    // Echo the path this exec ACTUALLY used (agentFor is the same pick every
+    // request in the intent rode) so the panel can label "Trading:
+    // Native·Proxy/Direct" from CONFIRMED fact, never from the pref. A
+    // refused agent (proxy on, unbuildable) echoes {refused:true}.
+    if (r && typeof r === 'object' && !r.via) {
+      try { r.via = tradeViaFromAgent(agentFor(intent && intent.route)); }
+      catch (e) { /* non-fatal — label just stays pending */ }
+    }
+    return r;
   });
 
   return { execIntent, credsStatus };   // exposed for shell-internal use/tests
@@ -3411,6 +3430,7 @@ module.exports = {
   findPosition,
   validateIntent,
   sltpTriggerOk,
+  tradeViaFromAgent,
   phemexErrorMessage,
   // pure — multi-venue (Binance / Bybit / OKX / Gate / Bitget)
   decNorm,

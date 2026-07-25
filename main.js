@@ -799,6 +799,11 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
     try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
   };
   ws.on('open', () => emit({ id, type: 'open' }));
+  // via = the path MAIN actually applied (not what the renderer requested):
+  // an agent means the tunnel is really in use; no agent means the dial goes
+  // over the plain internet (proxy off / explicit Direct). A refused open
+  // never reaches here — the panel's confirmed-transport label reads this.
+  const via = { transport: 'native', route: ag.agent ? 'proxy' : 'direct' };
   ws.on('message', (data, isBinary) => {
     // Binance market data is text JSON; forward verbatim as a string. Binary
     // frames (none expected) are dropped rather than guessed at.
@@ -816,7 +821,7 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
   ws.on('error', (err) => {
     emit({ id, type: 'error', message: (err && err.message) || 'error' });
   });
-  return { ok: true, id };
+  return { ok: true, id, via };
 });
 
 // POST the KuCoin bullet-public endpoint through the SAME proxy agent the
@@ -924,7 +929,8 @@ ipcMain.handle('att:ws-open-kucoin', async (event, market, route) => {
   ws.on('error', (err) => {
     emit({ id, type: 'error', message: (err && err.message) || 'error' });
   });
-  return { ok: true, id };
+  // Same confirmed-path echo as att:ws-open: ag is the agent used at DIAL time.
+  return { ok: true, id, via: { transport: 'native', route: ag.agent ? 'proxy' : 'direct' } };
 });
 
 // Forward an outbound text frame verbatim to the owning native socket.
