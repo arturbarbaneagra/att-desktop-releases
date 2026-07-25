@@ -109,6 +109,25 @@ ipcRenderer.on('att:ws-event', (_e, msg) => {
 });
 
 // ---------------------------------------------------------------------------
+// Native trading bridge — window.attTrade
+// ---------------------------------------------------------------------------
+// The renderer NEVER sees API keys: setCreds forwards the one-shot creds blob
+// (fetched by the page from the authed server endpoint) straight into the main
+// process, which stores it via Electron safeStorage; exec sends an order
+// INTENT that main validates/builds/signs itself. Presence of window.attTrade
+// is how the panel detects a native-trading-capable build (same pattern as
+// attNativeWS). No cross-transport fallback: a failed native call surfaces
+// {ok:false, message} and the page reports it — it never re-sends via server.
+try {
+  contextBridge.exposeInMainWorld('attTrade', {
+    setCreds: (venue, creds) => ipcRenderer.invoke('att:trade-creds-set', String(venue || ''), creds),
+    wipeCreds: (venue) => ipcRenderer.invoke('att:trade-creds-wipe', String(venue || '')),
+    status: () => ipcRenderer.invoke('att:trade-creds-status'),
+    exec: (intent) => ipcRenderer.invoke('att:trade-exec', intent),
+  });
+} catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
+
+// ---------------------------------------------------------------------------
 // Ctrl+scroll page zoom (shell-owned, every window shares this preload)
 // ---------------------------------------------------------------------------
 // Electron disables Chromium's default Ctrl+wheel zoom, so nothing happens

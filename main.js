@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Tray, Menu, shell, session, nativeImage, ipcMain } = require('electron');
+const { app, BrowserWindow, Tray, Menu, shell, session, nativeImage, ipcMain, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -670,6 +670,12 @@ const NATIVE_WS_HOSTS = new Set([
   'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
   'ws.bitmex.com',              // BitMEX realtime WS (spot + USDT-linear perps)
   'api.hyperliquid.xyz',        // Hyperliquid public market-data WS (/ws)
+  'stream.bybit.com',           // Bybit v5 public streams (linear + spot; text JSON)
+  'ws.okx.com',                 // OKX public WS (:8443 — host match only, port passes)
+  'api.arcus.xyz',              // Arcus futures public WS (/v1/ws; text JSON)
+  'indexer.spot.arcus.xyz',     // Arcus spot indexer WS (/ws; text JSON)
+  'fstream.asterdex.com',       // AsterDex USDT-M futures combined streams (Binance-family, text)
+  'sstream.asterdex.com',       // AsterDex spot combined streams (Binance-family, text)
 ]);
 function nativeWsUrlOk(url) {
   try {
@@ -939,6 +945,20 @@ ipcMain.on('att:ws-close', (event, payload) => {
   const rec = nativeSockets.get(id);
   if (!rec || rec.wcId !== event.sender.id) return;
   closeNativeSocket(id);
+});
+
+// ---------------------------------------------------------------------------
+// Native trading transport (trade_native.js) — creds in safeStorage, orders
+// signed and sent from the main process. Reuses the native-WS sender gate
+// (top-level app-origin frames only) and the same proxy-agent discipline.
+// ---------------------------------------------------------------------------
+const { createTradeNative } = require('./trade_native');
+createTradeNative({
+  ipcMain,
+  safeStorage,
+  getProxyConfig,
+  senderOk: nativeWsSenderOk,
+  userDataDir: () => app.getPath('userData'),
 });
 
 // ---------------------------------------------------------------------------
