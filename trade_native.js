@@ -68,6 +68,7 @@ const PHEMEX_ERRORS = {
   11041: 'Order price too far from the mark price',
   11057: 'Reduce-only order would increase the position',
   11077: 'Too many active orders for this symbol',
+  20004: 'Phemex has this symbol in Hedge mode — the app trades One-Way only',
   30000: 'Phemex rejected the request arguments',
   39995: 'Rate limited by Phemex — retry shortly',
   39996: 'Invalid or expired request signature',
@@ -263,6 +264,36 @@ function buildPhemexRequests(intent, spec) {
     ];
   }
   throw new Error('unknown op');
+}
+
+// --- Phemex hedge-mode (20004) recovery -------------------------------------
+// posSide:'Merged' orders require the symbol in ONE-WAY position mode; a user
+// who flipped the symbol to Hedge in the Phemex app gets every order rejected
+// with 20004 TE_ERR_INCONSISTENT_POS_MODE. Recovery: switch the symbol back to
+// one-way via the documented endpoint, then retry the original request ONCE.
+// NO proactive probe — zero happy-path latency (unlike the Binance guard).
+function phemexSwitchPosModeStep(symbol) {
+  return { method: 'PUT', path: '/g-positions/switch-pos-mode-sync',
+           query: 'symbol=' + symbol + '&targetPosMode=OneWay', body: null };
+}
+
+// Pure recovery flow (node-testable): `send(step)` is the signed-request
+// runner. Non-20004 rejects pass through UNCHANGED; on 20004 the switch is
+// attempted and the original step retried exactly once; a failed switch
+// (Phemex refuses while hedge positions/active orders exist) returns a clear
+// actionable message. Never loops.
+async function phemexHedgeRecoveryFlow(send, step) {
+  const r = await send(step);
+  if (!r || r.ok || Number(r.code) !== 20004) return r;
+  const sym = String((step && step.body && step.body.symbol) || '');
+  const sw = await send(phemexSwitchPosModeStep(sym));
+  if (!sw || !sw.ok) {
+    return { ok: false, code: 20004,
+             message: 'Phemex has ' + (sym || 'this symbol') + ' in Hedge mode and it could not '
+                    + 'be switched automatically — close hedge positions/orders and switch to '
+                    + 'One-Way in Phemex settings, then retry' };
+  }
+  return await send(step);
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,7 +1690,8 @@ function createTradeNative(opts) {
     }
     const code = data && data.code;
     if (code !== 0 && code != null) {
-      return { ok: false, message: phemexErrorMessage(code, String((data && data.msg) || '')) };
+      return { ok: false, code: Number(code),
+               message: phemexErrorMessage(code, String((data && data.msg) || '')) };
     }
     return { ok: true, data: (data && data.data !== undefined) ? data.data : data };
   }
@@ -3465,7 +3497,9 @@ function createTradeNative(opts) {
         const side = String(pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
         const body = phemexFuturesOrderBody(pos.symbol, side, 'market', pos.size,
                                             null, intent.clOrdID, { reduceOnly: true });
-        const r = await signedRequest(creds, { method: 'POST', path: '/g-orders', query: '', body: body }, route);
+        const r = await phemexHedgeRecoveryFlow(
+          (step) => signedRequest(creds, step, route),
+          { method: 'POST', path: '/g-orders', query: '', body: body });
         if (!r.ok) return r;
         const oid = r.data && (r.data.orderID || r.data.orderId);
         return { ok: true, orderID: oid || null, clOrdID: intent.clOrdID };
@@ -3488,7 +3522,9 @@ function createTradeNative(opts) {
                                             null, intent.clOrdID,
                                             { reduceOnly: true, trigger: intent.trigger,
                                               closeOnTrigger: true });
-        const r = await signedRequest(creds, { method: 'POST', path: '/g-orders', query: '', body: body }, route);
+        const r = await phemexHedgeRecoveryFlow(
+          (step) => signedRequest(creds, step, route),
+          { method: 'POST', path: '/g-orders', query: '', body: body });
         if (!r.ok) return r;
         const oid = r.data && (r.data.orderID || r.data.orderId);
         return { ok: true, kind: intent.kind, orderID: oid || null, clOrdID: intent.clOrdID };
@@ -3511,7 +3547,11 @@ function createTradeNative(opts) {
       }
       let last = null;
       for (const step of steps) {
-        last = await signedRequest(creds, step, route);
+        // Futures order POSTs get the 20004 hedge-mode recovery (switch the
+        // symbol to one-way + single retry); everything else is unchanged.
+        last = (step.method === 'POST' && step.path === '/g-orders')
+          ? await phemexHedgeRecoveryFlow((s) => signedRequest(creds, s, route), step)
+          : await signedRequest(creds, step, route);
         if (!last.ok) return last;   // FAIL LOUD — no partial-success masking
       }
       if (intent.op === 'order') {
@@ -3571,6 +3611,8 @@ module.exports = {
   phemexSpotOrderBody,
   canonJson,
   buildPhemexRequests,
+  phemexSwitchPosModeStep,
+  phemexHedgeRecoveryFlow,
   phemexPositionRows,
   findPosition,
   validateIntent,
