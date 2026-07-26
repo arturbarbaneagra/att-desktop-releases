@@ -402,6 +402,67 @@ const BYBIT_RECV_WINDOW_MS = 5000;
 const ONEWAY_TTL_MS = 600 * 1000;      // Binance position-mode check cache
 const POS_RETRY_DELAY_MS = 400;        // fresh-position REST lag retry
 
+// --- venue time-probe registry (public time endpoints; pure data) ----------
+// Every HMAC venue signs with "PC clock + offset" where offset comes from a
+// lazy TTL-refreshed probe of that venue's public time endpoint (same
+// discipline as the original Phemex timeSync: stamp-first single probe per
+// TTL, failure keeps the last offset, initial 0 = raw PC clock). Offset 0
+// keeps every signature byte-identical to before (golden parity).
+// BitMEX has NO public time endpoint — it reads the HTTP Date header off a
+// cheap unauthenticated GET instead (second resolution; centered +500ms —
+// plenty for a 30s api-expires window).
+const VENUE_TIME_PROBES = {
+  'phemex': { host: PHEMEX_HOST, path: '/public/time',
+              ext: (d) => Number((d && d.data && (d.data.serverTime || d.data.timestamp))) },
+  'binance:spot':    { host: BINANCE_SPOT_HOST, path: '/api/v3/time',
+                       ext: (d) => Number((d || {}).serverTime) },
+  'binance:futures': { host: BINANCE_FUT_HOST, path: '/fapi/v1/time',
+                       ext: (d) => Number((d || {}).serverTime) },
+  'bybit':  { host: BYBIT_HOST, path: '/v5/market/time',
+              ext: (d) => Number((((d || {}).result) || {}).timeNano) / 1e6 },
+  'okx':    { host: OKX_HOST, path: '/api/v5/public/time',
+              ext: (d) => Number(((((d || {}).data) || [])[0] || {}).ts) },
+  'gate':   { host: GATE_HOST, path: GATE_API_PREFIX + '/spot/time',
+              ext: (d) => Number((d || {}).server_time) },
+  'bitget': { host: BITGET_HOST, path: '/api/v2/public/time',
+              ext: (d) => Number(((d || {}).data || {}).serverTime) },
+  'kucoin:spot':    { host: KUCOIN_SPOT_HOST, path: '/api/v1/timestamp',
+                      ext: (d) => Number((d || {}).data) },
+  'kucoin:futures': { host: KUCOIN_FUT_HOST, path: '/api/v1/timestamp',
+                      ext: (d) => Number((d || {}).data) },
+  'bitmex': { host: BITMEX_HOST, path: BITMEX_API_PREFIX + '/announcement/urgent',
+              dateHeader: true },
+  'asterdex:futures': { host: ASTER_FUT_HOST, path: '/fapi/v1/time',
+                        ext: (d) => Number((d || {}).serverTime) },
+  'asterdex:spot':    { host: ASTER_SPOT_HOST, path: '/api/v1/time',
+                        ext: (d) => Number((d || {}).serverTime) },
+};
+
+// venue+market → probe spec (market-split hosts get their own offsets).
+function venueTimeProbe(venue, market) {
+  const mk = market === 'spot' ? 'spot' : 'futures';
+  return VENUE_TIME_PROBES[venue + ':' + mk] || VENUE_TIME_PROBES[venue] || null;
+}
+function venueTimeProbeKey(venue, market) {
+  const mk = market === 'spot' ? 'spot' : 'futures';
+  return VENUE_TIME_PROBES[venue + ':' + mk] ? venue + ':' + mk
+       : (VENUE_TIME_PROBES[venue] ? venue : null);
+}
+
+// serverMs vs midpoint of the probe round-trip → offset to ADD to Date.now().
+function venueClkOffset(serverMs, t0, t1) {
+  return Number(serverMs) - (Number(t0) + Number(t1)) / 2;
+}
+
+// Offset-corrected timestamp stampers (offset 0 → byte-identical to the old
+// raw Date.now() stamps — Date.now() is already an integer).
+function venueStampMs(offsetMs, nowMs) {
+  return String(Math.round((nowMs != null ? Number(nowMs) : Date.now()) + (offsetMs || 0)));
+}
+function venueStampSec(offsetMs, nowMs) {
+  return String(Math.floor(((nowMs != null ? Number(nowMs) : Date.now()) + (offsetMs || 0)) / 1000));
+}
+
 // --- exact decimal helpers (BigInt — Python Decimal parity) ----------------
 // Parse a plain decimal string → { neg, digits(BigInt, unsigned), scale }.
 function decNorm(v) {
@@ -1475,7 +1536,8 @@ function createTradeNative(opts) {
         let buf = '';
         res.setEncoding('utf8');
         res.on('data', (d) => { if (buf.length < 262144) buf += d; });
-        res.on('end', () => resolve({ status: res.statusCode, text: buf }));
+        res.on('end', () => resolve({ status: res.statusCode, text: buf,
+                                      date: (res.headers && res.headers.date) || null }));
       });
       req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) { /* noop */ } });
       req.on('error', reject);
@@ -1484,20 +1546,34 @@ function createTradeNative(opts) {
   }
 
   // --- venue time sync (offset refreshed lazily; failure → offset 0) -------
-  const timeSync = { offsetSec: 0, ts: 0 };
-  async function ensureTimeSync(route) {
-    if (Date.now() - timeSync.ts < TIMESYNC_TTL_MS) return;
-    timeSync.ts = Date.now();          // stamp first — one probe per TTL even on failure
+  // One offset per venue+host (VENUE_TIME_PROBES key). Lazy: first signed
+  // call probes, TTL-stamped FIRST so a dead endpoint costs one probe per
+  // TTL; probe failure keeps the last offset (0 initially — old behavior).
+  // Probes ride the SAME httpJson + route as the venue's orders.
+  const venueClk = {};                 // probeKey → { offsetMs, ts }
+  async function ensureVenueTime(venue, market, route) {
+    const key = venueTimeProbeKey(venue, market);
+    if (!key) return 0;
+    const spec = VENUE_TIME_PROBES[key];
+    const st = venueClk[key] || (venueClk[key] = { offsetMs: 0, ts: 0 });
+    if (Date.now() - st.ts < TIMESYNC_TTL_MS) return st.offsetMs;
+    st.ts = Date.now();                // stamp first — one probe per TTL even on failure
     try {
       const t0 = Date.now();
-      const r = await httpJson(PHEMEX_HOST, 'GET', '/public/time', '', null, {}, route);
-      const d = JSON.parse(r.text);
-      const st = Number(d && d.data && (d.data.serverTime || d.data.timestamp));
-      if (isFinite(st) && st > 1e12) {
-        const mid = (t0 + Date.now()) / 2;
-        timeSync.offsetSec = (st - mid) / 1000;
+      const r = await httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
+      const t1 = Date.now();
+      let sv = null;
+      if (spec.dateHeader) {
+        // HTTP Date header (BitMEX — no time endpoint): second resolution,
+        // centered by +500ms.
+        const p = r.date ? Date.parse(r.date) : NaN;
+        if (isFinite(p)) sv = p + 500;
+      } else {
+        sv = spec.ext(JSON.parse(r.text));
       }
+      if (isFinite(sv) && sv > 1e12) st.offsetMs = venueClkOffset(sv, t0, t1);
     } catch (e) { /* keep last offset (0 initially — engine-parity behavior) */ }
+    return st.offsetMs;
   }
 
   // --- products cache (spot base valueScale) -------------------------------
@@ -1526,9 +1602,9 @@ function createTradeNative(opts) {
 
   // --- signed request runner ------------------------------------------------
   async function signedRequest(creds, step, route) {
-    await ensureTimeSync(route);
+    const offMs = await ensureVenueTime('phemex', null, route);
     const bodyStr = step.body != null ? canonJson(step.body) : '';
-    const expiry = phemexExpiry(null, timeSync.offsetSec);
+    const expiry = phemexExpiry(null, offMs / 1000);
     const headers = {
       'x-phemex-access-token': creds.key,
       'x-phemex-request-signature': phemexSign(creds.secret, step.path, step.query || '', expiry, bodyStr),
@@ -1599,9 +1675,10 @@ function createTradeNative(opts) {
   function bnHost(market) { return market === 'futures' ? BINANCE_FUT_HOST : BINANCE_SPOT_HOST; }
 
   async function bnRequest(creds, method, market, reqPath, params, route) {
+    const offMs = await ensureVenueTime('binance', market, route);
     const q = formEnc((params || []).concat([
       ['recvWindow', String(BINANCE_RECV_WINDOW_MS)],
-      ['timestamp', String(Date.now())],
+      ['timestamp', venueStampMs(offMs)],
     ]));
     const query = q + '&signature=' + binanceSign(creds.secret, q);
     let r;
@@ -1736,7 +1813,7 @@ function createTradeNative(opts) {
 
   // --- Bybit -------------------------------------------------------------------
   async function bybRequest(creds, method, reqPath, params, body, route) {
-    const ts = String(Date.now());
+    const ts = venueStampMs(await ensureVenueTime('bybit', null, route));
     const q = params && params.length ? formEnc(params) : '';
     const bodyStr = body != null ? canonJson(body) : '';
     const payload = method === 'GET' ? q : bodyStr;
@@ -1880,7 +1957,7 @@ function createTradeNative(opts) {
   async function okxRequest(creds, method, reqPath, params, body, route) {
     const q = params && params.length ? formEnc(params) : '';
     const bodyStr = body != null ? canonJson(body) : '';
-    const ts = okxTs();
+    const ts = okxTs(Date.now() + await ensureVenueTime('okx', null, route));
     const fullPath = reqPath + (q ? '?' + q : '');
     const headers = {
       'OK-ACCESS-KEY': creds.key,
@@ -2061,7 +2138,7 @@ function createTradeNative(opts) {
   async function gateRequest(creds, method, reqPath, params, body, route) {
     const q = params && params.length ? formEnc(params) : '';
     const bodyStr = body != null ? canonJson(body) : '';
-    const ts = String(Math.floor(Date.now() / 1000));
+    const ts = venueStampSec(await ensureVenueTime('gate', null, route));
     const fullPath = GATE_API_PREFIX + reqPath;
     const headers = {
       'KEY': creds.key,
@@ -2192,7 +2269,7 @@ function createTradeNative(opts) {
   async function bitgetRequest(creds, method, reqPath, params, body, route) {
     const q = params && params.length ? formEnc(params) : '';
     const bodyStr = body != null ? canonJson(body) : '';
-    const ts = String(Date.now());
+    const ts = venueStampMs(await ensureVenueTime('bitget', null, route));
     const fullPath = reqPath + (q ? '?' + q : '');
     const headers = {
       'ACCESS-KEY': creds.key,
@@ -2388,7 +2465,7 @@ function createTradeNative(opts) {
     const q = params && params.length ? formEnc(params) : '';
     const bodyStr = body != null ? canonJson(body) : '';
     const reqPath = path + (q ? '?' + q : '');
-    const ts = String(Date.now());
+    const ts = venueStampMs(await ensureVenueTime('kucoin', market, route));
     const headers = {
       'KC-API-KEY': creds.key,
       'KC-API-SIGN': kcSign(creds.secret, ts, method, reqPath, bodyStr),
@@ -2566,7 +2643,7 @@ function createTradeNative(opts) {
   async function bmxRequest(creds, method, path, params, bodyStr, route) {
     const q = params && params.length ? formEnc(params) : '';
     const reqPath = BITMEX_API_PREFIX + path + (q ? '?' + q : '');
-    const expires = bmxExpires();
+    const expires = bmxExpires((Date.now() + await ensureVenueTime('bitmex', null, route)) / 1000);
     const headers = {
       'api-key': creds.key,
       'api-expires': String(expires),
@@ -2994,9 +3071,13 @@ function createTradeNative(opts) {
     // Creds slots: key = user wallet address, secret = API signer private
     // key, pass = signer address (mirrors the engine's 3-slot blob).
     reqPath = ASTER_PATHS[method + ' ' + reqPath] || reqPath;
+    // Aster's signed nonce IS a wall-clock µs timestamp (Binance-family
+    // recvWindow discipline applies) — feed it the offset-corrected clock.
+    const offMs = await ensureVenueTime('asterdex', market, route);
     let parts;
     try {
-      parts = dexSign.asterSignParams(creds.key, creds.pass, creds.secret, params || []);
+      parts = dexSign.asterSignParams(creds.key, creds.pass, creds.secret, params || [],
+                                      dexSign.asterNextNonce(Math.round((Date.now() + offMs) * 1000)));
     } catch (e) {
       return { ok: false, message: 'Aster signing failed: ' + ((e && e.message) || 'error') };
     }
@@ -3432,6 +3513,13 @@ module.exports = {
   sltpTriggerOk,
   tradeViaFromAgent,
   phemexErrorMessage,
+  // pure — venue time sync (offset math + probe registry)
+  VENUE_TIME_PROBES,
+  venueTimeProbe,
+  venueTimeProbeKey,
+  venueClkOffset,
+  venueStampMs,
+  venueStampSec,
   // pure — multi-venue (Binance / Bybit / OKX / Gate / Bitget)
   decNorm,
   bnNum,
