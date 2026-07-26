@@ -1541,7 +1541,12 @@ function createTradeNative(opts) {
     return { refuse: true };   // never dial direct past an enabled proxy
   }
 
-  function httpJson(host, method, reqPath, query, bodyStr, headers, route) {
+  // maxBytes: optional response-body cap. Default stays 256 KB (byte-identical
+  // behavior for every existing call); full-catalog GETs (Phemex
+  // /public/products is ~2.5 MB and growing) MUST pass a larger cap or the
+  // body silently truncates and JSON.parse fails downstream.
+  function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
+    const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
     return new Promise((resolve, reject) => {
       const ag = agentFor(route);
       if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
@@ -1555,7 +1560,7 @@ function createTradeNative(opts) {
       }, (res) => {
         let buf = '';
         res.setEncoding('utf8');
-        res.on('data', (d) => { if (buf.length < 262144) buf += d; });
+        res.on('data', (d) => { if (buf.length < cap) buf += d; });
         res.on('end', () => resolve({ status: res.statusCode, text: buf,
                                       date: (res.headers && res.headers.date) || null }));
       });
@@ -1597,10 +1602,17 @@ function createTradeNative(opts) {
   }
 
   // --- products cache (spot base valueScale) -------------------------------
+  // spotSpec THROWS on catalog fetch/parse failure (network, truncation, bad
+  // JSON) and returns null ONLY for a successfully-loaded catalog that lacks
+  // the symbol — the call site maps the throw to an honest "couldn't load
+  // catalog" message instead of "Unknown spot symbol X".
+  // The full Phemex catalog measured ~2.5 MB (2026-07); pass an 8 MB cap so
+  // the default 256 KB httpJson cap doesn't silently truncate it.
   const products = { spot: null, ts: 0 };
   async function spotSpec(symbol, route) {
     if (!products.spot || Date.now() - products.ts > PRODUCTS_TTL_MS) {
-      const r = await httpJson(PHEMEX_HOST, 'GET', '/public/products', '', null, {}, route);
+      const r = await httpJson(PHEMEX_HOST, 'GET', '/public/products', '', null, {}, route,
+                               8 * 1024 * 1024);
       const d = JSON.parse(r.text);
       const data = (d && d.data) || {};
       const curScales = {};
@@ -3484,7 +3496,13 @@ function createTradeNative(opts) {
       // order / cancel / cancel_all ride the pure request builders.
       let spec = null;
       if (intent.op === 'order' && intent.market === 'spot') {
-        try { spec = await spotSpec(intent.symbol, route); } catch (e) { spec = null; }
+        try { spec = await spotSpec(intent.symbol, route); }
+        catch (e) {
+          // Catalog fetch/parse failed — NOT a symbol problem. Honest error;
+          // "Unknown spot symbol" is reserved for a loaded catalog miss.
+          return { ok: false, message: "Couldn't load Phemex spot catalog — order NOT sent ("
+                                       + ((e && e.message) || 'error') + ')' };
+        }
         if (!spec) return { ok: false, message: 'Unknown spot symbol ' + intent.symbol };
       }
       let steps;
