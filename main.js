@@ -968,6 +968,19 @@ createTradeNative({
 });
 
 // ---------------------------------------------------------------------------
+// Device API-key vault (keyvault.js) — per-panel-user exchange keys stored on
+// THIS machine via safeStorage; keys saved here never touch the server. Same
+// sender gate + userData dir discipline as the native trading store.
+// ---------------------------------------------------------------------------
+const { createKeyVault } = require('./keyvault');
+createKeyVault({
+  ipcMain,
+  safeStorage,
+  senderOk: nativeWsSenderOk,
+  userDataDir: () => app.getPath('userData'),
+});
+
+// ---------------------------------------------------------------------------
 // Auto-update (electron-updater; NSIS installer builds only)
 // ---------------------------------------------------------------------------
 // The portable exe cannot self-update (there is nothing installed to replace),

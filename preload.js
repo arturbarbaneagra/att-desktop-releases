@@ -128,6 +128,23 @@ try {
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 
 // ---------------------------------------------------------------------------
+// Device API-key vault bridge — window.attKeyVault
+// ---------------------------------------------------------------------------
+// Per-panel-user exchange API keys stored ONLY on this machine (safeStorage).
+// get() returns the decrypted blob to the page purely as an arm-time handoff
+// into attTrade.setCreds — identical trust surface to the server release path.
+// Presence of window.attKeyVault is how the panel detects a vault-capable
+// shell build; older shells simply lack it and the panel degrades gracefully.
+try {
+  contextBridge.exposeInMainWorld('attKeyVault', {
+    set: (user, venue, creds) => ipcRenderer.invoke('att:keyvault-set', String(user || ''), String(venue || ''), creds),
+    get: (user, venue) => ipcRenderer.invoke('att:keyvault-get', String(user || ''), String(venue || '')),
+    del: (user, venue) => ipcRenderer.invoke('att:keyvault-del', String(user || ''), String(venue || '')),
+    list: (user) => ipcRenderer.invoke('att:keyvault-list', String(user || '')),
+  });
+} catch (e) { /* non-fatal — vault unavailable, panel keeps Server keys */ }
+
+// ---------------------------------------------------------------------------
 // Ctrl+scroll page zoom (shell-owned, every window shares this preload)
 // ---------------------------------------------------------------------------
 // Electron disables Chromium's default Ctrl+wheel zoom, so nothing happens
