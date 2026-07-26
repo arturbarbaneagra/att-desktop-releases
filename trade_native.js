@@ -359,6 +359,26 @@ function tradeViaFromAgent(ag) {
   return { transport: 'native', route: (ag && ag.agent) ? 'proxy' : 'direct' };
 }
 
+// Read-only latency-probe target per venue+market (op:'ping_rt') — one cheap
+// PUBLIC endpoint on the SAME REST host the venue's orders dial (no keys, no
+// signing, no order). Reuses the venue time-probe registry where one exists;
+// the two venues without a public time endpoint get their own cheap GET/POST.
+// Pure — node-testable. null = venue has no probe target (panel skips).
+function pingRtTarget(venue, market) {
+  const p = venueTimeProbe(venue, market);
+  if (p) return { host: p.host, method: 'GET', path: p.path, body: null };
+  if (venue === 'hyperliquid') {
+    // HL has no GET time endpoint — /info is POST-only; "meta" is the
+    // cheapest public query and rides the exact host orders use.
+    return { host: HL_HOST, method: 'POST', path: '/info', body: '{"type":"meta"}' };
+  }
+  if (venue === 'arcus') {
+    // Arcus health endpoint lives at /health (NOT under /v1).
+    return { host: ARCUS_HOST, method: 'GET', path: '/health', body: null };
+  }
+  return null;
+}
+
 function sltpTriggerOk(kind, posSide, trigger, mark) {
   const t = Number(trigger);
   if (!isFinite(t)) return 'Invalid trigger price';
@@ -3376,6 +3396,32 @@ function createTradeNative(opts) {
 
   // One intent → executed result (renderer-facing shape mirrors the engine).
   async function execIntent(intent) {
+    // Read-only latency probe (op:'ping_rt') — handled BEFORE validation and
+    // creds: no keys, no signing, no order. One cheap public GET/POST against
+    // the venue's REST host via the SAME route arg orders would ride, so the
+    // panel's Order/Exec chips show the honest native round-trip and the IPC
+    // handler's via-echo confirms the "Trading: Native·…" label. Old shells
+    // without this branch fall through to validateIntent's 'unknown op' — the
+    // panel treats that as unsupported and stamps nothing.
+    if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
+      if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
+      const tgt = pingRtTarget(intent.venue, intent.market === 'spot' ? 'spot' : 'futures');
+      if (!tgt) return { ok: false, message: 'no probe target for this venue' };
+      const route = routeNorm(intent.route);
+      try {
+        const r = await httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, route);
+        // Any answer from the venue host < 500 counts — the probe measures the
+        // path, not the endpoint's semantics.
+        if (!r || !r.status || r.status >= 500) {
+          return { ok: false, message: 'venue ping failed (HTTP ' + ((r && r.status) || 0) + ')' };
+        }
+        return { ok: true };
+      } catch (e) {
+        const em = (e && e.message) || 'error';
+        if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
+        return { ok: false, message: 'venue ping failed: ' + em };
+      }
+    }
     const verr = validateIntent(intent);
     if (verr) return { ok: false, message: verr };
     const creds = credsGet(intent.venue);
@@ -3512,6 +3558,7 @@ module.exports = {
   validateIntent,
   sltpTriggerOk,
   tradeViaFromAgent,
+  pingRtTarget,
   phemexErrorMessage,
   // pure — venue time sync (offset math + probe registry)
   VENUE_TIME_PROBES,
