@@ -1318,10 +1318,21 @@ function kucoinCancelGone(errText) {
   if (!s) return false;
   for (const needle of ['already cancelled', 'already canceled', 'already filled',
                         'does not exist', 'not exist', 'order not found',
-                        '404000', '100004']) {
+                        '404000', '100004', 'http 404']) {
     if (s.indexOf(needle) >= 0) return true;
   }
   return false;
+}
+
+// A 2xx response whose body failed JSON.parse must surface as an HONEST
+// error message, NEVER ok:true/data:null — the httpJson byte cap can
+// truncate huge bodies (symbol-less /fapi/v2/positionRisk measured 200KB+),
+// and a data:null "success" once made futures close report "Position not
+// found". Returns the error message, or null when the parse succeeded.
+// (>=400 statuses are handled by the callers' own HTTP-error branches.)
+function unreadableBodyMsg(venue, status, parsed) {
+  if (parsed !== null && parsed !== undefined) return null;
+  return String(venue) + ' returned an unreadable response (HTTP ' + status + ')';
 }
 
 // --- BitMEX pure builders (parity with terminal_engine.py) -----------------
@@ -1761,6 +1772,8 @@ function createTradeNative(opts) {
                                : 'Binance returned HTTP ' + r.status;
       return { ok: false, message: msg, code: code };
     }
+    const unreadable = unreadableBodyMsg('Binance', r.status, data);
+    if (unreadable) return { ok: false, message: unreadable, code: null };
     return { ok: true, data: data, code: code };
   }
 
@@ -1813,7 +1826,10 @@ function createTradeNative(opts) {
   async function execBinance(creds, intent, route) {
     const market = intent.market === 'spot' ? 'spot' : 'futures';
     const fetchPos = async () => {
-      const r = await bnRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk', [], route);
+      // v3 + explicit symbol: the symbol-less v2 call returns EVERY listed
+      // contract (200KB+, past the httpJson byte cap → truncated body).
+      const r = await bnRequest(creds, 'GET', 'futures', '/fapi/v3/positionRisk',
+                                [['symbol', String(intent.symbol)]], route);
       if (!r.ok) return r;
       return { ok: true, rows: binancePositionRows(r.data) };
     };
@@ -2541,18 +2557,38 @@ function createTradeNative(opts) {
     try {
       r = await httpJson(host, method, path, q, bodyStr || null, headers, route);
     } catch (e) { return transportFail(e, 'KuCoin'); }
-    if (r.status === 429) return { ok: false, message: 'Rate limited by KuCoin — retry shortly' };
+    if (r.status === 429) {
+      return { ok: false, message: 'Rate limited by KuCoin — retry shortly', status: 429 };
+    }
     let data;
     try { data = r.text ? JSON.parse(r.text) : {}; } catch (e) {
-      return { ok: false, message: 'KuCoin returned HTTP ' + r.status };
+      // Bare HTTP failures (e.g. an empty-body 404 on a stop delete) carry
+      // the status so call sites can match "gone" without string games.
+      return { ok: false, message: 'KuCoin returned HTTP ' + r.status, status: r.status };
     }
     const code = (data && typeof data === 'object' && data.code != null) ? String(data.code) : null;
     if (code == null) {
-      if (r.status >= 400) return { ok: false, message: 'KuCoin returned HTTP ' + r.status };
+      if (r.status >= 400) {
+        return { ok: false, message: 'KuCoin returned HTTP ' + r.status, status: r.status };
+      }
       return { ok: true, data: data };
     }
     if (code === '200000') return { ok: true, data: data };
-    return { ok: false, message: kcErrorMessage(code, String((data && data.msg) || '')) };
+    return { ok: false, message: kcErrorMessage(code, String((data && data.msg) || '')),
+             status: r.status };
+  }
+
+  // KuCoin rate-limit discipline for multi-call sweeps: space the calls and
+  // give ONE mid-sweep 429 a breather + single retry instead of failing the
+  // whole cancel-all (the unspaced sweep itself used to trip the limiter).
+  const KC_SWEEP_SPACING_MS = 150;
+  const KC_SWEEP_429_WAIT_MS = 1500;
+  function kcRateLimited(rc) {
+    return !rc.ok && (rc.status === 429 ||
+                      String(rc.message || '').toLowerCase().indexOf('rate limited') >= 0);
+  }
+  function kcCancelGoneRc(rc) {
+    return rc.status === 404 || kucoinCancelGone(rc.message);
   }
 
   async function kcMult(symbol, route) {
@@ -2650,9 +2686,23 @@ function createTradeNative(opts) {
                                 [['symbol', String(intent.symbol)]], null, route);
       if (!r.ok) return r;
       if (market === 'futures') {
-        // Sweep untriggered stops too — terminal rule.
+        // Clear untriggered stops too — terminal rule. ONE documented bulk
+        // call (DELETE /api/v1/stopOrders?symbol=) replaces the old
+        // 10-page-list + per-stop-delete sweep that tripped the rate limit;
+        // the paced sweep survives only as a fallback.
+        await sleepMs(KC_SWEEP_SPACING_MS);
+        let rb = await kcRequest(creds, 'DELETE', 'futures', '/api/v1/stopOrders',
+                                 [['symbol', String(intent.symbol)]], null, route);
+        if (kcRateLimited(rb)) {
+          await sleepMs(KC_SWEEP_429_WAIT_MS);
+          rb = await kcRequest(creds, 'DELETE', 'futures', '/api/v1/stopOrders',
+                               [['symbol', String(intent.symbol)]], null, route);
+        }
+        if (rb.ok || kcCancelGoneRc(rb)) return { ok: true, cancelled: 'all' };
+        // Fallback: paced per-stop sweep (spacing + one mid-sweep 429 retry).
         const pend = [];
         for (let page = 1; page <= 10; page++) {
+          await sleepMs(KC_SWEEP_SPACING_MS);
           const rp = await kcRequest(creds, 'GET', 'futures', '/api/v1/stopOrders',
                                      [['currentPage', String(page)], ['pageSize', '100']],
                                      null, route);
@@ -2669,10 +2719,16 @@ function createTradeNative(opts) {
           if (page >= total || !lst.length) break;
         }
         for (const sid of pend) {
-          const rc = await kcRequest(creds, 'DELETE', 'futures',
-                                     '/api/v1/stopOrders/' + sid, null, null, route);
+          await sleepMs(KC_SWEEP_SPACING_MS);
+          let rc = await kcRequest(creds, 'DELETE', 'futures',
+                                   '/api/v1/stopOrders/' + sid, null, null, route);
+          if (kcRateLimited(rc)) {
+            await sleepMs(KC_SWEEP_429_WAIT_MS);
+            rc = await kcRequest(creds, 'DELETE', 'futures',
+                                 '/api/v1/stopOrders/' + sid, null, null, route);
+          }
           if (!rc.ok) {
-            if (kucoinCancelGone(rc.message)) continue;
+            if (kcCancelGoneRc(rc)) continue;
             return rc;
           }
         }
@@ -3162,6 +3218,8 @@ function createTradeNative(opts) {
                                : 'Aster returned HTTP ' + r.status;
       return { ok: false, message: msg, code: code };
     }
+    const unreadable = unreadableBodyMsg('Aster', r.status, data);
+    if (unreadable) return { ok: false, message: unreadable, code: null };
     return { ok: true, data: data, code: code };
   }
   const asterOneway = {};
@@ -3202,7 +3260,10 @@ function createTradeNative(opts) {
   async function execAster(creds, intent, route) {
     const market = intent.market === 'spot' ? 'spot' : 'futures';
     const fetchPos = async () => {
-      const r = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk', [], route);
+      // Explicit symbol (Binance-family): the symbol-less list grows with
+      // the venue's catalog and can blow past the httpJson byte cap.
+      const r = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk',
+                                   [['symbol', String(intent.symbol)]], route);
       if (!r.ok) return r;
       return { ok: true, rows: binancePositionRows(r.data) };
     };
@@ -3638,6 +3699,7 @@ module.exports = {
   binanceOrderParams,
   binanceAlgoOrderParams,
   binancePositionRows,
+  unreadableBodyMsg,
   bybitSign,
   bybitErrorMessage,
   bybitOrderBody,
