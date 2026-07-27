@@ -45,7 +45,15 @@ try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e
 // of writing into a server-killed socket.
 // ---------------------------------------------------------------------------
 const KEEPALIVE_MSECS = 15000;
+// Cap concurrent sockets per agent (= per proxy config). Without a cap Node's
+// http.Agent NEVER queues onto warm sockets — every concurrent request in a
+// burst dials a brand-new SOCKS+TCP+TLS tunnel (empirically proven with
+// req.reusedSocket harnesses), flooding the proxy chain and dropping some
+// mid-TLS ("disconnected before secure TLS"). 4 warm lanes absorb scalping
+// bursts while forcing reuse.
+const KA_MAX_SOCKETS = 4;
 const _kaAgents = new Map();   // 'direct' | '<scheme>|<proxyUrl>' → Agent
+let _kaWarmed = new Set();     // warm-up keys ('<venue>') — cleared on flush
 
 function kaAgentKey(scheme, proxyUrl) {
   return proxyUrl ? String(scheme) + '|' + String(proxyUrl) : 'direct';
@@ -58,12 +66,23 @@ function sharedKeepAliveAgent(scheme, proxyUrl) {
   const key = kaAgentKey(scheme, proxyUrl);
   const hit = _kaAgents.get(key);
   if (hit) return hit;
-  const opts = { keepAlive: true, keepAliveMsecs: KEEPALIVE_MSECS, scheduling: 'lifo' };
+  const opts = { keepAlive: true, keepAliveMsecs: KEEPALIVE_MSECS, scheduling: 'lifo',
+                 maxSockets: KA_MAX_SOCKETS };
   let ag = null;
   try {
     if (!proxyUrl) ag = new https.Agent(opts);
     else if (scheme === 'socks5' && SocksProxyAgent) ag = new SocksProxyAgent(proxyUrl, opts);
     else if (scheme === 'http' && HttpsProxyAgent) ag = new HttpsProxyAgent(proxyUrl, opts);
+    // agent-base (SocksProxyAgent / HttpsProxyAgent) computes the connection
+    // pool name via a stack-trace sniff in isSecureEndpoint(): at addRequest
+    // time the stack contains node:https (→ long TLS pool name) but the
+    // deferred createSocket runs off a clean Promise stack (→ short name).
+    // Freed sockets land under the short key, lookups use the long key —
+    // so keepAlive NEVER reuses and, with maxSockets set, queued bursts
+    // DEADLOCK (empirically proven with a local SOCKS5 relay harness). We
+    // only ever dial HTTPS/wss venue hosts, so pinning secure=true on the
+    // instance makes both sides compute the same name and pooling works.
+    if (ag && proxyUrl) ag.isSecureEndpoint = () => true;
   } catch (e) { ag = null; }
   if (ag) _kaAgents.set(key, ag);
   return ag;
@@ -76,6 +95,7 @@ function flushKeepAliveAgents() {
     try { ag.destroy(); } catch (e) { /* non-fatal */ }
   }
   _kaAgents.clear();
+  _kaWarmed.clear();   // warmth re-establishes on next arm/action — no timer loop
 }
 
 // --- stale-socket retry policy (pure) --------------------------------------
@@ -97,6 +117,32 @@ function staleSocketError(err) {
   if (code === 'ECONNRESET' || code === 'EPIPE') return true;
   const em = String(err.message || '');
   return /\b(ECONNRESET|EPIPE)\b/.test(em) || /socket hang up/i.test(em);
+}
+
+// CONNECT-PHASE failures: the tunnel/TLS never came up, so the request body
+// was NEVER transmitted — retrying is safe for ALL methods including order
+// POSTs (nothing reached the venue; no double-fill risk). Matches the exact
+// mid-TLS drop the proxy chain produces under burst dialing, plus refused /
+// unreachable dials and SOCKS/proxy handshake errors. Pure — node-testable.
+function connectPhaseError(err) {
+  if (!err) return false;
+  const code = err.code;
+  if (code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return true;
+  const em = String(err.message || '');
+  return /disconnected before secure TLS/i.test(em) ||
+         /\b(ECONNREFUSED|EHOSTUNREACH|ENETUNREACH)\b/.test(em) ||
+         /socks/i.test(em) ||                      // SOCKS handshake/relay errors
+         /proxy connection/i.test(em);             // HttpsProxyAgent CONNECT failures
+}
+
+// Retry decision by failure PHASE, not just method (pure — node-testable):
+// - sent=false (request never flushed to the wire) + connect-phase or
+//   dead-socket error → retry once for ANY method, POST included.
+// - sent=true (request hit the wire) → keep the strict matrix: GET/DELETE
+//   retry once on dead-socket errors only; POST never (double-fill risk).
+function httpRetryAllowed(method, err, sent) {
+  if (!sent && (connectPhaseError(err) || staleSocketError(err))) return true;
+  return httpRetryLimit(method) > 0 && staleSocketError(err);
 }
 
 const PHEMEX_BASE = 'https://api.phemex.com';
@@ -1650,6 +1696,11 @@ function createTradeNative(opts) {
     return { refuse: true };   // never dial direct past an enabled proxy
   }
 
+  // Last completed request's socket-reuse flag (req.reusedSocket) — the
+  // smallest honest field signal that keep-alive pooling is really working
+  // on the user's route. Echoed as via.reused by att:trade-exec.
+  let _lastReused = null;
+
   // maxBytes: optional response-body cap. Default stays 256 KB (byte-identical
   // behavior for every existing call); full-catalog GETs (Phemex
   // /public/products is ~2.5 MB and growing) MUST pass a larger cap or the
@@ -1657,6 +1708,10 @@ function createTradeNative(opts) {
   function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
     const attempt = () => new Promise((resolve, reject) => {
+      // Per-attempt transmit flag: flipped only after the request has fully
+      // flushed to a live (TLS-complete) socket. An error with sent=false is
+      // a connect-phase failure — nothing reached the venue.
+      let sent = false;
       const ag = agentFor(route);
       if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
       const h = Object.assign({}, headers);
@@ -1676,18 +1731,29 @@ function createTradeNative(opts) {
         let buf = '';
         res.setEncoding('utf8');
         res.on('data', (d) => { if (buf.length < cap) buf += d; });
-        res.on('end', () => resolve({ status: res.statusCode, text: buf,
-                                      date: (res.headers && res.headers.date) || null }));
+        res.on('end', () => {
+          // Field diagnosability: remember whether this request rode a warm
+          // (reused) socket — surfaced via lastSocketReused() in the exec echo.
+          _lastReused = !!req.reusedSocket;
+          resolve({ status: res.statusCode, text: buf,
+                    date: (res.headers && res.headers.date) || null });
+        });
       });
+      // 'finish' fires only after the request has been fully written to a
+      // connected socket (TLS complete) — empirically it does NOT fire on
+      // connect-phase failures (ECONNREFUSED / mid-TLS drops), so it is an
+      // honest pre/post-transmit boundary.
+      req.on('finish', () => { sent = true; });
       req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) { /* noop */ } });
-      req.on('error', reject);
+      req.on('error', (e) => { try { if (e && typeof e === 'object') e.reqSent = sent; } catch (e2) {} reject(e); });
       req.end(bodyStr || '');
     });
-    // Stale keep-alive socket safety: retry ONCE on a fresh connection, but
-    // ONLY for idempotent methods (GET / DELETE — see httpRetryLimit) and
-    // ONLY on dead-socket transport errors. Order POSTs never blind-retry.
+    // Phase-aware retry (ONE retry total): connect-phase failures where the
+    // body never hit the wire retry for ALL methods (incl. order POSTs — no
+    // double-fill risk, nothing reached the venue); post-transmit dead-socket
+    // errors keep the strict GET/DELETE-only matrix. See httpRetryAllowed.
     return attempt().catch((e) => {
-      if (httpRetryLimit(method) > 0 && staleSocketError(e)) return attempt();
+      if (httpRetryAllowed(method, e, !!(e && e.reqSent))) return attempt();
       throw e;
     });
   }
@@ -3702,8 +3768,30 @@ function createTradeNative(opts) {
       if (intent.op === 'cancel') return { ok: true, cancelled: intent.orderID };
       return { ok: true, cancelled: 'all' };
     } catch (e) {
+      // Connect-phase failures reaching here already ATE their one automatic
+      // retry (httpJson) — map the raw Node message to a friendlier one, but
+      // never mask a real venue rejection (connectPhaseError is transport-only).
+      if (connectPhaseError(e)) {
+        return { ok: false, message: 'Connection to the venue dropped while connecting (already retried once) — check proxy/network and try again' };
+      }
       return { ok: false, message: 'Native trade failed: ' + ((e && e.message) || 'error') };
     }
+  }
+
+  // First-action warmth: when trading is ARMED for a venue (creds set), fire
+  // ONE cheap unauthenticated GET/POST at the venue's REST host so the first
+  // real order doesn't pay the SOCKS+TCP+TLS handshake. Once per venue per
+  // agent generation (_kaWarmed is cleared by flushKeepAliveAgents, so a
+  // proxy change re-warms on the next arm). Fire-and-forget — NO timer loop.
+  function warmVenue(venue) {
+    try {
+      if (_kaWarmed.has(venue)) return;
+      _kaWarmed.add(venue);
+      const tgt = pingRtTarget(venue, 'futures');
+      if (!tgt) return;
+      httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, undefined)
+        .catch(() => { /* warm-up is best-effort; real action will surface errors */ });
+    } catch (e) { /* non-fatal */ }
   }
 
   // --- IPC surface -----------------------------------------------------------
@@ -3711,7 +3799,9 @@ function createTradeNative(opts) {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
     if (TRADE_VENUES.indexOf(venue) < 0) return { ok: false, error: 'bad-venue' };
     if (!creds || typeof creds !== 'object') return { ok: false, error: 'bad-creds' };
-    return credsSet(venue, creds);
+    const r = credsSet(venue, creds);
+    if (r && r.ok) warmVenue(venue);   // arm → pre-open one warm connection
+    return r;
   });
   ipcMain.handle('att:trade-creds-wipe', (event, venue) => {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
@@ -3730,7 +3820,13 @@ function createTradeNative(opts) {
     // Native·Proxy/Direct" from CONFIRMED fact, never from the pref. A
     // refused agent (proxy on, unbuildable) echoes {refused:true}.
     if (r && typeof r === 'object' && !r.via) {
-      try { r.via = tradeViaFromAgent(agentFor(intent && intent.route)); }
+      try {
+        r.via = tradeViaFromAgent(agentFor(intent && intent.route));
+        // Socket-reuse marker (req.reusedSocket of the last completed HTTP
+        // round-trip): lets the panel's ping-chip tooltip show whether the
+        // warm keep-alive pool is really being hit on this route.
+        if (_lastReused !== null) r.via.reused = _lastReused;
+      }
       catch (e) { /* non-fatal — label just stays pending */ }
     }
     return r;
@@ -3767,7 +3863,10 @@ module.exports = {
   kaAgentKey,
   httpRetryLimit,
   staleSocketError,
+  connectPhaseError,
+  httpRetryAllowed,
   KEEPALIVE_MSECS,
+  KA_MAX_SOCKETS,
   // pure — venue time sync (offset math + probe registry)
   VENUE_TIME_PROBES,
   venueTimeProbe,
