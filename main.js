@@ -491,6 +491,10 @@ async function setProxyAndReconnect(cfg) {
   // won't drop them — close them explicitly so they re-open through the new agent
   // when each window reloads below.
   closeAllNativeSockets();
+  // Destroy every cached keep-alive HTTP(S) agent too (native trading + WS +
+  // bullet fetch), so the next request dials through the NEW egress instead of
+  // reusing a warm socket through the old proxy. Also covers proxy disable.
+  flushKeepAliveAgents();
   reloadAllWindows();
   refreshTrayMenu();
 }
@@ -652,9 +656,10 @@ const https = require('https');
 const { KC_BULLET_HOSTS, kcBulletParse, kcDialUrl } = require('./kucoin_bullet');
 const { nativeProxyUrl } = require('./proxy_url');
 const { routeNorm, bypassHostsFor } = require('./route_hosts');
-let SocksProxyAgent = null, HttpsProxyAgent = null;
-try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
-try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e) { /* optional */ }
+// Shared keep-alive proxy-agent cache lives in trade_native.js so the native
+// WS bridge, the KuCoin bullet fetch, and the native trading HTTPS requests
+// all reuse ONE warm agent per proxy config (flushed on proxy change below).
+const { sharedKeepAliveAgent, flushKeepAliveAgents } = require('./trade_native');
 
 // Strict allowlist: only Terminal market-data WS hosts (Phemex + Binance + Gate), wss
 // only. Anything else is refused so the shim can never be turned into an
@@ -711,10 +716,11 @@ function nativeWsAgent() {
     if (cfg && cfg.enabled) return { refuse: true };
     return { agent: undefined };
   }
-  try {
-    if (cfg.scheme === 'socks5' && SocksProxyAgent) return { agent: new SocksProxyAgent(proxyUrl) };
-    if (cfg.scheme === 'http' && HttpsProxyAgent) return { agent: new HttpsProxyAgent(proxyUrl) };
-  } catch (e) { /* fall through to refuse — never leak direct past an enabled proxy */ }
+  // Shared keep-alive agent (trade_native's cache): WS dials + the KuCoin
+  // bullet fetch reuse the SAME warm agent as the native trading requests —
+  // one SOCKS/TLS handshake per proxy config, not per dial. null → refuse.
+  const ag = sharedKeepAliveAgent(cfg.scheme, proxyUrl);
+  if (ag) return { agent: ag };
   return { refuse: true };
 }
 

@@ -32,6 +32,73 @@ let SocksProxyAgent = null, HttpsProxyAgent = null;
 try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
 try { HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent; } catch (e) { /* optional */ }
 
+// ---------------------------------------------------------------------------
+// Shared keep-alive agent cache — one warm agent per (scheme, proxyUrl) plus
+// one shared direct https.Agent, so every native HTTPS request reuses an
+// already-established connection instead of paying SOCKS handshake + TCP +
+// TLS per request (~2-3 extra RTTs; +250-350 ms on a long proxy chain).
+// Keyed by the FULL proxy URL: a proxy config change produces a different key
+// (and flushKeepAliveAgents() is called on every change/disable anyway, so
+// stale agents never linger and never dial the old egress).
+// scheduling 'lifo' keeps the reuse window short (most-recently-used socket
+// first → idle sockets age out at keepAliveMsecs) which minimizes the chance
+// of writing into a server-killed socket.
+// ---------------------------------------------------------------------------
+const KEEPALIVE_MSECS = 15000;
+const _kaAgents = new Map();   // 'direct' | '<scheme>|<proxyUrl>' → Agent
+
+function kaAgentKey(scheme, proxyUrl) {
+  return proxyUrl ? String(scheme) + '|' + String(proxyUrl) : 'direct';
+}
+
+// Returns the shared agent for the route, constructing it on first use.
+// null = no agent buildable for a proxy route (module missing / ctor threw)
+// — callers must keep their existing REFUSE semantics on null.
+function sharedKeepAliveAgent(scheme, proxyUrl) {
+  const key = kaAgentKey(scheme, proxyUrl);
+  const hit = _kaAgents.get(key);
+  if (hit) return hit;
+  const opts = { keepAlive: true, keepAliveMsecs: KEEPALIVE_MSECS, scheduling: 'lifo' };
+  let ag = null;
+  try {
+    if (!proxyUrl) ag = new https.Agent(opts);
+    else if (scheme === 'socks5' && SocksProxyAgent) ag = new SocksProxyAgent(proxyUrl, opts);
+    else if (scheme === 'http' && HttpsProxyAgent) ag = new HttpsProxyAgent(proxyUrl, opts);
+  } catch (e) { ag = null; }
+  if (ag) _kaAgents.set(key, ag);
+  return ag;
+}
+
+// Destroy + drop every cached agent (proxy config change / disable) so the
+// next request dials fresh through the new egress.
+function flushKeepAliveAgents() {
+  for (const ag of _kaAgents.values()) {
+    try { ag.destroy(); } catch (e) { /* non-fatal */ }
+  }
+  _kaAgents.clear();
+}
+
+// --- stale-socket retry policy (pure) --------------------------------------
+// A reused keep-alive socket can be killed by the venue between requests: the
+// first write then fails with a transport error instead of a clean response.
+// Retry budget by METHOD: GETs + time probes are read-only (retry once on a
+// fresh socket), DELETE cancels are idempotent (venues answer "already gone"
+// — gone-matchers handle that), but order-placing POSTs must NEVER be blind
+// retried (double-fill risk) — they surface the error honestly.
+function httpRetryLimit(method) {
+  const m = String(method || '').toUpperCase();
+  return (m === 'GET' || m === 'DELETE') ? 1 : 0;
+}
+
+// Errors that mean "the reused socket was already dead", not a venue verdict.
+function staleSocketError(err) {
+  if (!err) return false;
+  const code = err.code;
+  if (code === 'ECONNRESET' || code === 'EPIPE') return true;
+  const em = String(err.message || '');
+  return /\b(ECONNRESET|EPIPE)\b/.test(em) || /socket hang up/i.test(em);
+}
+
 const PHEMEX_BASE = 'https://api.phemex.com';
 const PHEMEX_HOST = 'api.phemex.com';
 const PHEMEX_EXPIRY_S = 60;
@@ -1576,10 +1643,10 @@ function createTradeNative(opts) {
       if (cfg && cfg.enabled) return { refuse: true };   // unknown scheme, proxy on → refuse
       return { agent: undefined };
     }
-    try {
-      if (cfg.scheme === 'socks5' && SocksProxyAgent) return { agent: new SocksProxyAgent(proxyUrl) };
-      if (cfg.scheme === 'http' && HttpsProxyAgent) return { agent: new HttpsProxyAgent(proxyUrl) };
-    } catch (e) { /* fall through */ }
+    // Shared warm agent (keep-alive) — the SOCKS/TLS handshake is paid once
+    // per proxy config, not once per request. null → refuse, same as before.
+    const ag = sharedKeepAliveAgent(cfg.scheme, proxyUrl);
+    if (ag) return { agent: ag };
     return { refuse: true };   // never dial direct past an enabled proxy
   }
 
@@ -1589,7 +1656,7 @@ function createTradeNative(opts) {
   // body silently truncates and JSON.parse fails downstream.
   function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
-    return new Promise((resolve, reject) => {
+    const attempt = () => new Promise((resolve, reject) => {
       const ag = agentFor(route);
       if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
       const h = Object.assign({}, headers);
@@ -1598,7 +1665,13 @@ function createTradeNative(opts) {
       const req = https.request({
         host: host, method: method,
         path: reqPath + (query ? '?' + query : ''),
-        agent: ag.agent, headers: h, timeout: HTTP_TIMEOUT_MS,
+        // Direct route: use the shared keep-alive https.Agent explicitly
+        // (never rely on Node's global-agent defaults) so direct requests
+        // reuse warm connections exactly like proxied ones. agentFor keeps
+        // returning {agent: undefined} for direct so tradeViaFromAgent's
+        // proxy/direct echo stays truthful.
+        agent: ag.agent !== undefined ? ag.agent : sharedKeepAliveAgent(null, null),
+        headers: h, timeout: HTTP_TIMEOUT_MS,
       }, (res) => {
         let buf = '';
         res.setEncoding('utf8');
@@ -1609,6 +1682,13 @@ function createTradeNative(opts) {
       req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) { /* noop */ } });
       req.on('error', reject);
       req.end(bodyStr || '');
+    });
+    // Stale keep-alive socket safety: retry ONCE on a fresh connection, but
+    // ONLY for idempotent methods (GET / DELETE — see httpRetryLimit) and
+    // ONLY on dead-socket transport errors. Order POSTs never blind-retry.
+    return attempt().catch((e) => {
+      if (httpRetryLimit(method) > 0 && staleSocketError(e)) return attempt();
+      throw e;
     });
   }
 
@@ -3681,6 +3761,13 @@ module.exports = {
   tradeViaFromAgent,
   pingRtTarget,
   phemexErrorMessage,
+  // shared keep-alive agent cache (used by main.js's native-WS bridge too)
+  sharedKeepAliveAgent,
+  flushKeepAliveAgents,
+  kaAgentKey,
+  httpRetryLimit,
+  staleSocketError,
+  KEEPALIVE_MSECS,
   // pure — venue time sync (offset math + probe registry)
   VENUE_TIME_PROBES,
   venueTimeProbe,
