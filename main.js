@@ -214,6 +214,12 @@ function featureWindowOptions(bounds) {
       nodeIntegration: false,
       sandbox: true,
       spellcheck: false,
+      // Terminal pop-outs run live DOM boards/charts on secondary monitors —
+      // Chromium must never throttle their rAF/timers when the window is
+      // occluded or unfocused (the main window keeps the default: throttling
+      // an occluded main window is desirable battery behavior, and the rAF
+      // loop already gates on document.hidden panel-side).
+      backgroundThrottling: false,
     },
   };
 }
