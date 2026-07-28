@@ -44,6 +44,8 @@ const VENUE_ROUTE_HOSTS = {
   'arcus|spot':          ['indexer.spot.arcus.xyz'],
   'kucoin|futures':      [],
   'kucoin|spot':         [],
+  'mexc|futures':        ['contract.mexc.com'],
+  'mexc|spot':           [],
 };
 
 // Normalize a renderer-supplied route. ONLY the literal string 'direct' opts a

@@ -760,10 +760,16 @@
     return { action: { type: 'order', orders: [wire], grouping: 'na' },
              symbol: String(spec.symbol || p.symbol || ''), px: px, sz: sz };
   }
-  function hlCancelAction(asset, orderId) {
+  // fast=true adds HL's fast-cancel flag ("f": true — pre-consensus cancel
+  // attempt). ONLY legal on plain (non-trigger) orders cancelled by numeric
+  // oid: trigger orders reject fast cancels, and cancelByCloid has no flag.
+  // The flag enters the msgpack action hash, so both sides must agree.
+  function hlCancelAction(asset, orderId, fast) {
     var oid = parseInt(String(orderId), 10);
     if (String(oid) === String(orderId).trim() && !isNaN(oid)) {
-      return { type: 'cancel', cancels: [{ a: parseInt(asset, 10), o: oid }] };
+      var act = { type: 'cancel', cancels: [{ a: parseInt(asset, 10), o: oid }] };
+      if (fast) act.f = true;
+      return act;
     }
     var cloid = String(orderId).slice(0, 2) === '0x' ? String(orderId) : hlCloid(String(orderId));
     return { type: 'cancelByCloid', cancels: [{ asset: parseInt(asset, 10), cloid: cloid }] };

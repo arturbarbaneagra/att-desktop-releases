@@ -155,7 +155,7 @@ const TIMESYNC_TTL_MS = 10 * 60 * 1000;
 // Venues this module can trade natively. The registry keys everything
 // (validation, signer pick, creds slots) so adding a venue is additive.
 const TRADE_VENUES = ['phemex', 'binance', 'bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bitmex',
-                      'hyperliquid', 'asterdex', 'arcus'];
+                      'mexc', 'hyperliquid', 'asterdex', 'arcus'];
 // DEX venues carry symbols the CEX charset forbids: HL spot 'UBTC/USDC',
 // HIP-3 builder perps 'xyz:PLTR', spot wire '@N'.
 const DEX_VENUES = ['hyperliquid', 'asterdex', 'arcus'];
@@ -600,6 +600,10 @@ const VENUE_TIME_PROBES = {
                         ext: (d) => Number((d || {}).serverTime) },
   'asterdex:spot':    { host: ASTER_SPOT_HOST, path: '/api/v1/time',
                         ext: (d) => Number((d || {}).serverTime) },
+  'mexc:spot':    { host: 'api.mexc.com', path: '/api/v3/time',
+                    ext: (d) => Number((d || {}).serverTime) },
+  'mexc:futures': { host: 'contract.mexc.com', path: '/api/v1/contract/ping',
+                    ext: (d) => Number((d || {}).data) },
 };
 
 // venue+market → probe spec (market-split hosts get their own offsets).
@@ -1589,6 +1593,198 @@ function bitmexCancelGone(errText) {
   if (!s) return false;
   for (const needle of ['already', 'not found', 'unable to cancel',
                         'invalid orderid', 'invalid ordstatus']) {
+    if (s.indexOf(needle) >= 0) return true;
+  }
+  return false;
+}
+
+// --- MEXC (venue #11 — spot Binance-family + contract.mexc.com futures) ----
+// Pure builders: golden-vector parity with terminal_engine.py (mexc_* fns).
+const MEXC_SPOT_HOST = 'api.mexc.com';
+const MEXC_FUT_HOST = 'contract.mexc.com';
+const MX_NATIVE_LEVERAGE = '10';   // engine MX_DEFAULT_LEVERAGE parity
+
+// Spot signature: hex(HMAC-SHA256(secret, query)) — exact Binance recipe.
+function mexcSpotSign(secret, query) {
+  return crypto.createHmac('sha256', String(secret)).update(String(query), 'utf8').digest('hex');
+}
+// Futures signature: hex(HMAC-SHA256(secret, accessKey + ts + paramString)).
+function mexcFutSign(accessKey, secret, tsMs, paramStr) {
+  const msg = String(accessKey) + String(tsMs) + String(paramStr == null ? '' : paramStr);
+  return crypto.createHmac('sha256', String(secret)).update(msg, 'utf8').digest('hex');
+}
+// GET/DELETE paramString: key=value joined with '&', keys SORTED (dictionary
+// order) — values verbatim (no URL-encoding) — mexc_fut_param_str parity.
+function mexcFutParamStr(params) {
+  if (!params) return '';
+  const keys = Object.keys(params).sort();
+  return keys.map((k) => k + '=' + params[k]).join('&');
+}
+
+// Cryptic MEXC codes → clear panel messages (engine MEXC_ERRORS parity).
+const MEXC_ERRORS = {
+  700002: 'Invalid request signature — re-enter your API keys',
+  700007: "IP not allowed by the API key's whitelist",
+  10072: 'Invalid API key',
+  700003: 'Request timestamp expired — server clock skew',
+  10007: 'This spot symbol is API-restricted on MEXC — connect your ' +
+         'MEXC UID + web session in the key settings to trade it',
+  30016: 'Trading is suspended for this symbol',
+  30004: 'Insufficient balance',
+  700013: 'Invalid API key permissions',
+  401: 'Invalid API key or signature — re-enter your API keys',
+  602: 'Invalid request signature — re-enter your API keys',
+  1002: 'Contract not activated — open a futures account on MEXC first',
+  2005: 'Insufficient balance',
+  2011: 'Order does not exist or is already filled/cancelled',
+  510: 'Rate limited by MEXC — retry shortly',
+};
+function mexcErrorMessage(code, rawMsg) {
+  const c = parseInt(code, 10);
+  const msg = isFinite(c) ? MEXC_ERRORS[c] : null;
+  if (msg) return msg;
+  const tail = rawMsg ? ': ' + rawMsg : '';
+  return 'MEXC error ' + code + tail;
+}
+function mexcIsRestrictedErr(code) {
+  return parseInt(code, 10) === 10007;
+}
+
+// Client order id: alphanumeric strip + 32-char truncate — mexc_clordid parity.
+function mexcClOrdId(clOrdID) {
+  return String(clOrdID == null ? '' : clOrdID).replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+}
+// One-way futures side → MEXC 1-4 code (1 open long / 2 close short /
+// 3 open short / 4 close long) — mexc_fut_side parity.
+function mexcFutSide(side, reduceOnly) {
+  const isBuy = String(side).toLowerCase() === 'buy';
+  if (reduceOnly) return isBuy ? 2 : 4;
+  return isBuy ? 1 : 3;
+}
+
+// BASE qty → CONTRACTS string: (qty ÷ contractSize) quantized half-even at
+// scale 8, floored to volUnit multiples — mexc_contracts parity.
+function mexcContracts(qty, ctVal, volStep) {
+  if (!ctVal) return String(qty);
+  let cv, q;
+  try { cv = decNorm(ctVal); q = decNorm(qty); } catch (e) { return String(qty); }
+  if (cv.digits === 0n || cv.neg) return String(qty);
+  const num = q.digits * (10n ** BigInt(8 + cv.scale));
+  const den = cv.digits * (10n ** BigInt(q.scale));
+  let n8 = divHalfEven(num, den);            // unsigned, scale 8
+  let sD = null;
+  if (volStep) { try { sD = decNorm(volStep); } catch (e) { sD = null; } }
+  if (!sD || sD.neg || sD.digits === 0n) sD = { neg: false, digits: 1n, scale: 0 };
+  const step8 = sD.scale <= 8 ? sD.digits * (10n ** BigInt(8 - sD.scale))
+                              : sD.digits / (10n ** BigInt(sD.scale - 8));
+  if (step8 > 0n) n8 = (n8 / step8) * step8;
+  return decFmt(q.neg, n8, 8);
+}
+// CONTRACTS (or base when ctVal falsy) → BASE qty — mexc_base_qty parity.
+function mexcBaseQty(vol, ctVal) {
+  const v = bnNum(vol);
+  if (v == null) return null;
+  if (!ctVal) return v;
+  try {
+    const a = decNorm(v), b = decNorm(ctVal);
+    return decFmt(a.neg !== b.neg, a.digits * b.digits, a.scale + b.scale);
+  } catch (e) { return v; }
+}
+
+// Deterministic query params (ordered pairs) for POST /api/v3/order —
+// mexc_spot_order_params parity (market BUY sends quoteOrderQty = USDT).
+function mexcSpotOrderParams(symbol, side, ordType, qty, price, clOrdID) {
+  const sideU = String(side).toLowerCase() === 'buy' ? 'BUY' : 'SELL';
+  const isLimit = String(ordType).toLowerCase() === 'limit';
+  const p = [
+    ['symbol', String(symbol)],
+    ['side', sideU],
+    ['type', isLimit ? 'LIMIT' : 'MARKET'],
+    ['newClientOrderId', mexcClOrdId(clOrdID)],
+  ];
+  if (isLimit) {
+    p.push(['price', String(price)]);
+    p.push(['quantity', String(qty)]);
+  } else if (sideU === 'BUY') {
+    p.push(['quoteOrderQty', String(qty)]);
+  } else {
+    p.push(['quantity', String(qty)]);
+  }
+  return p;
+}
+
+// Deterministic body for POST /api/v1/private/order/submit —
+// mexc_fut_order_body parity (key insertion order matches json.dumps).
+function mexcFutOrderBody(symbol, side, ordType, contracts, price, clOrdID, flags) {
+  const f = flags || {};
+  const isLimit = ['limit', 'stop_limit'].indexOf(String(ordType).toLowerCase()) >= 0;
+  const body = {
+    symbol: String(symbol),
+    vol: String(contracts),
+    side: mexcFutSide(side, !!f.reduceOnly),
+    type: isLimit ? 1 : 5,
+    openType: 2,
+    externalOid: mexcClOrdId(clOrdID),
+  };
+  if (isLimit) body.price = String(price);
+  if (f.leverage) body.leverage = String(f.leverage);
+  return body;
+}
+
+// Plan-order trend (trigger comparator) — mexc_plan_trend parity.
+function mexcPlanTrend(side, ordType) {
+  const isBuy = String(side).toLowerCase() === 'buy';
+  if (String(ordType).toLowerCase() === 'tp_market') return isBuy ? 2 : 1;
+  return isBuy ? 1 : 2;
+}
+// Deterministic body for POST /api/v1/private/planorder/place —
+// mexc_plan_body parity (triggerType 2 = fair/mark for SL/TP).
+function mexcPlanBody(symbol, side, ordType, contracts, price, trigger, flags) {
+  const f = flags || {};
+  const isLimit = String(ordType).toLowerCase() === 'stop_limit';
+  const body = {
+    symbol: String(symbol),
+    vol: String(contracts),
+    side: mexcFutSide(side, !!f.reduceOnly),
+    openType: 2,
+    triggerPrice: String(trigger),
+    triggerType: f.triggerType != null ? Math.trunc(Number(f.triggerType)) : 1,
+    executeCycle: 3,
+    orderType: isLimit ? 1 : 5,
+    trend: mexcPlanTrend(side, ordType),
+  };
+  if (isLimit) body.price = String(price);
+  if (f.leverage) body.leverage = String(f.leverage);
+  return body;
+}
+
+// Futures open_positions rows → common position-row shape —
+// mexc_row_from_position parity (holdVol CONTRACTS → BASE via contractSize;
+// mark is not in the payload → null, sltpTriggerOk skips the mark check).
+function mexcPositionRows(data, ctVal) {
+  const rows = [];
+  const lst = (data && Array.isArray(data.data)) ? data.data : [];
+  for (const p of lst) {
+    try {
+      const vol = bnNum((p || {}).holdVol);
+      if (vol == null || Number(vol) === 0) continue;
+      const isLong = parseInt(p.positionType || 1, 10) !== 2;
+      rows.push({
+        symbol: p.symbol,
+        side: isLong ? 'Buy' : 'Sell',
+        size: mexcBaseQty(vol.indexOf('-') === 0 ? vol.slice(1) : vol, ctVal),
+        mark: null,
+        leverage: bnNum(p.leverage),
+      });
+    } catch (e) { /* skip */ }
+  }
+  return rows;
+}
+
+function mexcCancelGone(errText) {
+  const s = String(errText || '').toLowerCase();
+  if (!s) return false;
+  for (const needle of ['does not exist', 'already', 'not found']) {
     if (s.indexOf(needle) >= 0) return true;
   }
   return false;
@@ -3051,6 +3247,242 @@ function createTradeNative(opts) {
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
   }
 
+  // --- MEXC --------------------------------------------------------------------
+  const mxCtCache = {};
+
+  async function mxRequest(creds, method, market, path, params, body, route) {
+    const plist = (params || []).slice();
+    let headers = {};
+    let bodyStr = null;
+    let host, query;
+    if (market === 'futures') {
+      host = MEXC_FUT_HOST;
+      query = formEnc(plist);
+      if (body != null) {
+        bodyStr = JSON.stringify(body);           // separators(',',':') parity
+        headers['Content-Type'] = 'application/json';
+      }
+      const ts = venueStampMs(await ensureVenueTime('mexc', 'futures', route));
+      let paramStr;
+      if (body != null) paramStr = bodyStr;
+      else {
+        const pd = {};
+        for (const kv of plist) pd[String(kv[0])] = String(kv[1]);
+        paramStr = mexcFutParamStr(pd);
+      }
+      headers['ApiKey'] = creds.key;
+      headers['Request-Time'] = ts;
+      headers['Signature'] = mexcFutSign(creds.key, creds.secret, ts, paramStr);
+    } else {
+      host = MEXC_SPOT_HOST;
+      plist.push(['recvWindow', '10000']);
+      plist.push(['timestamp', venueStampMs(await ensureVenueTime('mexc', 'spot', route))]);
+      query = formEnc(plist);
+      query += '&signature=' + mexcSpotSign(creds.secret, query);
+      headers['X-MEXC-APIKEY'] = creds.key;
+    }
+    let r;
+    try {
+      r = await httpJson(host, method, path, query, bodyStr, headers, route);
+    } catch (e) { return transportFail(e, 'MEXC'); }
+    if (r.status === 429) return { ok: false, message: 'Rate limited by MEXC — retry shortly' };
+    let data;
+    try { data = r.text ? JSON.parse(r.text) : {}; } catch (e) {
+      return { ok: false, message: 'MEXC returned HTTP ' + r.status };
+    }
+    if (market === 'futures') {
+      if (data && typeof data === 'object' && 'success' in data) {
+        if (data.success) return { ok: true, data: data };
+        const code = parseInt(data.code, 10);
+        return { ok: false, code: isFinite(code) ? code : -1,
+                 message: mexcErrorMessage(data.code, String(data.message || data.msg || '')) };
+      }
+      if (r.status >= 400) return { ok: false, message: 'MEXC returned HTTP ' + r.status };
+      return { ok: true, data: data };
+    }
+    // spot: flat payloads; errors carry {code, msg}
+    if (data && typeof data === 'object' && data.code != null && data.msg != null
+        && !('symbol' in data) && !('orderId' in data)) {
+      const code = parseInt(data.code, 10);
+      const c = isFinite(code) ? code : -1;
+      if (c !== 200 && (r.status >= 400 || c !== 0)) {
+        return { ok: false, code: c, message: mexcErrorMessage(data.code, String(data.msg || '')) };
+      }
+    }
+    if (r.status >= 400) {
+      if (data && typeof data === 'object' && data.code != null) {
+        return { ok: false, message: mexcErrorMessage(data.code, String(data.msg || '')) };
+      }
+      return { ok: false, message: 'MEXC returned HTTP ' + r.status };
+    }
+    return { ok: true, data: data };
+  }
+
+  // Public futures contract detail → { cv: contractSize, vs: volUnit } (TTL).
+  async function mxCt(symbol, route) {
+    const c = mxCtCache[symbol];
+    if (c && Date.now() - c.ts < PRODUCTS_TTL_MS) return c.v;
+    try {
+      const r = await httpJson(MEXC_FUT_HOST, 'GET', '/api/v1/contract/detail',
+                               formEnc([['symbol', String(symbol)]]), null, {}, route);
+      const d = JSON.parse(r.text);
+      let row = (d || {}).data;
+      if (Array.isArray(row)) row = row[0];
+      row = row || {};
+      const v = { cv: bnNum(row.contractSize), vs: bnNum(row.volUnit) || '1' };
+      if (v.cv != null) mxCtCache[symbol] = { ts: Date.now(), v: v };
+      return v;
+    } catch (e) { return { cv: null, vs: null }; }
+  }
+
+  async function execMexc(creds, intent, route) {
+    const market = intent.market === 'spot' ? 'spot' : 'futures';
+    const fetchPos = async () => {
+      const r = await mxRequest(creds, 'GET', 'futures',
+                                '/api/v1/private/position/open_positions', null, null, route);
+      if (!r.ok) return r;
+      const spec = await mxCt(intent.symbol, route);
+      return { ok: true, rows: mexcPositionRows(r.data, spec.cv) };
+    };
+    async function place(mkt, symbol, side, ordType, qty, price, clOrdID, flags) {
+      const f = flags || {};
+      const t = String(ordType).toLowerCase();
+      const isStop = t === 'stop' || t === 'stop_limit' || t === 'tp_market';
+      if (mkt !== 'futures') {
+        if (isStop) return { ok: false, message: 'Stop orders are futures-only' };
+        const params = mexcSpotOrderParams(symbol, side, ordType, qty, price, clOrdID);
+        const r = await mxRequest(creds, 'POST', 'spot', '/api/v3/order', params, null, route);
+        if (!r.ok) {
+          // API-restricted symbol (10007): the engine's UID/web-session
+          // bypass is a SERVER-side path — native cannot ride it. Honest
+          // guidance instead of a silent retry.
+          if (mexcIsRestrictedErr(r.code)) {
+            return { ok: false, message: mexcErrorMessage(10007) +
+              ' — or switch Trading to Server for this symbol (the web-session bypass is server-only)' };
+          }
+          return r;
+        }
+        const oid = String((r.data || {}).orderId || '');
+        return { ok: true, orderID: oid || null, clOrdID: mexcClOrdId(clOrdID) };
+      }
+      const spec = await mxCt(symbol, route);
+      const contracts = mexcContracts(qty, spec.cv, spec.vs);
+      if (!(Number(contracts) > 0)) {
+        return { ok: false, message: 'Quantity below one contract (' +
+          (mexcBaseQty(spec.vs || '1', spec.cv) || '1') + ' minimum)' };
+      }
+      if (isStop) {
+        // SL/TP (reduce-only) trigger vs FAIR/mark — terminal-stop-orders
+        // rule; entry stops watch last price (engine parity).
+        const body = mexcPlanBody(symbol, side, t, contracts, price, f.trigger,
+                                  { leverage: MX_NATIVE_LEVERAGE,
+                                    reduceOnly: !!f.reduceOnly,
+                                    triggerType: f.reduceOnly ? 2 : 1 });
+        const r = await mxRequest(creds, 'POST', 'futures',
+                                  '/api/v1/private/planorder/place', null, body, route);
+        if (!r.ok) return r;
+        const oid = String((r.data || {}).data || '');
+        return { ok: true, orderID: oid ? 'mx:' + oid : null, clOrdID: clOrdID };
+      }
+      const body = mexcFutOrderBody(symbol, side, ordType, contracts, price, clOrdID,
+                                    { leverage: MX_NATIVE_LEVERAGE,
+                                      reduceOnly: !!f.reduceOnly });
+      const r = await mxRequest(creds, 'POST', 'futures',
+                                '/api/v1/private/order/submit', null, body, route);
+      if (!r.ok) return r;
+      const d = (r.data || {}).data;
+      const oid = String((d && typeof d === 'object') ? (d.orderId || '') : (d || ''));
+      return { ok: true, orderID: oid || null, clOrdID: mexcClOrdId(clOrdID) };
+    }
+    if (intent.op === 'order') {
+      return place(market, intent.symbol, intent.side, intent.type,
+                   intent.qty, intent.price, intent.clOrdID,
+                   { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+    }
+    if (intent.op === 'cancel') {
+      const oid = String(intent.orderID);
+      if (oid.indexOf('mxw:') === 0) {
+        // Restricted-spot web orders live on the server's web-session path.
+        return { ok: false, message: 'This order was placed through the MEXC web session — ' +
+                 'switch Trading to Server to cancel it' };
+      }
+      if (oid.indexOf('mx:') === 0) {
+        const r = await mxRequest(creds, 'POST', 'futures', '/api/v1/private/planorder/cancel',
+                                  null, [{ symbol: String(intent.symbol), orderId: oid.slice(3) }],
+                                  route);
+        if (!r.ok) return r;
+        return { ok: true, cancelled: intent.orderID };
+      }
+      if (market === 'futures') {
+        const r = await mxRequest(creds, 'POST', 'futures', '/api/v1/private/order/cancel',
+                                  null, [oid], route);
+        if (!r.ok) return r;
+        // per-id result rides data rows: [{orderId, errorCode, errorMsg}]
+        for (const row of ((r.data || {}).data || [])) {
+          if (String((row || {}).orderId) === oid && parseInt(row.errorCode || 0, 10) !== 0) {
+            return { ok: false, message: mexcErrorMessage(row.errorCode, String(row.errorMsg || '')) };
+          }
+        }
+        return { ok: true, cancelled: intent.orderID };
+      }
+      const r = await mxRequest(creds, 'DELETE', 'spot', '/api/v3/order',
+                                [['symbol', String(intent.symbol)], ['orderId', oid]], null, route);
+      if (!r.ok) return r;
+      return { ok: true, cancelled: intent.orderID };
+    }
+    if (intent.op === 'cancel_all') {
+      if (market === 'futures') {
+        const r = await mxRequest(creds, 'POST', 'futures', '/api/v1/private/order/cancel_all',
+                                  null, { symbol: String(intent.symbol) }, route);
+        if (!r.ok) return r;
+        // Sweep untriggered plan stops too — terminal rule (states 1).
+        for (let page = 1; page <= 10; page++) {
+          const rp = await mxRequest(creds, 'GET', 'futures',
+                                     '/api/v1/private/planorder/list/orders',
+                                     [['page_num', String(page)], ['page_size', '100'],
+                                      ['states', '1']], null, route);
+          if (!rp.ok) return rp;
+          const lst = Array.isArray((rp.data || {}).data) ? rp.data.data : [];
+          for (const o of lst) {
+            if (String((o || {}).symbol || '') !== String(intent.symbol)) continue;
+            const sid = String(o.id || o.orderId || '');
+            if (!sid) continue;
+            const rc = await mxRequest(creds, 'POST', 'futures',
+                                       '/api/v1/private/planorder/cancel', null,
+                                       [{ symbol: String(intent.symbol), orderId: sid }], route);
+            if (!rc.ok && !mexcCancelGone(rc.message)) return rc;
+          }
+          if (lst.length < 100) break;
+        }
+        return { ok: true, cancelled: 'all' };
+      }
+      const r = await mxRequest(creds, 'DELETE', 'spot', '/api/v3/openOrders',
+                                [['symbol', String(intent.symbol)]], null, route);
+      if (!r.ok) return r;
+      return { ok: true, cancelled: 'all' };
+    }
+    const pr = await findPosRetry(fetchPos, intent.symbol);
+    if (!pr.ok) return pr;
+    if (intent.op === 'close') {
+      if (!pr.pos) return { ok: false, message: 'Position not found' };
+      const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+      const r = await place('futures', pr.pos.symbol, side, 'market', pr.pos.size,
+                            null, intent.clOrdID, { reduceOnly: true });
+      if (!r.ok) return r;
+      return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
+    }
+    if (!pr.pos) return { ok: false, message: 'No open position to protect' };
+    const terr = sltpTriggerOk(intent.kind, pr.pos.side, intent.trigger, pr.pos.mark);
+    if (terr) return { ok: false, message: terr };
+    const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+    const ordType = intent.kind === 'sl' ? 'stop' : 'tp_market';
+    const r = await place('futures', pr.pos.symbol, side, ordType, pr.pos.size,
+                          null, intent.clOrdID,
+                          { reduceOnly: true, trigger: intent.trigger });
+    if (!r.ok) return r;
+    return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
   // --- Hyperliquid (DEX — wallet-signed /exchange actions) --------------------
   async function hlInfo(body, route) {
     let r;
@@ -3294,7 +3726,9 @@ function createTradeNative(opts) {
       const mine = rr.rows.filter((o) => String((o || {}).coin || '') === wire);
       const rc = await hlCancelBatch(creds, mine, route);
       if (!rc.ok) return rc;
-      return { ok: true, cancelled: 'all' };
+      // count: how many orders the sweep actually found — 0 while the board
+      // still shows badges is the "wrong account address" honesty signal
+      return { ok: true, cancelled: 'all', count: rc.count };
     }
     // close / sltp — fresh position read (builder symbols read THEIR dex).
     const dex = hlDexOfSymbol(intent.symbol);
@@ -3686,6 +4120,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'bitget') return await execBitget(creds, intent, route);
       if (intent.venue === 'kucoin') return await execKucoin(creds, intent, route);
       if (intent.venue === 'bitmex') return await execBitmex(creds, intent, route);
+      if (intent.venue === 'mexc') return await execMexc(creds, intent, route);
       if (intent.venue === 'hyperliquid') return await execHyperliquid(creds, intent, route);
       if (intent.venue === 'asterdex') return await execAster(creds, intent, route);
       if (intent.venue === 'arcus') return await execArcus(creds, intent, route);
@@ -3939,6 +4374,21 @@ module.exports = {
   bmxOrderBody,
   bmxPositionRows,
   bitmexCancelGone,
+  mexcSpotSign,
+  mexcFutSign,
+  mexcFutParamStr,
+  mexcErrorMessage,
+  mexcIsRestrictedErr,
+  mexcClOrdId,
+  mexcFutSide,
+  mexcContracts,
+  mexcBaseQty,
+  mexcSpotOrderParams,
+  mexcFutOrderBody,
+  mexcPlanTrend,
+  mexcPlanBody,
+  mexcPositionRows,
+  mexcCancelGone,
   // runtime
   createTradeNative,
 };

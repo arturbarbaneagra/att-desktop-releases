@@ -687,6 +687,8 @@ const NATIVE_WS_HOSTS = new Set([
   'indexer.spot.arcus.xyz',     // Arcus spot indexer WS (/ws; text JSON)
   'fstream.asterdex.com',       // AsterDex USDT-M futures combined streams (Binance-family, text)
   'sstream.asterdex.com',       // AsterDex spot combined streams (Binance-family, text)
+  'contract.mexc.com',          // MEXC futures push WS (/edge; text JSON — spot stays relay-only)
+  'wbs-api.mexc.com',           // MEXC spot WS (/ws; protobuf BINARY frames — decoded in the panel)
 ]);
 function nativeWsUrlOk(url) {
   try {
@@ -817,9 +819,15 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
   // never reaches here — the panel's confirmed-transport label reads this.
   const via = { transport: 'native', route: ag.agent ? 'proxy' : 'direct' };
   ws.on('message', (data, isBinary) => {
-    // Binance market data is text JSON; forward verbatim as a string. Binary
-    // frames (none expected) are dropped rather than guessed at.
-    if (isBinary) return;
+    // Text feeds forward verbatim as strings. Binary frames (MEXC spot WS
+    // is protobuf) forward base64-tagged — the PANEL owns the decode; the
+    // shell stays a dumb transport.
+    if (isBinary) {
+      let b = '';
+      try { b = Buffer.from(data).toString('base64'); } catch (e) { return; }
+      emit({ id, type: 'message', data: b, binary: true });
+      return;
+    }
     let s = '';
     try { s = data.toString('utf8'); } catch (e) { return; }
     emit({ id, type: 'message', data: s });
