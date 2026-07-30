@@ -676,6 +676,7 @@ const NATIVE_WS_HOSTS = new Set([
   'fstream.binance.com',        // USDT-M futures combined streams
   'stream.binance.com',         // spot combined streams (:9443)
   'data-stream.binance.com',    // spot market-data mirror
+  'nbstream.binance.com',       // Binance Alpha wsa combined streams (WS only — bapi REST stays browser-side)
   'api.gateio.ws',              // Gate spot market data WS (wss only — REST on this host is NOT reachable via this shim)
   'fx-ws.gateio.ws',            // Gate USDT-futures market data WS
   'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
@@ -689,6 +690,7 @@ const NATIVE_WS_HOSTS = new Set([
   'sstream.asterdex.com',       // AsterDex spot combined streams (Binance-family, text)
   'contract.mexc.com',          // MEXC futures push WS (/edge; text JSON — spot stays relay-only)
   'wbs-api.mexc.com',           // MEXC spot WS (/ws; protobuf BINARY frames — decoded in the panel)
+  'mainnet.zklighter.elliot.ai', // Lighter zk-rollup /stream WS (text JSON; REST stays browser-side per host route rules)
 ]);
 function nativeWsUrlOk(url) {
   try {

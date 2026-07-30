@@ -155,7 +155,7 @@ const TIMESYNC_TTL_MS = 10 * 60 * 1000;
 // Venues this module can trade natively. The registry keys everything
 // (validation, signer pick, creds slots) so adding a venue is additive.
 const TRADE_VENUES = ['phemex', 'binance', 'bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bitmex',
-                      'mexc', 'hyperliquid', 'asterdex', 'arcus'];
+                      'mexc', 'hyperliquid', 'asterdex', 'arcus', 'lighter'];
 // DEX venues carry symbols the CEX charset forbids: HL spot 'UBTC/USDC',
 // HIP-3 builder perps 'xyz:PLTR', spot wire '@N'.
 const DEX_VENUES = ['hyperliquid', 'asterdex', 'arcus'];
@@ -540,6 +540,63 @@ function sltpTriggerOk(kind, posSide, trigger, mark) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Lighter (venue #12) — PURE helpers, engine-parity (terminal_engine.py).
+// Native trading signs via the Go WASM signer (assets/lighter_signer.wasm);
+// these helpers are the WASM-independent parts so tests can pin parity under
+// plain node without loading the wasm.
+// ---------------------------------------------------------------------------
+const LIGHTER_HOST = 'mainnet.zklighter.elliot.ai';
+const LIGHTER_CHAIN_ID = 304;               // zk mainnet
+const LIGHTER_DEFAULT_KEY_INDEX = 2;        // engine LT_DEFAULT_API_KEY_INDEX
+
+// "accountIndex" or "accountIndex:apiKeyIndex" → {acct, kidx} (engine
+// lighter_parse_key parity). null on garbage.
+function ltParseKey(key) {
+  const parts = String(key == null ? '' : key).trim().split(':');
+  if (parts.length > 2 || parts[0] === '') return null;
+  if (!/^\d+$/.test(parts[0])) return null;
+  const acct = Number(parts[0]);
+  let kidx = LIGHTER_DEFAULT_KEY_INDEX;
+  if (parts.length === 2) {
+    if (!/^\d+$/.test(parts[1])) return null;
+    kidx = Number(parts[1]);
+  }
+  if (!Number.isSafeInteger(acct) || acct < 0 ||
+      !Number.isInteger(kidx) || kidx < 0 || kidx > 254) return null;
+  return { acct: acct, kidx: kidx };
+}
+
+// Deterministic 48-bit client_order_index from the panel clOrdID — md5-fold,
+// MUST stay byte-identical to engine lighter_coi (cancel resolves and the
+// blotter key on it).
+function ltCoi(clOrdID) {
+  const h = crypto.createHash('md5').update(String(clOrdID == null ? '' : clOrdID)).digest('hex');
+  return parseInt(h.slice(0, 12), 16);
+}
+
+// Human decimal string → integer venue units (10^decimals), floored.
+// String math (no float rounding); null on garbage / negative / unsafe int.
+function ltUnits(val, decimals) {
+  const s = String(val == null ? '' : val).trim().replace(/^\+/, '');
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const d = Number(decimals);
+  if (!Number.isInteger(d) || d < 0) return null;
+  const dot = s.split('.');
+  const frac = ((dot[1] || '') + '0'.repeat(d)).slice(0, d);   // floor
+  const out = (dot[0] + frac).replace(/^0+(?=\d)/, '');
+  const n = Number(out);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// Market/stop-market execution bound in UNITS: ±2% integer math — equals the
+// engine's Decimal ×1.02/×0.98 floor-to-tick on the same unit price.
+function ltBoundUnits(pxUnits, buySide) {
+  const n = Number(pxUnits);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  const b = Math.floor(n * (buySide ? 102 : 98) / 100);
+  return b > 0 ? b : null;
+}
 
 // ===========================================================================
 // Multi-venue rollout (Binance, Bybit, OKX, Gate, Bitget — spot + USDT-M
@@ -604,6 +661,12 @@ const VENUE_TIME_PROBES = {
                     ext: (d) => Number((d || {}).serverTime) },
   'mexc:futures': { host: 'contract.mexc.com', path: '/api/v1/contract/ping',
                     ext: (d) => Number((d || {}).data) },
+  // Lighter status lives at the host ROOT '/' (SDK root_api resource_path;
+  // /api/v1/status does NOT exist — CloudFront 403s it). Its `timestamp` is
+  // whole SECONDS (verified live 2026-07-29) → ×1000 and center by +500ms
+  // (BitMEX dateHeader convention) — plenty for signer expiry stamps.
+  'lighter': { host: 'mainnet.zklighter.elliot.ai', path: '/',
+               ext: (d) => Number((d || {}).timestamp) * 1000 + 500 },
 };
 
 // venue+market → probe spec (market-split hosts get their own offsets).
@@ -1649,6 +1712,34 @@ function mexcErrorMessage(code, rawMsg) {
 function mexcIsRestrictedErr(code) {
   return parseInt(code, 10) === 10007;
 }
+// MEXC's 'quantity scale is invalid' rejection (the real market-order scale
+// is unpublished and can be coarser than every exchangeInfo precision
+// field) — mexc_is_qty_scale_err parity.
+function mexcIsQtyScaleErr(msg) {
+  return String(msg == null ? '' : msg).toLowerCase()
+    .indexOf('quantity scale is invalid') >= 0;
+}
+// Decimal scale (# significant decimals) of a plain qty string —
+// mexc_qty_scale parity ("0.0050" → 3, "4.73" → 2, "50"/"junk" → 0).
+function mexcQtyScale(q) {
+  const s = String(q == null ? '' : q).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return 0;
+  const i = s.indexOf('.');
+  if (i < 0) return 0;
+  return s.slice(i + 1).replace(/0+$/, '').length;
+}
+// Floor a qty string to `sc` decimals (string truncation — never rounds
+// up), trailing zeros stripped — mexc_qty_floor_scale parity ("4.739",2 →
+// "4.73"; "0.9",0 → "0"; bad input / negative scale → null).
+function mexcQtyFloorScale(q, sc) {
+  const s = String(q == null ? '' : q).trim();
+  const n = Math.floor(Number(sc));
+  if (!/^\d+(\.\d+)?$/.test(s) || !isFinite(n) || n < 0) return null;
+  const i = s.indexOf('.');
+  let out = i < 0 ? s : (n > 0 ? s.slice(0, i + 1 + n) : s.slice(0, i));
+  if (out.indexOf('.') >= 0) out = out.replace(/0+$/, '').replace(/\.$/, '');
+  return out === '' ? '0' : out;
+}
 
 // Client order id: alphanumeric strip + 32-char truncate — mexc_clordid parity.
 function mexcClOrdId(clOrdID) {
@@ -1911,7 +2002,9 @@ function createTradeNative(opts) {
       const ag = agentFor(route);
       if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
       const h = Object.assign({}, headers);
-      if (bodyStr) h['Content-Type'] = 'application/json';
+      // Default JSON only when the caller didn't set an explicit type
+      // (Lighter sendTx is form-urlencoded).
+      if (bodyStr && !h['Content-Type']) h['Content-Type'] = 'application/json';
       h['Content-Length'] = Buffer.byteLength(bodyStr || '');
       const req = https.request({
         host: host, method: method,
@@ -3249,6 +3342,9 @@ function createTradeNative(opts) {
 
   // --- MEXC --------------------------------------------------------------------
   const mxCtCache = {};
+  // Per-session accepted spot qty scale by symbol (engine _mx_spot_scale
+  // parity): filled by the trim-retry below, pre-floors later orders.
+  const mxSpotScaleMemo = {};
 
   async function mxRequest(creds, method, market, path, params, body, route) {
     const plist = (params || []).slice();
@@ -3350,8 +3446,37 @@ function createTradeNative(opts) {
       const isStop = t === 'stop' || t === 'stop_limit' || t === 'tp_market';
       if (mkt !== 'futures') {
         if (isStop) return { ok: false, message: 'Stop orders are futures-only' };
-        const params = mexcSpotOrderParams(symbol, side, ordType, qty, price, clOrdID);
-        const r = await mxRequest(creds, 'POST', 'spot', '/api/v3/order', params, null, route);
+        // BASE-quantity shapes only (market BUY sends quoteOrderQty = USDT):
+        // pre-floor to any per-symbol scale MEXC previously accepted this
+        // session (engine _mx_spot_scale recipe).
+        const sendsBase = !(t !== 'limit' && String(side).toLowerCase() === 'buy');
+        let sendQty = String(qty);
+        if (sendsBase) {
+          const memo = mxSpotScaleMemo[symbol];
+          if (memo != null && mexcQtyScale(sendQty) > memo) {
+            const q3 = mexcQtyFloorScale(sendQty, memo);
+            if (q3 != null && Number(q3) > 0) sendQty = q3;
+          }
+        }
+        let params = mexcSpotOrderParams(symbol, side, ordType, sendQty, price, clOrdID);
+        let r = await mxRequest(creds, 'POST', 'spot', '/api/v3/order', params, null, route);
+        if (!r.ok && sendsBase && mexcIsQtyScaleErr(r.message || r.data)) {
+          // Bounded trim-one-decimal retry: MEXC's accepted scale for this
+          // symbol is coarser than everything published — floor a decimal
+          // off at a time (never up) until it takes or the quantity dies.
+          // Accepted scale memoized per symbol for the session (engine
+          // trim-retry parity, terminal_engine mexc spot place).
+          let sc = mexcQtyScale(sendQty);
+          for (let att = 0; att < 6 && !r.ok && sc > 0; att++) {
+            sc -= 1;
+            const nq = mexcQtyFloorScale(sendQty, sc);
+            if (nq == null || !(Number(nq) > 0)) break;
+            params = mexcSpotOrderParams(symbol, side, ordType, nq, price, clOrdID);
+            r = await mxRequest(creds, 'POST', 'spot', '/api/v3/order', params, null, route);
+            if (r.ok) { mxSpotScaleMemo[symbol] = sc; break; }
+            if (!mexcIsQtyScaleErr(r.message || r.data)) break;
+          }
+        }
         if (!r.ok) {
           // API-restricted symbol (10007): the engine's UID/web-session
           // bypass is a SERVER-side path — native cannot ride it. Honest
@@ -4079,6 +4204,371 @@ function createTradeNative(opts) {
     return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
   }
 
+  // --- Lighter native trading (WASM zk signer) -----------------------------
+  // Signing rides assets/lighter_signer.wasm (Go, poseidon/schnorr) — parity
+  // proven against the Python SDK (identical txHash + payload). All REST here
+  // is public except accountActiveOrders (auth token, signed offline).
+  let _ltWasm = null;      // load promise (reset on failure so retry works)
+  const _ltCli = { key: '' };                    // creds triple registered in the wasm
+  const _ltAuth = { key: '', token: '', exp: 0 };
+  const _ltNonce = { key: '', next: null, chain: Promise.resolve() };
+  const _ltProds = { ts: 0, map: null };
+
+  function ltWasmLoad() {
+    if (_ltWasm) return _ltWasm;
+    _ltWasm = (async () => {
+      if (typeof globalThis.Go !== 'function') {
+        require(path.join(__dirname, 'assets', 'wasm_exec.js'));
+      }
+      const buf = fs.readFileSync(path.join(__dirname, 'assets', 'lighter_signer.wasm'));
+      const go = new globalThis.Go();
+      const inst = await WebAssembly.instantiate(buf, go.importObject);
+      go.run(inst.instance);   // registers the Sign* globals then parks on a channel
+      const t0 = Date.now();
+      while (typeof globalThis.CreateClient !== 'function') {
+        if (Date.now() - t0 > 5000) throw new Error('Lighter signer WASM failed to initialize');
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return true;
+    })();
+    _ltWasm.catch(() => { _ltWasm = null; });
+    return _ltWasm;
+  }
+
+  // The Go wasm runtime reads walltime via the JS Date — shift it by the
+  // probed venue offset for the duration of one SYNC sign call so the tx
+  // ExpiredAt / order expiry stamps ride venue time, not the raw PC clock
+  // (native-venue clock-sync rule).
+  function ltWithClock(offMs, fn) {
+    const off = Number(offMs) || 0;
+    if (!off) return fn();
+    const RealDate = globalThis.Date;
+    const Shifted = class extends RealDate {
+      constructor(...a) { if (a.length === 0) { super(RealDate.now() + off); } else { super(...a); } }
+      static now() { return RealDate.now() + off; }
+    };
+    globalThis.Date = Shifted;
+    try { return fn(); } finally { globalThis.Date = RealDate; }
+  }
+
+  // Ensure the wasm client holds THIS creds triple (idempotent re-register on
+  // creds change). Returns {ok, acct, kidx} or an honest failure.
+  async function ltClient(creds) {
+    const p = ltParseKey(creds.key);
+    if (!p) return { ok: false, message: 'Invalid Lighter key — use accountIndex or accountIndex:apiKeyIndex' };
+    const pk = String(creds.secret || '').trim();
+    if (!/^(0x)?[0-9a-fA-F]{80}$/.test(pk)) {
+      return { ok: false, message: 'Invalid Lighter API private key (expect 40-byte hex)' };
+    }
+    try { await ltWasmLoad(); } catch (e) {
+      return { ok: false, message: (e && e.message) || 'Lighter signer load failed' };
+    }
+    const ck = p.acct + ':' + p.kidx + ':' + pk.slice(-8);
+    if (_ltCli.key !== ck) {
+      let r;
+      try {
+        r = globalThis.CreateClient('https://' + LIGHTER_HOST, pk, LIGHTER_CHAIN_ID, p.kidx, p.acct);
+      } catch (e) {
+        return { ok: false, message: 'Lighter signer rejected the key: ' + ((e && e.message) || 'error') };
+      }
+      if (r && r.error) return { ok: false, message: 'Lighter signer rejected the key: ' + r.error };
+      _ltCli.key = ck;
+      _ltAuth.key = '';                          // creds changed → new token
+      _ltNonce.key = ''; _ltNonce.next = null;   // and a fresh nonce fetch
+    }
+    return { ok: true, acct: p.acct, kidx: p.kidx };
+  }
+
+  // Perp catalog (public /orderBookDetails), 10-min cache — engine parity
+  // fields: market_id + price/size_decimals.
+  async function ltSpec(symbol, route) {
+    if (!_ltProds.map || Date.now() - _ltProds.ts > PRODUCTS_TTL_MS) {
+      let r;
+      try {
+        r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/orderBookDetails', '', null, {}, route, 8 * 1024 * 1024);
+      } catch (e) {
+        return { ok: false, message: 'Lighter catalog fetch failed: ' + ((e && e.message) || 'error') };
+      }
+      let rows = null;
+      try { rows = JSON.parse(r.text).order_book_details; } catch (e) { rows = null; }
+      if (!Array.isArray(rows)) {
+        return { ok: false, message: 'Lighter catalog unavailable (HTTP ' + (r.status || 0) + ')' };
+      }
+      const map = {};
+      for (const d of rows) {
+        const sym = String((d && d.symbol) || '');
+        if (!sym) continue;
+        if (d.market_type != null && String(d.market_type) !== 'perp') continue;
+        if (d.status != null && String(d.status) !== 'active') continue;
+        const pd = d.price_decimals != null ? Number(d.price_decimals) : Number(d.supported_price_decimals);
+        const sd = d.size_decimals != null ? Number(d.size_decimals) : Number(d.supported_size_decimals);
+        const mid = Number(d.market_id);
+        if (!Number.isInteger(pd) || !Number.isInteger(sd) || !Number.isInteger(mid)) continue;
+        map[sym.toLowerCase()] = { mid: mid, pd: pd, sd: sd, symbol: sym };
+      }
+      _ltProds.map = map; _ltProds.ts = Date.now();
+    }
+    const s = _ltProds.map[String(symbol || '').toLowerCase()];
+    return s ? { ok: true, spec: s } : { ok: false, message: 'Unknown Lighter symbol ' + symbol };
+  }
+
+  // Auth token for the one authenticated read (accountActiveOrders). Signed
+  // OFFLINE by the wasm; ~6h deadline, refreshed 10 min early.
+  function ltAuthToken(cc) {
+    const k = cc.acct + ':' + cc.kidx;
+    if (_ltAuth.key === k && Date.now() < _ltAuth.exp - 600000) return { ok: true, token: _ltAuth.token };
+    const deadline = Math.floor(Date.now() / 1000) + 6 * 3600;
+    let r;
+    try { r = globalThis.CreateAuthToken(deadline, cc.kidx, cc.acct); } catch (e) {
+      return { ok: false, message: 'Lighter auth token failed: ' + ((e && e.message) || 'error') };
+    }
+    const tok = r && (r.authToken || r.token);
+    if (!tok || (r && r.error)) {
+      return { ok: false, message: 'Lighter auth token failed: ' + ((r && r.error) || 'no token') };
+    }
+    _ltAuth.key = k; _ltAuth.token = String(tok); _ltAuth.exp = deadline * 1000;
+    return { ok: true, token: _ltAuth.token };
+  }
+
+  // Sign + send ONE tx under the nonce chain (engine _tx parity): nonce
+  // advances only on an ACCEPTED send; ANY failure drops the cache (hard
+  // /nextNonce refresh next tx). signFn(nonce) → wasm result {txType, txInfo,
+  // txHash?, error?}.
+  function ltTx(cc, route, signFn) {
+    const nk = cc.acct + ':' + cc.kidx;
+    const run = _ltNonce.chain.then(async () => {
+      const drop = () => { _ltNonce.key = ''; _ltNonce.next = null; };
+      try {
+        let nonce = (_ltNonce.key === nk) ? _ltNonce.next : null;
+        if (nonce == null) {
+          const r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/nextNonce',
+            'account_index=' + cc.acct + '&api_key_index=' + cc.kidx, null, {}, route);
+          let n = null;
+          try { n = Number(JSON.parse(r.text).nonce); } catch (e) { n = null; }
+          if (!Number.isSafeInteger(n)) {
+            return { ok: false, message: 'Lighter nonce fetch failed (HTTP ' + (r.status || 0) + ')' };
+          }
+          nonce = n;
+        }
+        const off = await ensureVenueTime('lighter', null, route);
+        let s;
+        try { s = ltWithClock(off, () => signFn(nonce)); } catch (e) {
+          drop();
+          return { ok: false, message: 'Lighter signing failed: ' + ((e && e.message) || 'error') };
+        }
+        if (!s || s.error || !s.txInfo) {
+          drop();
+          return { ok: false, message: 'Lighter signing failed: ' + ((s && s.error) || 'empty result') };
+        }
+        const body = 'tx_type=' + encodeURIComponent(String(s.txType)) +
+                     '&tx_info=' + encodeURIComponent(String(s.txInfo));
+        const r = await httpJson(LIGHTER_HOST, 'POST', '/api/v1/sendTx', '', body,
+                                 { 'Content-Type': 'application/x-www-form-urlencoded' }, route);
+        let data = null;
+        try { data = JSON.parse(r.text); } catch (e) { data = null; }
+        const code = data && data.code != null ? Number(data.code) : null;
+        if (r.status === 200 && (code === null || code === 0 || code === 200)) {
+          _ltNonce.key = nk; _ltNonce.next = nonce + 1;
+          return { ok: true, data: data };
+        }
+        drop();
+        const msg = (data && (data.message || data.msg)) || '';
+        return { ok: false, message: 'Lighter error ' + (code != null ? code : ('HTTP ' + (r.status || 0))) + (msg ? ' — ' + msg : '') };
+      } catch (e) {
+        drop();
+        const em = (e && e.message) || 'error';
+        if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
+        return { ok: false, message: 'Lighter request failed: ' + em };
+      }
+    });
+    _ltNonce.chain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  // Top-of-book ±2% execution bound for market/IOC orders — book fetch
+  // failure FAILS the order (engine parity, no unbounded markets).
+  async function ltBook(mid, side, pd, route) {
+    let r;
+    try {
+      r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/orderBookOrders',
+                         'market_id=' + mid + '&limit=1', null, {}, route);
+    } catch (e) {
+      return { ok: false, message: 'Lighter order book unavailable — market order not sent' };
+    }
+    let d = null;
+    try { d = JSON.parse(r.text); } catch (e) { d = null; }
+    const buy = !String(side || '').toLowerCase().startsWith('s');
+    const rows = (d && d[buy ? 'asks' : 'bids']) || [];
+    const px = rows.length ? ltUnits(String(rows[0].price), pd) : null;
+    const pu = ltBoundUnits(px, buy);
+    if (!pu) return { ok: false, message: 'Lighter order book unavailable — market order not sent' };
+    return { ok: true, pu: pu };
+  }
+
+  // Open positions from the PUBLIC /account blob (engine parity: sign<0 =
+  // Sell, size = |position|; no mark in this blob).
+  async function ltPositions(cc, route) {
+    let r;
+    try {
+      r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/account',
+                         'by=index&value=' + cc.acct, null, {}, route, 4 * 1024 * 1024);
+    } catch (e) {
+      return { ok: false, message: 'Lighter account fetch failed: ' + ((e && e.message) || 'error') };
+    }
+    let d = null;
+    try { d = JSON.parse(r.text); } catch (e) { d = null; }
+    const acc = d && Array.isArray(d.accounts) && d.accounts[0];
+    if (!acc) return { ok: false, message: 'Lighter account fetch failed (HTTP ' + (r.status || 0) + ')' };
+    const rows = [];
+    for (const p of (acc.positions || [])) {
+      const sz = Number(p && p.position);
+      if (!isFinite(sz) || sz === 0) continue;
+      rows.push({
+        symbol: String(p.symbol || ''),
+        side: Number(p.sign || 1) < 0 ? 'sell' : 'buy',
+        size: String(p.position).replace(/^-/, ''),
+        mark: null,
+      });
+    }
+    return { ok: true, rows: rows };
+  }
+
+  // Place one perp order — EXACT engine mapping: limit→type0/GTT/exp-1,
+  // market→1/IOC/exp0 + book bound, stop→2 / tp_market→4 (IOC, px =
+  // trigger∓2%), stop_limit→3/GTT. Wasm stamps expiry itself for exp=-1.
+  async function ltPlace(cc, route, symbol, side, type, qty, price, clOrdID, opts) {
+    const sr = await ltSpec(symbol, route);
+    if (!sr.ok) return sr;
+    const sp = sr.spec;
+    const bu = ltUnits(qty, sp.sd);
+    if (!bu || bu <= 0) return { ok: false, message: 'Quantity below one step' };
+    const isAsk = String(side || '').toLowerCase().startsWith('s');
+    const t = String(type || '').toLowerCase();
+    const isStop = (t === 'stop' || t === 'stop_limit' || t === 'tp_market');
+    let otype, tif, exp = -1, trigU = 0, pu = null;
+    if (isStop) {
+      trigU = ltUnits(opts.trigger, sp.pd);
+      if (!trigU || trigU <= 0) return { ok: false, message: 'Invalid trigger price' };
+      if (t === 'stop_limit') {
+        otype = 3; tif = 1;                       // STOP_LOSS_LIMIT / GTT
+        if (price == null) return { ok: false, message: 'Missing limit price' };
+        pu = ltUnits(price, sp.pd);
+        if (!pu || pu <= 0) return { ok: false, message: 'Invalid price' };
+      } else {
+        otype = (t === 'tp_market') ? 4 : 2;      // TAKE_PROFIT / STOP_LOSS
+        tif = 0;                                  // IOC after trigger
+        pu = ltBoundUnits(trigU, !isAsk);         // ±2% around the trigger
+        if (!pu) return { ok: false, message: 'Invalid trigger price' };
+      }
+    } else if (t === 'market') {
+      otype = 1; tif = 0; exp = 0;                // MARKET / IOC
+      const b = await ltBook(sp.mid, side, sp.pd, route);
+      if (!b.ok) return b;
+      pu = b.pu;
+    } else {
+      otype = 0; tif = 1;                         // LIMIT / GTT
+      if (price == null) return { ok: false, message: 'Missing limit price' };
+      pu = ltUnits(price, sp.pd);
+      if (!pu || pu <= 0) return { ok: false, message: 'Invalid price' };
+    }
+    const coi = ltCoi(clOrdID);
+    const ro = opts.reduceOnly ? 1 : 0;
+    const r = await ltTx(cc, route, (nonce) =>
+      globalThis.SignCreateOrder(sp.mid, coi, bu, pu, isAsk ? 1 : 0, otype, tif,
+                                 ro, trigU, exp, 0, 0, 0, 0, 0, 0,
+                                 nonce, cc.kidx, cc.acct));
+    if (!r.ok) return r;
+    // Synthetic id namespace mirrors the engine: ltc:/lts: + client index.
+    return { ok: true, orderID: (isStop ? 'lts:' : 'ltc:') + coi, clOrdID: clOrdID || null };
+  }
+
+  async function execLighter(creds, intent, route) {
+    if (intent.market === 'spot') {
+      return { ok: false, message: 'Lighter spot trading is not supported yet (watch-only)' };
+    }
+    const cc = await ltClient(creds);
+    if (!cc.ok) return cc;
+    if (intent.op === 'order') {
+      return ltPlace(cc, route, intent.symbol, intent.side, intent.type,
+                     intent.qty, intent.price, intent.clOrdID,
+                     { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+    }
+    if (intent.op === 'cancel') {
+      const sr = await ltSpec(intent.symbol, route);
+      if (!sr.ok) return sr;
+      const mid = sr.spec.mid;
+      const oid = String(intent.orderID || '');
+      let oidx = null;
+      if (/^lt[cs]:\d+$/.test(oid)) {
+        // Synthetic id → resolve client_order_index → live order_index via
+        // the authenticated active-orders read. order_index is int64: pull
+        // its DIGITS from the raw body (JSON.parse would round >2^53) and
+        // fail honestly if it exceeds the JS/wasm float boundary.
+        const coi = Number(oid.slice(4));
+        const at = ltAuthToken(cc);
+        if (!at.ok) return at;
+        let r;
+        try {
+          r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/accountActiveOrders',
+                             'account_index=' + cc.acct + '&market_id=' + mid +
+                             '&auth=' + encodeURIComponent(at.token),
+                             null, {}, route, 4 * 1024 * 1024);
+        } catch (e) {
+          return { ok: false, message: 'Lighter open-orders fetch failed: ' + ((e && e.message) || 'error') };
+        }
+        const rx = new RegExp('\\{[^{}]*"client_order_index"\\s*:\\s*"?' + coi + '"?[^{}]*\\}');
+        const m = (r.text || '').match(rx);
+        const im = m && m[0].match(/"order_index"\s*:\s*"?(\d+)/);
+        if (!im) {
+          return { ok: false, message: 'Order not found on Lighter (already filled or cancelled?)' };
+        }
+        oidx = Number(im[1]);
+        if (!Number.isSafeInteger(oidx)) {
+          return { ok: false, message: 'Lighter order index exceeds the native signer range — cancel via Server trading' };
+        }
+      } else {
+        oidx = Number(oid);
+        if (!Number.isSafeInteger(oidx) || oidx < 0) return { ok: false, message: 'Bad order id' };
+      }
+      const r = await ltTx(cc, route, (nonce) =>
+        globalThis.SignCancelOrder(mid, oidx, 0, nonce, cc.kidx, cc.acct));
+      if (!r.ok) return r;
+      return { ok: true, cancelled: oid, orderID: oid };
+    }
+    if (intent.op === 'cancel_all') {
+      // One book-wide cancel-all tx (sweeps stops too). Count honesty: the
+      // venue doesn't report how many — count stays null.
+      const sr = await ltSpec(intent.symbol, route);
+      if (!sr.ok) return sr;
+      const r = await ltTx(cc, route, (nonce) =>
+        globalThis.SignCancelAllOrders(0, 0, sr.spec.mid, 0, nonce, cc.kidx, cc.acct));
+      if (!r.ok) return r;
+      return { ok: true, cancelled: 'all', count: null };
+    }
+    if (intent.op === 'sltp') {
+      const pr = await findPosRetry(() => ltPositions(cc, route), intent.symbol);
+      if (!pr.ok) return pr;
+      if (!pr.pos) return { ok: false, message: 'No open position to protect' };
+      const terr = sltpTriggerOk(intent.kind, pr.pos.side, intent.trigger, pr.pos.mark);
+      if (terr) return { ok: false, message: terr };
+      const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+      const ordType = intent.kind === 'sl' ? 'stop' : 'tp_market';
+      const r = await ltPlace(cc, route, pr.pos.symbol, side, ordType, pr.pos.size,
+                              null, intent.clOrdID, { reduceOnly: true, trigger: intent.trigger });
+      if (!r.ok) return r;
+      return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
+    }
+    // close — reduce-only market for the position's full size.
+    const pr = await findPosRetry(() => ltPositions(cc, route), intent.symbol);
+    if (!pr.ok) return pr;
+    if (!pr.pos) return { ok: false, message: 'Position not found' };
+    const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+    const r = await ltPlace(cc, route, pr.pos.symbol, side, 'market', pr.pos.size,
+                            null, intent.clOrdID, { reduceOnly: true });
+    if (!r.ok) return r;
+    return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
   // One intent → executed result (renderer-facing shape mirrors the engine).
   async function execIntent(intent) {
     // Read-only latency probe (op:'ping_rt') — handled BEFORE validation and
@@ -4124,6 +4614,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'hyperliquid') return await execHyperliquid(creds, intent, route);
       if (intent.venue === 'asterdex') return await execAster(creds, intent, route);
       if (intent.venue === 'arcus') return await execArcus(creds, intent, route);
+      if (intent.venue === 'lighter') return await execLighter(creds, intent, route);
       if (intent.op === 'close') {
         // Positions lookup → reduce-only market for the full size; ONE retry
         // on a miss (fresh-position REST lag), mirroring the engine.
@@ -4302,6 +4793,14 @@ module.exports = {
   httpRetryAllowed,
   KEEPALIVE_MSECS,
   KA_MAX_SOCKETS,
+  // pure — Lighter native (engine-parity helpers, WASM-independent)
+  LIGHTER_HOST,
+  LIGHTER_CHAIN_ID,
+  LIGHTER_DEFAULT_KEY_INDEX,
+  ltParseKey,
+  ltCoi,
+  ltUnits,
+  ltBoundUnits,
   // pure — venue time sync (offset math + probe registry)
   VENUE_TIME_PROBES,
   venueTimeProbe,
@@ -4379,6 +4878,9 @@ module.exports = {
   mexcFutParamStr,
   mexcErrorMessage,
   mexcIsRestrictedErr,
+  mexcIsQtyScaleErr,
+  mexcQtyScale,
+  mexcQtyFloorScale,
   mexcClOrdId,
   mexcFutSide,
   mexcContracts,

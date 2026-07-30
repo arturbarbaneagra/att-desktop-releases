@@ -1,7 +1,7 @@
 {
   "name": "a-traders-tool-desktop",
   "productName": "A Trader's Tool",
-  "version": "1.5.9",
+  "version": "1.5.10",
   "description": "Desktop shell for atraderstool.com",
   "main": "main.js",
   "private": true,
@@ -39,7 +39,8 @@
       "keyvault.js",
       "dex_sign.js",
       "fallback.html",
-      "assets/**"
+      "assets/**",
+      "!assets/lighter_signer.wasm.gz"
     ],
     "publish": [
       {
@@ -67,6 +68,7 @@
     },
     "portable": {
       "artifactName": "A-Traders-Tool-${version}-portable.exe"
-    }
+    },
+    "beforePack": "scripts/prepare-wasm.js"
   }
 }
