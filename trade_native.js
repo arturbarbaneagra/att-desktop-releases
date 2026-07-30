@@ -461,7 +461,8 @@ function validateIntent(it) {
   }
   const sym = it.symbol;
   const symRe = DEX_VENUES.indexOf(it.venue) >= 0
-    ? /^[A-Za-z0-9._:/@-]+$/ : /^[A-Za-z0-9._-]+$/;
+    ? /^[A-Za-z0-9._:/@-]+$/
+    : (it.venue === 'kraken' ? /^[A-Za-z0-9./_-]+$/ : /^[A-Za-z0-9._-]+$/);
   if (typeof sym !== 'string' || !sym || sym.length > 32 || !symRe.test(sym)) {
     return 'bad symbol';
   }
@@ -2046,17 +2047,31 @@ function createTradeNative(opts) {
       return { ok: false, error: 'encryption-unavailable' };
     }
     const key = String(creds.key || ''), secret = String(creds.secret || '');
-    if (!key || !secret || key.length > 200 || secret.length > 500) {
+    // Kraken dual-pair creds: key/secret = spot pair, additive key2/secret2
+    // = futures pair (separate keys — spot keys can't sign the futures API).
+    // Valid when at least ONE complete pair is present.
+    const key2 = String(creds.key2 || ''), secret2 = String(creds.secret2 || '');
+    const dual = !!(creds.krv || key2 || secret2);
+    if (dual) {
+      if ((!!key !== !!secret) || (!!key2 !== !!secret2)
+          || (!key && !key2)
+          || key.length > 200 || secret.length > 500
+          || key2.length > 200 || secret2.length > 500) {
+        return { ok: false, error: 'bad-creds' };
+      }
+    } else if (!key || !secret || key.length > 200 || secret.length > 500) {
       return { ok: false, error: 'bad-creds' };
     }
     const payload = { key: key, secret: secret };
+    if (dual) { payload.krv = 1; payload.key2 = key2; payload.secret2 = secret2; }
     if (creds.passphrase) payload.pass = String(creds.passphrase).slice(0, 200);
     let b64;
     try {
       b64 = safeStorage.encryptString(JSON.stringify(payload)).toString('base64');
     } catch (e) { return { ok: false, error: 'encrypt-failed' }; }
     const venues = credsLoadAll();
-    venues[venue] = { b64: b64, tail: key.length >= 4 ? key.slice(-4) : key, ts: Math.floor(Date.now() / 1000) };
+    const tailSrc = key || key2;
+    venues[venue] = { b64: b64, tail: tailSrc.length >= 4 ? tailSrc.slice(-4) : tailSrc, ts: Math.floor(Date.now() / 1000) };
     if (!credsSaveAll(venues)) return { ok: false, error: 'persist-failed' };
     return { ok: true, tail: venues[venue].tail };
   }
@@ -3727,7 +3742,10 @@ function createTradeNative(opts) {
   }
 
   // --- Kraken (venue #14 — spot api.kraken.com + PF_ futures) ----------------
-  // ONE unified kraken.com key pair signs both hosts. Spot private = POST
+  // TWO SEPARATE key pairs — spot (kraken.com) and futures — since spot keys
+  // cannot sign the futures API. Dual creds carry krv/key2/secret2; each
+  // market signs ONLY with its own pair (fail-closed when missing); legacy
+  // single-pair creds sign both hosts. Spot private = POST
   // form (nonce in body, API-Key/API-Sign); futures = urlencoded params with
   // APIKey/Authent/Nonce headers, signing path WITHOUT /derivatives.
   let krNonceLast = 0;
@@ -3738,7 +3756,30 @@ function createTradeNative(opts) {
     return String(n);
   }
 
+  // Per-market pair resolve: dual creds (krv or key2 present) are STRICT —
+  // a missing pair means that market fails closed; legacy single-pair
+  // creds sign both markets (they were validated against both scopes).
+  function krPairFor(creds, market) {
+    const dual = !!(creds && (creds.krv || creds.key2 || creds.secret2));
+    if (!dual) {
+      return (creds && creds.key && creds.secret)
+        ? { key: creds.key, secret: creds.secret } : null;
+    }
+    if (market === 'futures') {
+      return (creds.key2 && creds.secret2)
+        ? { key: creds.key2, secret: creds.secret2 } : null;
+    }
+    return (creds.key && creds.secret)
+      ? { key: creds.key, secret: creds.secret } : null;
+  }
+
   async function krRequest(creds, method, market, path, params, route) {
+    const pair = krPairFor(creds, market);
+    if (!pair) {
+      return { ok: false, message: market === 'futures'
+        ? 'No Kraken futures API key saved — add a futures.kraken.com key pair'
+        : 'No Kraken spot API key saved — add a kraken.com key pair' };
+    }
     const plist = (params || []).slice();
     const headers = {};
     let host, query = '', bodyStr = null, m = method;
@@ -3747,9 +3788,9 @@ function createTradeNative(opts) {
       const postData = formEnc(plist);
       const nonce = krNonce(venueStampMs(await ensureVenueTime('kraken', 'futures', route)));
       let authent;
-      try { authent = krFutSign(creds.secret, krFutSignPath(path), postData, nonce); }
+      try { authent = krFutSign(pair.secret, krFutSignPath(path), postData, nonce); }
       catch (e) { return { ok: false, message: 'Invalid API secret (not base64)' }; }
-      headers['APIKey'] = creds.key;
+      headers['APIKey'] = pair.key;
       headers['Authent'] = authent;
       headers['Nonce'] = nonce;
       if (m === 'POST' || m === 'PUT') {
@@ -3763,9 +3804,9 @@ function createTradeNative(opts) {
       const nonce = krNonce(venueStampMs(await ensureVenueTime('kraken', 'spot', route)));
       bodyStr = formEnc([['nonce', nonce]].concat(plist));
       let sign;
-      try { sign = krSpotSign(creds.secret, path, nonce, bodyStr); }
+      try { sign = krSpotSign(pair.secret, path, nonce, bodyStr); }
       catch (e) { return { ok: false, message: 'Invalid API secret (not base64)' }; }
-      headers['API-Key'] = creds.key;
+      headers['API-Key'] = pair.key;
       headers['API-Sign'] = sign;
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       m = 'POST';                       // spot private is always POST

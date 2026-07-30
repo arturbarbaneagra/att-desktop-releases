@@ -41,8 +41,21 @@ function kvSlot(user, venue) {
 function kvCredsNorm(creds) {
   if (!creds || typeof creds !== 'object') return null;
   const key = String(creds.key || ''), secret = String(creds.secret || '');
-  if (!key || !secret || key.length > 200 || secret.length > 500) return null;
+  // Kraken dual-pair creds: key/secret = spot pair, additive key2/secret2 =
+  // futures pair (separate keys — spot keys can't sign the futures API).
+  // Valid when at least ONE complete pair is present.
+  const key2 = String(creds.key2 || ''), secret2 = String(creds.secret2 || '');
+  const dual = !!(creds.krv || key2 || secret2);
+  if (dual) {
+    if ((!!key !== !!secret) || (!!key2 !== !!secret2)
+        || (!key && !key2)
+        || key.length > 200 || secret.length > 500
+        || key2.length > 200 || secret2.length > 500) return null;
+  } else if (!key || !secret || key.length > 200 || secret.length > 500) {
+    return null;
+  }
   const out = { key: key, secret: secret };
+  if (dual) { out.krv = 1; out.key2 = key2; out.secret2 = secret2; }
   if (creds.passphrase) out.pass = String(creds.passphrase).slice(0, 200);
   else if (creds.pass) out.pass = String(creds.pass).slice(0, 200);
   return out;
@@ -104,7 +117,9 @@ function createKeyVault(opts) {
     const entries = loadAll();
     entries[slot] = {
       b64: b64,
-      tail: payload.key.length >= 4 ? payload.key.slice(-4) : payload.key,
+      tail: (payload.key || payload.key2 || '').length >= 4
+        ? (payload.key || payload.key2 || '').slice(-4)
+        : (payload.key || payload.key2 || ''),
       ts: Math.floor(Date.now() / 1000),
     };
     if (!saveAll(entries)) return { ok: false, error: 'persist-failed' };
@@ -118,7 +133,9 @@ function createKeyVault(opts) {
     if (!r || !r.b64) return null;
     try {
       const d = JSON.parse(safeStorage.decryptString(Buffer.from(r.b64, 'base64')));
-      if (!d || !d.key || !d.secret) return null;
+      if (!d) return null;
+      // Valid: a plain pair, or a Kraken dual blob with ≥1 complete pair.
+      if (!((d.key && d.secret) || (d.key2 && d.secret2))) return null;
       return d;                                     // {key, secret, pass?}
     } catch (e) { return null; }
   }
