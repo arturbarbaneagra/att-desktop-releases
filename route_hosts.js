@@ -49,6 +49,8 @@ const VENUE_ROUTE_HOSTS = {
   'kucoin|spot':         [],
   'mexc|futures':        ['contract.mexc.com'],
   'mexc|spot':           [],
+  'kraken|futures':      ['futures.kraken.com'],
+  'kraken|spot':         ['ws.kraken.com'],
 };
 
 // Normalize a renderer-supplied route. ONLY the literal string 'direct' opts a

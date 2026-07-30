@@ -691,6 +691,8 @@ const NATIVE_WS_HOSTS = new Set([
   'contract.mexc.com',          // MEXC futures push WS (/edge; text JSON — spot stays relay-only)
   'wbs-api.mexc.com',           // MEXC spot WS (/ws; protobuf BINARY frames — decoded in the panel)
   'mainnet.zklighter.elliot.ai', // Lighter zk-rollup /stream WS (text JSON; REST stays browser-side per host route rules)
+  'ws.kraken.com',              // Kraken spot WS v2 market data (trading REST rides trade_native)
+  'futures.kraken.com',         // Kraken futures ws/v1 market data (trading REST rides trade_native)
 ]);
 function nativeWsUrlOk(url) {
   try {

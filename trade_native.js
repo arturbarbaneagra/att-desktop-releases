@@ -155,7 +155,7 @@ const TIMESYNC_TTL_MS = 10 * 60 * 1000;
 // Venues this module can trade natively. The registry keys everything
 // (validation, signer pick, creds slots) so adding a venue is additive.
 const TRADE_VENUES = ['phemex', 'binance', 'bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bitmex',
-                      'mexc', 'hyperliquid', 'asterdex', 'arcus', 'lighter'];
+                      'mexc', 'hyperliquid', 'asterdex', 'arcus', 'lighter', 'kraken'];
 // DEX venues carry symbols the CEX charset forbids: HL spot 'UBTC/USDC',
 // HIP-3 builder perps 'xyz:PLTR', spot wire '@N'.
 const DEX_VENUES = ['hyperliquid', 'asterdex', 'arcus'];
@@ -667,6 +667,12 @@ const VENUE_TIME_PROBES = {
   // (BitMEX dateHeader convention) — plenty for signer expiry stamps.
   'lighter': { host: 'mainnet.zklighter.elliot.ai', path: '/',
                ext: (d) => Number((d || {}).timestamp) * 1000 + 500 },
+  // Kraken spot Time is whole SECONDS (×1000, centered +500ms); futures has
+  // no public time endpoint but every REST envelope stamps an ISO serverTime.
+  'kraken:spot':    { host: 'api.kraken.com', path: '/0/public/Time',
+                      ext: (d) => Number((((d || {}).result) || {}).unixtime) * 1000 + 500 },
+  'kraken:futures': { host: 'futures.kraken.com', path: '/derivatives/api/v3/tickers/PF_XBTUSD',
+                      ext: (d) => Date.parse((d || {}).serverTime) },
 };
 
 // venue+market → probe spec (market-split hosts get their own offsets).
@@ -1879,6 +1885,118 @@ function mexcCancelGone(errText) {
     if (s.indexOf(needle) >= 0) return true;
   }
   return false;
+}
+
+// --- Kraken pure builders (venue #14 — parity with terminal_engine kr_*) ----
+const KRAKEN_SPOT_HOST = 'api.kraken.com';
+const KRAKEN_FUT_HOST = 'futures.kraken.com';
+
+// Spot API-Sign: b64(HMAC-SHA512(b64decode(secret), path + SHA256(nonce +
+// postdata))) — kr_spot_sign golden parity.
+function krSpotSign(secretB64, path, nonce, postdata) {
+  const digest = crypto.createHash('sha256')
+    .update(String(nonce) + String(postdata), 'utf8').digest();
+  return crypto.createHmac('sha512', Buffer.from(String(secretB64), 'base64'))
+    .update(Buffer.concat([Buffer.from(String(path), 'utf8'), digest]))
+    .digest('base64');
+}
+// Futures Authent: b64(HMAC-SHA512(b64decode(secret), SHA256(postData +
+// nonce + endpointPath))) — endpointPath EXCLUDES /derivatives (kr_fut_sign).
+function krFutSign(secretB64, endpointPath, postData, nonce) {
+  const digest = crypto.createHash('sha256')
+    .update(String(postData) + String(nonce == null ? '' : nonce) + String(endpointPath), 'utf8')
+    .digest();
+  return crypto.createHmac('sha512', Buffer.from(String(secretB64), 'base64'))
+    .update(digest).digest('base64');
+}
+// Request path → futures signing path (strip /derivatives) — kr_fut_sign_path.
+function krFutSignPath(path) {
+  const p = String(path || '');
+  return p.indexOf('/derivatives') === 0 ? p.slice('/derivatives'.length) : p;
+}
+// Client id: alnum ≤36 — fits spot cl_ord_id AND futures cliOrdId (kr_clordid).
+function krClOrdId(clOrdID) {
+  return String(clOrdID || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 36);
+}
+// Decimal-count → step string ('0'→'1', '2'→'0.01') — kr_dec_step parity.
+function krDecStep(d) {
+  const n = parseInt(d, 10);
+  if (!Number.isFinite(n) || String(n) !== String(d).trim() || n < 0 || n > 18) return null;
+  return n === 0 ? '1' : '0.' + '0'.repeat(n - 1) + '1';
+}
+// Floor a BASE quantity to the instrument step — kr_qty_floor parity.
+function krQtyFloor(qty, step) {
+  let q, st;
+  try { q = decNorm(qty); } catch (e) { return null; }
+  if (q.neg && q.digits !== 0n) return null;
+  if (step) {
+    try { st = decNorm(step); } catch (e) { st = null; }
+    if (st && !st.neg && st.digits > 0n) {
+      // scale both to a common scale, integer-divide, re-multiply
+      const sc = Math.max(q.scale, st.scale);
+      const qd = q.digits * 10n ** BigInt(sc - q.scale);
+      const sd = st.digits * 10n ** BigInt(sc - st.scale);
+      const floored = (qd / sd) * sd;
+      return decFmt(false, floored, sc);
+    }
+  }
+  return decFmt(false, q.digits, q.scale);
+}
+// Futures /derivatives/api/v3/sendorder param list — kr_fut_order_params
+// parity (stp/take_profit + triggerSignal=mark; stop w/o limitPrice executes
+// as market on trigger). Null on an unknown type.
+function krFutOrderParams(symbol, side, ordType, qty, price, clOrdID, flags) {
+  const f = flags || {};
+  const t = String(ordType).toLowerCase();
+  const p = [];
+  if (t === 'stop' || t === 'stop_limit') p.push(['orderType', 'stp']);
+  else if (t === 'tp_market') p.push(['orderType', 'take_profit']);
+  else if (t === 'limit') p.push(['orderType', 'lmt']);
+  else if (t === 'market') p.push(['orderType', 'mkt']);
+  else return null;
+  p.push(['symbol', String(symbol)]);
+  p.push(['side', String(side).toLowerCase() === 'buy' ? 'buy' : 'sell']);
+  p.push(['size', String(qty)]);
+  if ((t === 'limit' || t === 'stop_limit') && price != null) {
+    p.push(['limitPrice', String(price)]);
+  }
+  if (t === 'stop' || t === 'stop_limit' || t === 'tp_market') {
+    p.push(['stopPrice', String(f.trigger)]);
+    p.push(['triggerSignal', 'mark']);
+  }
+  if (f.reduceOnly) p.push(['reduceOnly', 'true']);
+  const cid = krClOrdId(clOrdID);
+  if (cid) p.push(['cliOrdId', cid]);
+  return p;
+}
+// Spot /0/private/AddOrder param list (pair = ALTNAME; volume = BASE qty).
+function krSpotOrderParams(alt, side, ordType, qty, price, clOrdID) {
+  const p = [['pair', String(alt)],
+             ['type', String(side).toLowerCase() === 'buy' ? 'buy' : 'sell'],
+             ['ordertype', String(ordType).toLowerCase() === 'limit' ? 'limit' : 'market'],
+             ['volume', String(qty)]];
+  if (String(ordType).toLowerCase() === 'limit') p.push(['price', String(price)]);
+  const cid = krClOrdId(clOrdID);
+  if (cid) p.push(['cl_ord_id', cid]);
+  return p;
+}
+// GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
+// PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
+function krPositionRows(data) {
+  const rows = [];
+  for (const p of ((data || {}).openPositions || [])) {
+    try {
+      const sz = bnNum((p || {}).size);
+      if (sz == null || Number(sz) === 0) continue;
+      rows.push({
+        symbol: p.symbol,
+        side: String(p.side || '').toLowerCase() === 'long' ? 'Buy' : 'Sell',
+        size: sz,
+        mark: null,
+      });
+    } catch (e) { /* skip bad row */ }
+  }
+  return rows;
 }
 
 // int(Decimal(s)) parity — truncate a decimal string toward zero → Number.
@@ -3608,6 +3726,255 @@ function createTradeNative(opts) {
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
   }
 
+  // --- Kraken (venue #14 — spot api.kraken.com + PF_ futures) ----------------
+  // ONE unified kraken.com key pair signs both hosts. Spot private = POST
+  // form (nonce in body, API-Key/API-Sign); futures = urlencoded params with
+  // APIKey/Authent/Nonce headers, signing path WITHOUT /derivatives.
+  let krNonceLast = 0;
+  function krNonce(baseMs) {
+    let n = Math.round(Number(baseMs) || Date.now());
+    if (n <= krNonceLast) n = krNonceLast + 1;
+    krNonceLast = n;
+    return String(n);
+  }
+
+  async function krRequest(creds, method, market, path, params, route) {
+    const plist = (params || []).slice();
+    const headers = {};
+    let host, query = '', bodyStr = null, m = method;
+    if (market === 'futures') {
+      host = KRAKEN_FUT_HOST;
+      const postData = formEnc(plist);
+      const nonce = krNonce(venueStampMs(await ensureVenueTime('kraken', 'futures', route)));
+      let authent;
+      try { authent = krFutSign(creds.secret, krFutSignPath(path), postData, nonce); }
+      catch (e) { return { ok: false, message: 'Invalid API secret (not base64)' }; }
+      headers['APIKey'] = creds.key;
+      headers['Authent'] = authent;
+      headers['Nonce'] = nonce;
+      if (m === 'POST' || m === 'PUT') {
+        bodyStr = postData;
+        headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      } else {
+        query = postData;
+      }
+    } else {
+      host = KRAKEN_SPOT_HOST;
+      const nonce = krNonce(venueStampMs(await ensureVenueTime('kraken', 'spot', route)));
+      bodyStr = formEnc([['nonce', nonce]].concat(plist));
+      let sign;
+      try { sign = krSpotSign(creds.secret, path, nonce, bodyStr); }
+      catch (e) { return { ok: false, message: 'Invalid API secret (not base64)' }; }
+      headers['API-Key'] = creds.key;
+      headers['API-Sign'] = sign;
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      m = 'POST';                       // spot private is always POST
+    }
+    let r;
+    try {
+      r = await httpJson(host, m, path, query, bodyStr, headers, route);
+    } catch (e) { return transportFail(e, 'Kraken'); }
+    if (r.status === 429) return { ok: false, message: 'Rate limited by Kraken — retry shortly' };
+    let data;
+    try { data = r.text ? JSON.parse(r.text) : {}; } catch (e) {
+      return { ok: false, message: 'Kraken returned HTTP ' + r.status };
+    }
+    if (market === 'futures') {
+      if (String((data || {}).result || '') === 'success') return { ok: true, data: data };
+      const err = String((data || {}).error
+        || (((data || {}).errors || [])[0] || '')
+        || '') || (r.status >= 400 ? 'Kraken returned HTTP ' + r.status : 'Kraken error');
+      return { ok: false, message: err };
+    }
+    const errs = (data || {}).error;
+    if (Array.isArray(errs) && errs.length) return { ok: false, message: String(errs[0]) };
+    if (r.status >= 400) return { ok: false, message: 'Kraken returned HTTP ' + r.status };
+    return { ok: true, data: data };
+  }
+
+  // Public product specs (TTL): futures PF_ steps + spot altname/lot steps.
+  // Full-catalog GETs — pass a raised response cap (shell httpJson defaults
+  // to 256 KB; AssetPairs/instruments exceed it → masked "unknown symbol").
+  let krProdCache = null;
+  async function krProducts(route) {
+    if (krProdCache && Date.now() - krProdCache.ts < PRODUCTS_TTL_MS) return krProdCache.v;
+    const cap = 8 * 1024 * 1024;
+    const v = { futures: {}, spot: {} };
+    try {
+      const rf = await httpJson(KRAKEN_FUT_HOST, 'GET', '/derivatives/api/v3/instruments',
+                                '', null, {}, route, cap);
+      const df = JSON.parse(rf.text);
+      for (const s of ((df || {}).instruments || [])) {
+        const sym = String((s || {}).symbol || '');
+        if (sym.indexOf('PF_') !== 0 || s.tradeable === false) continue;
+        v.futures[sym] = { qty_step: krDecStep(s.contractValueTradePrecision) || '1' };
+      }
+    } catch (e) { /* fail-visible at order time (spec miss) */ }
+    try {
+      const rs = await httpJson(KRAKEN_SPOT_HOST, 'GET', '/0/public/AssetPairs',
+                                '', null, {}, route, cap);
+      const ds = JSON.parse(rs.text);
+      const res = ((ds || {}).result) || {};
+      for (const code of Object.keys(res)) {
+        const s = res[code] || {};
+        if (String(s.status || '') !== 'online') continue;
+        const ws = s.wsname;
+        if (typeof ws !== 'string' || ws.indexOf('/') < 0) continue;
+        const fix = { XBT: 'BTC', XDG: 'DOGE' };
+        const sym = ws.split('/').map((p) => fix[p] || p).join('/');
+        v.spot[sym] = { alt: String(s.altname || code),
+                        qty_step: krDecStep(s.lot_decimals) || '1' };
+      }
+    } catch (e) { /* fail-visible at order time (spec miss) */ }
+    if (Object.keys(v.futures).length || Object.keys(v.spot).length) {
+      krProdCache = { ts: Date.now(), v: v };
+    }
+    return v;
+  }
+
+  async function execKraken(creds, intent, route) {
+    const market = intent.market === 'spot' ? 'spot' : 'futures';
+    const fetchPos = async () => {
+      const r = await krRequest(creds, 'GET', 'futures',
+                                '/derivatives/api/v3/openpositions', null, route);
+      if (!r.ok) return r;
+      return { ok: true, rows: krPositionRows(r.data) };
+    };
+    async function place(mkt, symbol, side, ordType, qty, price, clOrdID, flags) {
+      const f = flags || {};
+      const t = String(ordType).toLowerCase();
+      const isStop = t === 'stop' || t === 'stop_limit' || t === 'tp_market';
+      const prods = await krProducts(route);
+      if (mkt !== 'futures') {
+        // Spot conditional orders are deliberately NOT offered (futures-only
+        // stops — engine parity, same honest gate as MEXC spot).
+        if (isStop) return { ok: false, message: 'Stop orders are futures-only on Kraken' };
+        const spec = prods.spot[symbol];
+        if (!spec || !spec.alt) return { ok: false, message: 'Unknown spot symbol ' + symbol };
+        let qv = String(qty);
+        if (t === 'market' && String(side).toLowerCase() === 'buy') {
+          // Spot market BUY arrives QUOTE-denominated — convert via the live
+          // best ask; a failed ticker read FAILS the order (never a guess).
+          let ask = null;
+          try {
+            const rt = await httpJson(KRAKEN_SPOT_HOST, 'GET', '/0/public/Ticker',
+                                      formEnc([['pair', spec.alt]]), null, {}, route);
+            const res = ((JSON.parse(rt.text) || {}).result) || {};
+            for (const k of Object.keys(res)) {
+              const a = (res[k] || {}).a;
+              if (Array.isArray(a) && a.length) ask = Number(a[0]);
+              break;
+            }
+          } catch (e) { return transportFail(e, 'Kraken'); }
+          if (!(ask > 0)) return { ok: false, message: 'Price lookup failed: empty ticker' };
+          qv = String(Number(qty) / ask);
+        }
+        const q = krQtyFloor(qv, spec.qty_step);
+        if (q == null || !(Number(q) > 0)) {
+          return { ok: false, message: 'Quantity below the step for ' + symbol };
+        }
+        const params = krSpotOrderParams(spec.alt, side, t, q, price, clOrdID);
+        const r = await krRequest(creds, 'POST', 'spot', '/0/private/AddOrder', params, route);
+        if (!r.ok) return r;
+        const txids = (((r.data || {}).result) || {}).txid || [];
+        const oid = txids.length ? String(txids[0]) : '';
+        if (!oid) return { ok: false, message: 'Kraken returned no order id' };
+        return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+      }
+      const spec = prods.futures[symbol];
+      const q = krQtyFloor(qty, (spec || {}).qty_step);
+      if (q == null || !(Number(q) > 0)) {
+        return { ok: false, message: 'Quantity below the step for ' + symbol };
+      }
+      const params = krFutOrderParams(symbol, side, t, q, price, clOrdID,
+                                      { reduceOnly: !!f.reduceOnly, trigger: f.trigger });
+      if (params == null) return { ok: false, message: 'Unsupported order type ' + ordType };
+      const r = await krRequest(creds, 'POST', 'futures',
+                                '/derivatives/api/v3/sendorder', params, route);
+      if (!r.ok) return r;
+      const ss = ((r.data || {}).sendStatus) || {};
+      const st = String(ss.status || '');
+      const oid = String(ss.order_id || ss.orderId || '');
+      if (st !== 'placed' || !oid) {
+        // Kraken encodes rejects INSIDE a result:"success" envelope
+        // (insufficientAvailableFunds & co.) — surface verbatim.
+        return { ok: false, message: st || 'Kraken rejected the order' };
+      }
+      return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+    }
+    if (intent.op === 'order') {
+      return place(market, intent.symbol, intent.side, intent.type,
+                   intent.qty, intent.price, intent.clOrdID,
+                   { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+    }
+    if (intent.op === 'cancel') {
+      if (market === 'futures') {
+        const r = await krRequest(creds, 'POST', 'futures',
+                                  '/derivatives/api/v3/cancelorder',
+                                  [['order_id', String(intent.orderID)]], route);
+        if (!r.ok) return r;
+        const cs = ((r.data || {}).cancelStatus) || {};
+        const st = String(cs.status || '');
+        if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
+        return { ok: true, cancelled: intent.orderID };
+      }
+      const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
+                                [['txid', String(intent.orderID)]], route);
+      if (!r.ok) return r;
+      return { ok: true, cancelled: intent.orderID };
+    }
+    if (intent.op === 'cancel_all') {
+      if (market === 'futures') {
+        // cancelallorders?symbol sweeps EVERYTHING on the contract —
+        // untriggered stops included (they live in the same book).
+        const r = await krRequest(creds, 'POST', 'futures',
+                                  '/derivatives/api/v3/cancelallorders',
+                                  [['symbol', String(intent.symbol)]], route);
+        if (!r.ok) return r;
+        return { ok: true, cancelled: 'all' };
+      }
+      // Spot has NO per-pair sweep (CancelAll nukes every pair) → list the
+      // pair's open orders and cancel one by one (altname match).
+      const prods = await krProducts(route);
+      const spec = prods.spot[intent.symbol];
+      if (!spec || !spec.alt) return { ok: false, message: 'Unknown spot symbol ' + intent.symbol };
+      const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
+      if (!lo.ok) return lo;
+      const open = ((((lo.data || {}).result) || {}).open) || {};
+      let n = 0; let firstErr = null;
+      for (const txid of Object.keys(open)) {
+        const pair = String((((open[txid] || {}).descr) || {}).pair || '');
+        if (pair !== spec.alt) continue;
+        const rc = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
+                                   [['txid', txid]], route);
+        if (rc.ok) n += 1;
+        else if (!firstErr) firstErr = rc.message;
+      }
+      if (firstErr && !n) return { ok: false, message: firstErr };
+      return { ok: true, cancelled: 'all' };
+    }
+    const pr = await findPosRetry(fetchPos, intent.symbol);
+    if (!pr.ok) return pr;
+    if (intent.op === 'close') {
+      if (!pr.pos) return { ok: false, message: 'Position not found' };
+      const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+      const r = await place('futures', pr.pos.symbol, side, 'market', pr.pos.size,
+                            null, intent.clOrdID, { reduceOnly: true });
+      if (!r.ok) return r;
+      return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
+    }
+    if (!pr.pos) return { ok: false, message: 'No open position to protect' };
+    const terr = sltpTriggerOk(intent.kind, pr.pos.side, intent.trigger, pr.pos.mark);
+    if (terr) return { ok: false, message: terr };
+    const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+    const ordType = intent.kind === 'sl' ? 'stop' : 'tp_market';
+    const r = await place('futures', pr.pos.symbol, side, ordType, pr.pos.size,
+                          null, intent.clOrdID,
+                          { reduceOnly: true, trigger: intent.trigger });
+    if (!r.ok) return r;
+    return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
   // --- Hyperliquid (DEX — wallet-signed /exchange actions) --------------------
   async function hlInfo(body, route) {
     let r;
@@ -4615,6 +4982,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'asterdex') return await execAster(creds, intent, route);
       if (intent.venue === 'arcus') return await execArcus(creds, intent, route);
       if (intent.venue === 'lighter') return await execLighter(creds, intent, route);
+      if (intent.venue === 'kraken') return await execKraken(creds, intent, route);
       if (intent.op === 'close') {
         // Positions lookup → reduce-only market for the full size; ONE retry
         // on a miss (fresh-position REST lag), mirroring the engine.
@@ -4891,6 +5259,18 @@ module.exports = {
   mexcPlanBody,
   mexcPositionRows,
   mexcCancelGone,
+  // pure — Kraken (venue #14, engine kr_* golden parity)
+  KRAKEN_SPOT_HOST,
+  KRAKEN_FUT_HOST,
+  krSpotSign,
+  krFutSign,
+  krFutSignPath,
+  krClOrdId,
+  krDecStep,
+  krQtyFloor,
+  krFutOrderParams,
+  krSpotOrderParams,
+  krPositionRows,
   // runtime
   createTradeNative,
 };
