@@ -78,7 +78,12 @@ function kvListFor(entries, user) {
     if (i < 0 || slot.slice(0, i) !== u) continue;
     const r = entries[slot];
     if (!r || typeof r !== 'object' || !r.b64) continue;
-    out[slot.slice(i + 1)] = { present: true, tail: String(r.tail || ''), ts: r.ts || 0 };
+    const e = { present: true, tail: String(r.tail || ''), ts: r.ts || 0 };
+    // Dual-pair marker (Kraken spot+futures blobs): lets a plan decide
+    // whether the copy carries the second pair WITHOUT a get() — old
+    // entries simply lack the field (unknown, not false).
+    if (r.has2) e.has2 = true;
+    out[slot.slice(i + 1)] = e;
   }
   return out;
 }
@@ -122,6 +127,8 @@ function createKeyVault(opts) {
         : (payload.key || payload.key2 || ''),
       ts: Math.floor(Date.now() / 1000),
     };
+    // Dual-pair marker for list(): a Kraken blob carrying BOTH pairs.
+    if (payload.key2 && payload.secret2) entries[slot].has2 = true;
     if (!saveAll(entries)) return { ok: false, error: 'persist-failed' };
     return { ok: true, tail: entries[slot].tail };
   }

@@ -3773,7 +3773,14 @@ function createTradeNative(opts) {
       ? { key: creds.key, secret: creds.secret } : null;
   }
 
-  async function krRequest(creds, method, market, path, params, route) {
+  // Spot `EAPI:Invalid nonce` gets ONE retry with a forward-bumped nonce
+  // (+1500ms lead): with key source "Server" the SAME spot key is shared by
+  // the engine's REST polls and this signer — two independent ms-clock nonce
+  // streams race and either can lose (Kraken nonces are strictly increasing
+  // PER KEY). Never more than one retry: these errors count toward Kraken's
+  // rate limit.
+  const KR_NONCE_RETRY_LEAD_MS = 1500;
+  async function krRequest(creds, method, market, path, params, route, _nretry) {
     const pair = krPairFor(creds, market);
     if (!pair) {
       return { ok: false, message: market === 'futures'
@@ -3828,7 +3835,15 @@ function createTradeNative(opts) {
       return { ok: false, message: err };
     }
     const errs = (data || {}).error;
-    if (Array.isArray(errs) && errs.length) return { ok: false, message: String(errs[0]) };
+    if (Array.isArray(errs) && errs.length) {
+      const msg = String(errs[0]);
+      if (msg.indexOf('EAPI:Invalid nonce') >= 0 && !_nretry) {
+        const bump = Date.now() + KR_NONCE_RETRY_LEAD_MS;
+        if (bump > krNonceLast) krNonceLast = bump;
+        return krRequest(creds, method, market, path, params, route, true);
+      }
+      return { ok: false, message: msg };
+    }
     if (r.status >= 400) return { ok: false, message: 'Kraken returned HTTP ' + r.status };
     return { ok: true, data: data };
   }
