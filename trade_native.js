@@ -156,6 +156,18 @@ const TIMESYNC_TTL_MS = 10 * 60 * 1000;
 // (validation, signer pick, creds slots) so adding a venue is additive.
 const TRADE_VENUES = ['phemex', 'binance', 'bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bitmex',
                       'mexc', 'hyperliquid', 'asterdex', 'arcus', 'lighter', 'kraken'];
+// Multi-account creds SLOT grammar (pure): 'venue' (default account) or
+// 'venue#aN' (extra account, same grammar as the device key vault / panel
+// termVK). Returns {slot, base} — base keys HOSTS/agents/warmth (per venue),
+// slot keys CREDS (per account). null = not a valid slot ('bad-venue').
+// Strict fail-closed: a composite slot NEVER falls back to the base venue's
+// creds — a wrong-account order is worse than a refusal.
+function tnSlotNorm(v) {
+  const s = String(v == null ? '' : v);
+  const m = /^([a-z]+)(#a\d{1,4})?$/.exec(s);
+  if (!m || TRADE_VENUES.indexOf(m[1]) < 0) return null;
+  return { slot: s, base: m[1] };
+}
 // DEX venues carry symbols the CEX charset forbids: HL spot 'UBTC/USDC',
 // HIP-3 builder perps 'xyz:PLTR', spot wire '@N'.
 const DEX_VENUES = ['hyperliquid', 'asterdex', 'arcus'];
@@ -454,6 +466,12 @@ function posDecOk(v) { return decOk(v) && Number(v) > 0; }
 function validateIntent(it) {
   if (!it || typeof it !== 'object') return 'bad intent';
   if (TRADE_VENUES.indexOf(it.venue) < 0) return 'venue not supported natively';
+  // Optional per-account creds slot (aid>0 boards send credSlot='venue#aN');
+  // it must parse AND belong to the intent's venue — never another venue's key.
+  if (it.credSlot != null) {
+    const sn = tnSlotNorm(it.credSlot);
+    if (!sn || sn.base !== it.venue) return 'bad credSlot';
+  }
   if (['order', 'cancel', 'cancel_all', 'close', 'sltp'].indexOf(it.op) < 0) return 'unknown op';
   const market = it.market;
   if (it.op !== 'close' && it.op !== 'sltp' && market !== 'spot' && market !== 'futures') {
@@ -2087,6 +2105,16 @@ function createTradeNative(opts) {
     for (const v of TRADE_VENUES) {
       const r = venues[v];
       out[v] = r && r.b64 ? { present: true, tail: r.tail || '', ts: r.ts || 0 } : { present: false };
+    }
+    // Multi-account slots ('venue#aN'): report every stored composite slot so
+    // the panel's per-account armed/blocked chips are truthful. Additive —
+    // base-venue keys above stay byte-identical for aid-0 users.
+    for (const k of Object.keys(venues)) {
+      if (out[k] !== undefined) continue;
+      const sn = tnSlotNorm(k);
+      if (!sn || sn.slot === sn.base) continue;
+      const r = venues[k];
+      if (r && r.b64) out[k] = { present: true, tail: r.tail || '', ts: r.ts || 0 };
     }
     return { ok: true, venues: out, encryptionAvailable: !!(safeStorage && safeStorage.isEncryptionAvailable()) };
   }
@@ -5022,7 +5050,9 @@ function createTradeNative(opts) {
     }
     const verr = validateIntent(intent);
     if (verr) return { ok: false, message: verr };
-    const creds = credsGet(intent.venue);
+    // Per-account slot: aid>0 intents carry credSlot='venue#aN' and sign with
+    // THAT slot's creds ONLY (no base-account fallback — fail closed).
+    const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
     try {
@@ -5147,16 +5177,21 @@ function createTradeNative(opts) {
   // --- IPC surface -----------------------------------------------------------
   ipcMain.handle('att:trade-creds-set', (event, venue, creds) => {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
-    if (TRADE_VENUES.indexOf(venue) < 0) return { ok: false, error: 'bad-venue' };
+    // Accepts 'venue' OR the multi-account 'venue#aN' slot (panel termVK);
+    // creds store under the SLOT, warmth/hosts key the BASE venue (agents are
+    // per venue — never duplicated per account slot).
+    const sn = tnSlotNorm(venue);
+    if (!sn) return { ok: false, error: 'bad-venue' };
     if (!creds || typeof creds !== 'object') return { ok: false, error: 'bad-creds' };
-    const r = credsSet(venue, creds);
-    if (r && r.ok) warmVenue(venue);   // arm → pre-open one warm connection
+    const r = credsSet(sn.slot, creds);
+    if (r && r.ok) warmVenue(sn.base);   // arm → pre-open one warm connection
     return r;
   });
   ipcMain.handle('att:trade-creds-wipe', (event, venue) => {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
-    if (TRADE_VENUES.indexOf(venue) < 0) return { ok: false, error: 'bad-venue' };
-    return credsWipe(venue);
+    const sn = tnSlotNorm(venue);
+    if (!sn) return { ok: false, error: 'bad-venue' };
+    return credsWipe(sn.slot);
   });
   ipcMain.handle('att:trade-creds-status', (event) => {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
@@ -5189,6 +5224,7 @@ module.exports = {
   // pure (parity/validation tested under plain node)
   PHEMEX_BASE,
   TRADE_VENUES,
+  tnSlotNorm,
   decParts,
   futReal,
   spotToScaled,
