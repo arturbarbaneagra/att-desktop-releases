@@ -25,7 +25,7 @@ const RELEASES_URL = 'https://github.com/arturbarbaneagra/att-desktop-releases/r
 // panel.html.
 const FEATURE_IDS = [
   'main', 'terminal', 'mywallets', 'wallets', 'splashes', 'arbs', 'oracle', 'marklast',
-  'indexlast', 'stockarb', 'biglimits', 'screener', 'listings',
+  'indexlast', 'stockarb', 'biglimits', 'screener', 'listings', 'hld',
 ];
 // Scratch Terminal windows: throwaway DOM/chart workspaces, each in its OWN window.
 // The user can open ANY NUMBER of them, so their ids are dynamic ('terminal_scratch'
@@ -236,6 +236,16 @@ function makeWindowOpenHandler(win) {
       if (id) {
         const existing = featureWindows.get(id);
         if (existing && !existing.isDestroyed()) {
+          // Deep-linked reopen (e.g. sniff-row 📊 → ?feature=hld&hv=…&haddr=…&hcoin=…):
+          // re-navigate the EXISTING window to the new URL so clicking 📊 on a
+          // second wallet actually loads it (single window per feature — bounds
+          // slot stays unique). A plain ?feature=<id> open (nav ⧉) keeps the old
+          // focus-only behavior — no pointless reload of a live window.
+          try {
+            let extra = false;
+            new URL(url).searchParams.forEach((v, k) => { if (k !== 'feature') extra = true; });
+            if (extra) existing.loadURL(url).catch(() => showFallback(existing, url));
+          } catch (e) {}
           if (existing.isMinimized()) existing.restore();
           existing.show();
           existing.focus();
@@ -244,7 +254,9 @@ function makeWindowOpenHandler(win) {
         // Create the feature window on the INDEPENDENT path (no opener/owner
         // relationship) so clicking one window never raises the whole app group
         // above other apps. Deny the window.open so Electron makes no owned child.
-        createFeatureWindow(id);
+        // Pass the FULL url so deep-link params (hv/haddr/hcoin) survive the hop —
+        // reopen-on-launch still uses the bare ?feature=<id> URL (no stale wallet).
+        createFeatureWindow(id, url);
         return { action: 'deny' };
       }
       if (win && !win.isDestroyed()) win.loadURL(url);
@@ -372,7 +384,9 @@ function registerFeatureWindow(win, id) {
 }
 
 // Create a feature window directly (used to reopen saved windows on launch).
-function createFeatureWindow(id) {
+// Optional `url` carries a deep-linked open (e.g. ?feature=hld&hv=…&haddr=…);
+// launch-reopen never passes one, so restarts load the bare feature page.
+function createFeatureWindow(id, url) {
   const existing = featureWindows.get(id);
   if (existing && !existing.isDestroyed()) {
     if (existing.isMinimized()) existing.restore();
@@ -382,7 +396,8 @@ function createFeatureWindow(id) {
   }
   const win = new BrowserWindow(featureWindowOptions(featureWindowState(id).bounds));
   registerFeatureWindow(win, id);
-  win.loadURL(APP_URL + '/?feature=' + id).catch(() => showFallback(win, APP_URL + '/?feature=' + id));
+  const target = (url && isAppOrigin(url)) ? url : (APP_URL + '/?feature=' + id);
+  win.loadURL(target).catch(() => showFallback(win, target));
 }
 
 // On launch, reopen every feature window that was open when the app last quit.

@@ -30,7 +30,10 @@ function kvUserNorm(user) {
 }
 function kvVenueNorm(venue) {
   const v = String(venue == null ? '' : venue).trim().toLowerCase();
-  return (/^[a-z0-9_-]{1,32}$/.test(v)) ? v : '';
+  // Optional per-account suffix "#aN" (extra exchange accounts store under
+  // additive "venue#aN" slots — e.g. "bybit#a2"). '#' stays refused anywhere
+  // else so a hostile string still can't smuggle a separator.
+  return (/^[a-z0-9_-]{1,32}(?:#a[0-9]{1,4})?$/.test(v)) ? v : '';
 }
 function kvSlot(user, venue) {
   const u = kvUserNorm(user), v = kvVenueNorm(venue);
