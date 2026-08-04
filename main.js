@@ -47,7 +47,7 @@ function isScratchFeatureId(f) {
 // registerFeatureWindow persists their bounds + open flag like any feature window.
 // Lockstep with the terminal_trades / terminal_watchlist entries in POPOUT_FEATURES
 // (panel.html).
-const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist'];
+const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist', 'terminal_alerts'];
 
 let mainWindow = null;
 let tray = null;
@@ -144,6 +144,22 @@ function featureIdFromUrl(url) {
     // them. Feature windows + scratch windows are reopened on launch when they were
     // open at last quit; section pop-outs likewise (see reopenFeatureWindows).
     return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f) || isScratchFeatureId(f)) ? f : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Raw ?feature=<id> value from a URL when the id is NOT in the known sets above.
+// Used ONLY by the user-initiated window.open path (makeWindowOpenHandler) so a
+// panel feature added AFTER this shell version shipped still opens as a real
+// standalone window instead of replacing the window the user clicked from.
+// Reopen-on-launch (reopenFeatureWindows) deliberately does NOT use this — it
+// filters on the known id sets, so an unknown id is never spawned unprompted at
+// boot. The id shape is sanity-checked because it becomes a settings key.
+function rawFeatureIdFromUrl(url) {
+  try {
+    const f = new URL(url).searchParams.get('feature');
+    return (typeof f === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(f)) ? f : null;
   } catch (e) {
     return null;
   }
@@ -257,6 +273,18 @@ function makeWindowOpenHandler(win) {
         // Pass the FULL url so deep-link params (hv/haddr/hcoin) survive the hop —
         // reopen-on-launch still uses the bare ?feature=<id> URL (no stale wallet).
         createFeatureWindow(id, url);
+        return { action: 'deny' };
+      }
+      // FUTURE-PROOFING: an app-origin window.open carrying a ?feature=<id> this
+      // shell does NOT recognize (a section/feature the panel added after this
+      // version shipped) must STILL open a real standalone window — falling
+      // through to same-window navigation would replace the window the user
+      // clicked from (the v1.5.15 bug: ?feature=terminal_alerts replaced the
+      // Terminal window). Same independent createFeatureWindow path, raw id;
+      // reopen-on-launch stays strict, so unknown ids never respawn at boot.
+      const rawId = rawFeatureIdFromUrl(url);
+      if (rawId) {
+        createFeatureWindow(rawId, url);
         return { action: 'deny' };
       }
       if (win && !win.isDestroyed()) win.loadURL(url);
