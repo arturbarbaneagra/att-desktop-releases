@@ -25,7 +25,8 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { nativeProxyUrl } = require('./proxy_url');
-const { routeNorm } = require('./route_hosts');
+
+const { routeNorm, VENUE_ROUTE_HOSTS } = require('./route_hosts');
 const dexSign = require('./dex_sign.js');
 
 let SocksProxyAgent = null, HttpsProxyAgent = null;
@@ -206,6 +207,20 @@ function phemexErrorMessage(code, rawMsg) {
   const m = PHEMEX_ERRORS[Number(code)];
   if (m) return m;
   return 'Phemex error ' + code + (rawMsg ? ': ' + rawMsg : '');
+}
+
+// #1722: symbol-required error family — some Phemex deployments answer the
+// currency-wide /g-orders/activeList (and /spot/orders) queries with code
+// 10500 ("Missing required parameter,Required query parameter 'symbol' is
+// not present.") instead of the known 30000. Both codes, plus any message
+// naming the missing-symbol condition, trigger the per-symbol fallback;
+// everything else (auth/permission/transport) stays fail-closed. Pure —
+// engine twin: phemex_symbol_required.
+function phemexSymbolRequired(r) {
+  if (!r || r.ok) return false;
+  const c = Number(r.code);
+  if (c === 30000 || c === 10500) return true;
+  return /symbol.*not present|missing required parameter/i.test(String(r.message || ''));
 }
 
 // ---------------------------------------------------------------------------
@@ -5130,8 +5145,9 @@ function createTradeNative(opts) {
     let futRows;
     if (fo.ok) {
       futRows = (fo.data && fo.data.rows) || (Array.isArray(fo.data) ? fo.data : []);
-    } else if (fo.code === 30000) {
-      // Some deployments require a symbol — per-position symbols (engine twin).
+    } else if (phemexSymbolRequired(fo)) {
+      // Some deployments require a symbol (code 30000 OR 10500 — #1722) —
+      // per-position symbols (engine twin).
       futRows = [];
       const poss = ((acct.data || {}).positions || []).slice(0, 10);
       for (const p of poss) {
@@ -5142,24 +5158,64 @@ function createTradeNative(opts) {
         if (rs.ok) futRows = futRows.concat((rs.data && rs.data.rows) || (Array.isArray(rs.data) ? rs.data : []));
       }
     } else return fo;
-    const so = await signedRequest(creds, {
-      method: 'GET', path: '/spot/orders', query: '', body: null }, route);
-    if (!so.ok) return so;
+    // Wallets BEFORE spot orders (#1722): the spot symbol-required fallback
+    // derives its symbols from nonzero wallets × the products catalog.
     const wl = await signedRequest(creds, {
       method: 'GET', path: '/spot/wallets', query: '', body: null }, route);
     if (!wl.ok) return wl;
+    const wallets = Array.isArray(wl.data) ? wl.data : [];
+    const so = await signedRequest(creds, {
+      method: 'GET', path: '/spot/orders', query: '', body: null }, route);
+    let spotRows;
+    const partialErrors = [];
+    if (so.ok) {
+      spotRows = (so.data && so.data.rows) || (Array.isArray(so.data) ? so.data : []);
+    } else if (phemexSymbolRequired(so)) {
+      // #1722: symbol-required family only — retry per-symbol (spot symbols
+      // from nonzero wallets × products catalog, cap 10 like futures); no
+      // derivable symbols → degrade like the server twin (empty spotOrders +
+      // a surfaced partial-error note) instead of failing the whole read.
+      // Auth/permission errors stay fail-closed via the else-return below.
+      spotRows = [];
+      let syms = [];
+      try {
+        const pr = await phemexProducts(route);
+        const curs = {};
+        for (const w of wallets) {
+          const nz = (Number(w && w.balanceEv) || 0)
+                   + (Number(w && w.lockedTradingBalanceEv) || 0)
+                   + (Number(w && w.lockedWithdrawEv) || 0);
+          if (nz) curs[String(w.currency || '')] = 1;
+        }
+        for (const p of ((pr.raw && pr.raw.products) || [])) {
+          if (p && String(p.type) === 'Spot' && p.symbol
+              && curs[String(p.baseCurrency || '')]) syms.push(p.symbol);
+        }
+      } catch (e) { /* no catalog → no derivable symbols → degrade below */ }
+      let got = false;
+      for (const sym of syms.slice(0, 10)) {
+        const rs = await signedRequest(creds, {
+          method: 'GET', path: '/spot/orders',
+          query: 'symbol=' + encodeURIComponent(sym), body: null }, route);
+        if (rs.ok) { got = true; spotRows = spotRows.concat((rs.data && rs.data.rows) || (Array.isArray(rs.data) ? rs.data : [])); }
+      }
+      if (!got) partialErrors.push({ scope: 'spot', message: so.message || 'spot orders unavailable' });
+    } else return so;
     let curScales = {}, spotBaseScales = {};
     try {
       const pr = await phemexProducts(route);
       curScales = pr.curScales || {};
       for (const s in (pr.spot || {})) spotBaseScales[s] = pr.spot[s].value_scale;
     } catch (e) { /* scales default to 8 renderer-side — majors byte-identical */ }
-    return { ok: true,
+    const out = { ok: true,
              acct: acct.data || {},
              futOrders: futRows,
-             spotOrders: (so.data && so.data.rows) || (Array.isArray(so.data) ? so.data : []),
-             wallets: Array.isArray(wl.data) ? wl.data : [],
+             spotOrders: spotRows,
+             wallets: wallets,
              curScales: curScales, spotBaseScales: spotBaseScales };
+    // additive — absent on clean reads so legacy payloads stay byte-identical
+    if (partialErrors.length) out.partialErrors = partialErrors;
+    return out;
   }
 
   // OKX native account read (#1716): signed GETs mirroring OkxAdapter's REST
@@ -5599,6 +5655,50 @@ function createTradeNative(opts) {
   // routinely exceed httpJson's 256KB default — a truncated body would fail
   // the panel parser (see .agents/memory/shell-httpjson-response-cap.md).
   const CAT_GET_MAXBYTES = 8 * 1024 * 1024;
+  // Generic PUBLIC catalog/kline bridge (#1715): CORS-open venues' catalog +
+  // chart-history fetches move out of the renderer into this main-process
+  // intent so EACH request carries its own Proxy/Direct agent (agentFor's
+  // shared keep-alive cache — never per-request agents; flushed on proxy
+  // change). STRICT allowlist: https only, no embedded creds, the host must
+  // belong to the venue's static VENUE_ROUTE_HOSTS entries (the renderer can
+  // never widen egress), GET only — plus Hyperliquid's POST /info (its
+  // public catalog API is POST-shaped, body capped). No keys involved.
+  function catHttpHostsFor(venue) {
+    const out = [];
+    for (const k of Object.keys(VENUE_ROUTE_HOSTS)) {
+      if (k.slice(0, k.indexOf('|')) !== venue) continue;
+      for (const h of VENUE_ROUTE_HOSTS[k]) if (out.indexOf(h) < 0) out.push(h);
+    }
+    return out;
+  }
+  async function execCatHttp(intent) {
+    const venue = String(intent.venue || '');
+    const hosts = catHttpHostsFor(venue);
+    if (!hosts.length) return { ok: false, message: 'native catalog fetch not supported for this venue' };
+    let u;
+    try { u = new URL(String(intent.url || '')); } catch (e) { return { ok: false, message: 'bad url' }; }
+    if (u.protocol !== 'https:' || u.username || u.password) return { ok: false, message: 'bad url' };
+    if (hosts.indexOf(u.hostname) < 0) return { ok: false, message: 'host not allowed for this venue' };
+    let method = 'GET', body = null;
+    if (intent.method === 'POST') {
+      if (venue !== 'hyperliquid' || u.pathname !== '/info') return { ok: false, message: 'POST not allowed' };
+      body = (typeof intent.body === 'string') ? intent.body : '';
+      if (body.length > 4096) return { ok: false, message: 'body too large' };
+      method = 'POST';
+    }
+    const route = routeNorm(intent.route);
+    try {
+      // Catalogs can be huge (full product lists) — same 8 MB cap as the
+      // Phemex products fetch; httpJson's default 256 KB would truncate.
+      const r = await httpJson(u.hostname, method, u.pathname, u.search.replace(/^\?/, ''),
+                               body, {}, route, 8 * 1024 * 1024);
+      return { ok: true, status: r.status | 0, body: r.text || '' };
+    } catch (e) {
+      const em = (e && e.message) || 'error';
+      if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
+      return { ok: false, message: 'catalog fetch failed: ' + em };
+    }
+  }
   async function execCatFetch(intent) {
     const route = routeNorm(intent.route);
     // Generic raw-GET branch (#1716) — must precede the phemex-only gate so
@@ -5697,6 +5797,8 @@ function createTradeNative(opts) {
     // panel treats that as unsupported and stamps nothing.
     if (intent && typeof intent === 'object' && intent.op === 'acct_read') return await execAcctRead(intent);
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
+    // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
+    if (intent && typeof intent === 'object' && intent.op === 'cat_http') return await execCatHttp(intent);
     if (intent && typeof intent === 'object' && intent.op === 'cat_fetch') return await execCatFetch(intent);
     if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
       if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
@@ -5912,6 +6014,7 @@ module.exports = {
   tradeViaFromAgent,
   pingRtTarget,
   phemexErrorMessage,
+  phemexSymbolRequired,
   // shared keep-alive agent cache (used by main.js's native-WS bridge too)
   sharedKeepAliveAgent,
   flushKeepAliveAgents,

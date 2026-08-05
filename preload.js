@@ -128,7 +128,7 @@ try {
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe
     // for the pre-#1713 features.
-    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:arcus'],
+    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:arcus', 'cat:http'],
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 
@@ -156,8 +156,7 @@ try {
 // today. Re-implement it here via webFrame.setZoomFactor. The `!e.defaultPrevented`
 // guard means the shell zoom never double-fires over the panel's own Ctrl+wheel
 // handlers (Terminal DOM board + splash chart zoom already preventDefault their
-// own areas). Ctrl+0 resets to 100%.
-const ZOOM_MIN = 0.5;
+// own areas). Ctrl+0 resets to 100%.const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 2.5;
 const ZOOM_STEP = 0.1;
 
