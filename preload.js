@@ -156,7 +156,8 @@ try {
 // today. Re-implement it here via webFrame.setZoomFactor. The `!e.defaultPrevented`
 // guard means the shell zoom never double-fires over the panel's own Ctrl+wheel
 // handlers (Terminal DOM board + splash chart zoom already preventDefault their
-// own areas). Ctrl+0 resets to 100%.const ZOOM_MIN = 0.5;
+// own areas). Ctrl+0 resets to 100%.
+const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 2.5;
 const ZOOM_STEP = 0.1;
 
