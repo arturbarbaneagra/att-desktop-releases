@@ -2355,7 +2355,7 @@ function createTradeNative(opts) {
   // --- Binance ---------------------------------------------------------------
   function bnHost(market) { return market === 'futures' ? BINANCE_FUT_HOST : BINANCE_SPOT_HOST; }
 
-  async function bnRequest(creds, method, market, reqPath, params, route) {
+  async function bnRequest(creds, method, market, reqPath, params, route, maxBytes) {
     const offMs = await ensureVenueTime('binance', market, route);
     const q = formEnc((params || []).concat([
       ['recvWindow', String(BINANCE_RECV_WINDOW_MS)],
@@ -2365,7 +2365,7 @@ function createTradeNative(opts) {
     let r;
     try {
       r = await httpJson(bnHost(market), method, reqPath, query, null,
-                         { 'X-MBX-APIKEY': creds.key }, route);
+                         { 'X-MBX-APIKEY': creds.key }, route, maxBytes);
     } catch (e) { return transportFail(e, 'Binance'); }
     if (r.status === 429 || r.status === 418) {
       return { ok: false, message: 'Rate limited by Binance — retry shortly', code: null };
@@ -5037,6 +5037,7 @@ function createTradeNative(opts) {
   // /terminal/state venue-section shape.
   async function execAcctRead(intent) {
     if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
+    if (intent.venue === 'binance') return await execBinanceAcctRead(intent);
     if (intent.venue !== 'bybit') return { ok: false, message: 'native account reads not supported for this venue' };
     const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -5055,6 +5056,47 @@ function createTradeNative(opts) {
     if (!so.ok) return so;
     const lst = (r) => (((r.data || {}).result) || {}).list || [];
     return { ok: true, balance: lst(bal), positions: lst(pos), futOrders: lst(fo), spotOrders: lst(so) };
+  }
+
+  // Binance native account read (#1714): signed HMAC GETs mirroring the
+  // engine's BinanceAdapter REST builders — spot account (balances) + spot
+  // open orders, futures positionRisk / openOrders (+ Algo conditionals) /
+  // balance. Spot vs futures hosts differ (api. vs fapi.); every request
+  // rides bnRequest (recvWindow + ensureVenueTime clock offset — raw
+  // Date.now() regresses -1021) and the shared proxy agent cache. Raw venue
+  // rows go back to the renderer (its pure twins shape them into the
+  // ?binance=1 /state venue-section shape). NO geo special-casing (user
+  // decision): a 451-blocked machine/proxy surfaces the normal fail-visible
+  // error, never a silent server fallback.
+  async function execBinanceAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'binance');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const sa = await bnRequest(creds, 'GET', 'spot', '/api/v3/account',
+                               [['omitZeroBalances', 'true']], route);
+    if (!sa.ok) return sa;
+    const so = await bnRequest(creds, 'GET', 'spot', '/api/v3/openOrders', [], route);
+    if (!so.ok) return so;
+    const fb = await bnRequest(creds, 'GET', 'futures', '/fapi/v2/balance', [], route);
+    if (!fb.ok) return fb;
+    // Symbol-less positionRisk returns EVERY listed contract (200KB+) —
+    // raise the httpJson byte cap so JSON.parse never sees a truncated body
+    // (shell-httpjson convention; the engine twin parses the same payload).
+    const pos = await bnRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk',
+                                [], route, 4 * 1024 * 1024);
+    if (!pos.ok) return pos;
+    const fo = await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openOrders', [], route);
+    if (!fo.ok) return fo;
+    const ao = await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openAlgoOrders', [], route);
+    if (!ao.ok) return ao;
+    const arr = (r) => (Array.isArray(r.data) ? r.data : []);
+    return { ok: true,
+             spotAcct: sa.data || {},
+             spotOrders: arr(so),
+             futBalance: arr(fb),
+             positions: arr(pos),
+             futOrders: arr(fo),
+             algoOrders: arr(ao) };
   }
 
   // Phemex native account read (#1713): signed GETs mirroring the engine's

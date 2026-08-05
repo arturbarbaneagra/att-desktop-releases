@@ -128,7 +128,7 @@ try {
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe
     // for the pre-#1713 features.
-    caps: ['acct:bybit', 'acct:phemex', 'cat:phemex'],
+    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'cat:phemex'],
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 
