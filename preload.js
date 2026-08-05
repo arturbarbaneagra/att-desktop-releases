@@ -124,6 +124,11 @@ try {
     wipeCreds: (venue) => ipcRenderer.invoke('att:trade-creds-wipe', String(venue || '')),
     status: () => ipcRenderer.invoke('att:trade-creds-status'),
     exec: (intent) => ipcRenderer.invoke('att:trade-exec', intent),
+    // Capability list (#1713): the panel probes this to decide which NEW
+    // shell-backed axes to offer (absent on old shells → axes stay hidden →
+    // server path, graceful degradation). Presence-of-method stays the probe
+    // for the pre-#1713 features.
+    caps: ['acct:bybit', 'acct:phemex', 'cat:phemex'],
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 

@@ -2246,8 +2246,8 @@ function createTradeNative(opts) {
   // catalog" message instead of "Unknown spot symbol X".
   // The full Phemex catalog measured ~2.5 MB (2026-07); pass an 8 MB cap so
   // the default 256 KB httpJson cap doesn't silently truncate it.
-  const products = { spot: null, ts: 0 };
-  async function spotSpec(symbol, route) {
+  const products = { spot: null, curScales: null, raw: null, ts: 0 };
+  async function phemexProducts(route) {
     if (!products.spot || Date.now() - products.ts > PRODUCTS_TTL_MS) {
       const r = await httpJson(PHEMEX_HOST, 'GET', '/public/products', '', null, {}, route,
                                8 * 1024 * 1024);
@@ -2262,12 +2262,22 @@ function createTradeNative(opts) {
       for (const p of data.products || []) {
         if (!p || String(p.type) !== 'Spot' || !p.symbol) continue;
         const vs = curScales[String(p.baseCurrency || '')];
-        spot[p.symbol] = { value_scale: Number.isInteger(vs) ? vs : 8 };
+        // pscale (#1713): per-symbol e-scale of spot kline prices — needed by
+        // the panel's phKlineBars twin (futures rows are real numbers, 0/0).
+        const ps = Number(p.priceScale);
+        spot[p.symbol] = { value_scale: Number.isInteger(vs) ? vs : 8,
+                           pscale: Number.isInteger(ps) && ps >= 0 ? ps : 0 };
       }
       products.spot = spot;
+      products.curScales = curScales;
+      products.raw = data;
       products.ts = Date.now();
     }
-    return products.spot[symbol] || null;
+    return products;
+  }
+  async function spotSpec(symbol, route) {
+    const p = await phemexProducts(route);
+    return p.spot[symbol] || null;
   }
 
   // --- signed request runner ------------------------------------------------
@@ -5026,6 +5036,7 @@ function createTradeNative(opts) {
   // venue rows go back to the renderer, whose pure builders map them into the
   // /terminal/state venue-section shape.
   async function execAcctRead(intent) {
+    if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
     if (intent.venue !== 'bybit') return { ok: false, message: 'native account reads not supported for this venue' };
     const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -5046,6 +5057,123 @@ function createTradeNative(opts) {
     return { ok: true, balance: lst(bal), positions: lst(pos), futOrders: lst(fo), spotOrders: lst(so) };
   }
 
+  // Phemex native account read (#1713): signed GETs mirroring the engine's
+  // REST builders — futures account+positions (accountPositions), open orders
+  // BOTH markets (g-orders/activeList incl. its code-30000 per-symbol
+  // fallback; /spot/orders), spot wallets. Raw venue rows go back to the
+  // renderer (its pure twins shape them); the per-currency / per-spot-symbol
+  // valueScale maps ride along from the products cache so the renderer can
+  // descale the 1e8/e-scaled spot payloads without another fetch.
+  async function execPhemexAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'phemex');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const acct = await signedRequest(creds, {
+      method: 'GET', path: '/g-accounts/accountPositions',
+      query: 'currency=USDT', body: null }, route);
+    if (!acct.ok) return acct;
+    let fo = await signedRequest(creds, {
+      method: 'GET', path: '/g-orders/activeList',
+      query: 'currency=USDT', body: null }, route);
+    let futRows;
+    if (fo.ok) {
+      futRows = (fo.data && fo.data.rows) || (Array.isArray(fo.data) ? fo.data : []);
+    } else if (fo.code === 30000) {
+      // Some deployments require a symbol — per-position symbols (engine twin).
+      futRows = [];
+      const poss = ((acct.data || {}).positions || []).slice(0, 10);
+      for (const p of poss) {
+        if (!p || !p.symbol) continue;
+        const rs = await signedRequest(creds, {
+          method: 'GET', path: '/g-orders/activeList',
+          query: 'symbol=' + encodeURIComponent(p.symbol), body: null }, route);
+        if (rs.ok) futRows = futRows.concat((rs.data && rs.data.rows) || (Array.isArray(rs.data) ? rs.data : []));
+      }
+    } else return fo;
+    const so = await signedRequest(creds, {
+      method: 'GET', path: '/spot/orders', query: '', body: null }, route);
+    if (!so.ok) return so;
+    const wl = await signedRequest(creds, {
+      method: 'GET', path: '/spot/wallets', query: '', body: null }, route);
+    if (!wl.ok) return wl;
+    let curScales = {}, spotBaseScales = {};
+    try {
+      const pr = await phemexProducts(route);
+      curScales = pr.curScales || {};
+      for (const s in (pr.spot || {})) spotBaseScales[s] = pr.spot[s].value_scale;
+    } catch (e) { /* scales default to 8 renderer-side — majors byte-identical */ }
+    return { ok: true,
+             acct: acct.data || {},
+             futOrders: futRows,
+             spotOrders: (so.data && so.data.rows) || (Array.isArray(so.data) ? so.data : []),
+             wallets: Array.isArray(wl.data) ? wl.data : [],
+             curScales: curScales, spotBaseScales: spotBaseScales };
+  }
+
+  // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
+  // panel's "Catalogs & candles: Native" axis (Phemex REST has no CORS, so
+  // the fetch must run here in the main process; honors the user proxy via
+  // the shared keep-alive agent cache inside httpJson). STRICT allowlist —
+  // /public/products and the two public kline endpoints only, never an open
+  // proxy. No creds involved.
+  const PHEMEX_KLINE_TFS = [60, 300, 900, 1800, 3600];
+  async function execCatFetch(intent) {
+    if (intent.venue !== 'phemex') return { ok: false, message: 'native catalog fetch not supported for this venue' };
+    const route = routeNorm(intent.route);
+    if (intent.what === 'products') {
+      try {
+        const pr = await phemexProducts(route);
+        return { ok: true, data: pr.raw || {} };
+      } catch (e) {
+        return { ok: false, message: 'catalog fetch failed: ' + ((e && e.message) || 'error') };
+      }
+    }
+    if (intent.what === 'kline') {
+      const market = intent.market === 'spot' ? 'spot' : 'futures';
+      const symbol = String(intent.symbol || '');
+      const tf = Number(intent.tf) | 0;
+      if (!symbol || symbol.length > 32 || !/^[A-Za-z0-9]+$/.test(symbol))
+        return { ok: false, message: 'bad symbol' };
+      if (PHEMEX_KLINE_TFS.indexOf(tf) < 0) return { ok: false, message: 'bad tf' };
+      const now = Math.floor(Date.now() / 1000);
+      let to = Number(intent.to) | 0;
+      if (!(to > 0) || to > now + 60) to = now;
+      let n = Number(intent.n) | 0;
+      if (!(n >= 10)) n = 500;
+      if (n > 1000) n = 1000;
+      const frm = Math.max(0, to - n * tf);
+      const path = market === 'futures' ? '/exchange/public/md/v2/kline/list'
+                                        : '/exchange/public/md/kline';
+      let pscale = 0, vscale = 0;
+      if (market === 'spot') {
+        try {
+          const pr = await phemexProducts(route);
+          const sp = pr.spot[symbol];
+          if (!sp) return { ok: false, message: 'unknown symbol' };
+          pscale = sp.pscale | 0;
+          vscale = sp.value_scale | 0;
+        } catch (e) {
+          return { ok: false, message: 'catalog fetch failed: ' + ((e && e.message) || 'error') };
+        }
+      }
+      let r;
+      try {
+        r = await httpJson(PHEMEX_HOST, 'GET', path,
+                           'symbol=' + encodeURIComponent(symbol) + '&resolution=' + tf +
+                           '&from=' + frm + '&to=' + to,
+                           null, {}, route, 4 * 1024 * 1024);
+      } catch (e) {
+        return { ok: false, message: 'kline fetch failed: ' + ((e && e.message) || 'error') };
+      }
+      if (!r || r.status !== 200) return { ok: false, message: 'kline fetch failed (HTTP ' + ((r && r.status) || 0) + ')' };
+      let data;
+      try { data = JSON.parse(r.text); } catch (e) { return { ok: false, message: 'kline parse failed' }; }
+      if (!data || data.code !== 0) return { ok: false, message: 'kline upstream code ' + ((data && data.code) != null ? data.code : '?') };
+      return { ok: true, data: data, pscale: pscale, vscale: vscale };
+    }
+    return { ok: false, message: 'unknown cat_fetch kind' };
+  }
+
   async function execIntent(intent) {
     // Read-only latency probe (op:'ping_rt') — handled BEFORE validation and
     // creds: no keys, no signing, no order. One cheap public GET/POST against
@@ -5055,6 +5183,8 @@ function createTradeNative(opts) {
     // without this branch fall through to validateIntent's 'unknown op' — the
     // panel treats that as unsupported and stamps nothing.
     if (intent && typeof intent === 'object' && intent.op === 'acct_read') return await execAcctRead(intent);
+    // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
+    if (intent && typeof intent === 'object' && intent.op === 'cat_fetch') return await execCatFetch(intent);
     if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
       if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
       const tgt = pingRtTarget(intent.venue, intent.market === 'spot' ? 'spot' : 'futures');
