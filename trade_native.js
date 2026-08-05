@@ -4346,6 +4346,8 @@ function createTradeNative(opts) {
   // (method, Binance path) → Aster path; unlisted paths pass through.
   const ASTER_PATHS = {
     'GET /fapi/v2/positionRisk': '/fapi/v3/positionRisk',
+    'GET /fapi/v2/balance': '/fapi/v3/balance',
+    'GET /fapi/v1/openOrders': '/fapi/v3/openOrders',
     'POST /fapi/v1/order': '/fapi/v3/order',
     'DELETE /fapi/v1/order': '/fapi/v3/order',
     'DELETE /fapi/v1/allOpenOrders': '/fapi/v3/allOpenOrders',
@@ -5036,8 +5038,16 @@ function createTradeNative(opts) {
   // venue rows go back to the renderer, whose pure builders map them into the
   // /terminal/state venue-section shape.
   async function execAcctRead(intent) {
-    if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
     if (intent.venue === 'binance') return await execBinanceAcctRead(intent);
+    if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
+    if (intent.venue === 'okx') return await execOkxAcctRead(intent);
+    if (intent.venue === 'gate') return await execGateAcctRead(intent);
+    if (intent.venue === 'bitget') return await execBitgetAcctRead(intent);
+    if (intent.venue === 'mexc') return await execMexcAcctRead(intent);
+    if (intent.venue === 'kucoin') return await execKucoinAcctRead(intent);
+    if (intent.venue === 'bitmex') return await execBitmexAcctRead(intent);
+    if (intent.venue === 'asterdex') return await execAsterdexAcctRead(intent);
+    if (intent.venue === 'kraken') return await execKrakenAcctRead(intent);
     if (intent.venue !== 'bybit') return { ok: false, message: 'native account reads not supported for this venue' };
     const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -5152,6 +5162,402 @@ function createTradeNative(opts) {
              curScales: curScales, spotBaseScales: spotBaseScales };
   }
 
+  // OKX native account read (#1716): signed GETs mirroring OkxAdapter's REST
+  // state seed — one /account/balance (spot wallets + the unified USDT that
+  // backs the futures account), /account/positions?instType=SWAP, pending
+  // plain orders BOTH markets (/trade/orders-pending), pending algo orders
+  // (/trade/orders-algo-pending, trigger + conditional). Raw venue rows go
+  // back verbatim — sz/pos are CONTRACTS, converted renderer-side via the
+  // panel's OKX catalog ctVal (phemex-scales precedent; no shell-side ctVal
+  // fetch so the payload can't drift from the boards' own contract sizes).
+  // Fail-closed: any failed leg returns that leg's {ok:false,...}.
+  async function execOkxAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'okx');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    if (!creds.pass) return { ok: false, message: 'OKX API passphrase missing — re-provision Native trading on this device' };
+    const route = routeNorm(intent.route);
+    const bal = await okxRequest(creds, 'GET', '/api/v5/account/balance', null, null, route);
+    if (!bal.ok) return bal;
+    const pos = await okxRequest(creds, 'GET', '/api/v5/account/positions',
+                                 [['instType', 'SWAP']], null, route);
+    if (!pos.ok) return pos;
+    // Cursor-walk the pending-order pages exactly like OkxAdapter._orders_pending.
+    const walk = async (instType) => {
+      const rows = [];
+      let after = '';
+      for (let page = 0; page < 10; page++) {
+        const params = [['instType', instType], ['limit', '100']];
+        if (after) params.push(['after', after]);
+        const r = await okxRequest(creds, 'GET', '/api/v5/trade/orders-pending', params, null, route);
+        if (!r.ok) return r;
+        const lst = ((r.data || {}).data) || [];
+        for (const o of lst) rows.push(o);
+        if (lst.length < 100) break;
+        after = String((lst[lst.length - 1] || {}).ordId || '');
+        if (!after) break;
+      }
+      return { ok: true, rows: rows };
+    };
+    const fo = await walk('SWAP');
+    if (!fo.ok) return fo;
+    const so = await walk('SPOT');
+    if (!so.ok) return so;
+    // Pending algo (stop-family) orders: both types, SWAP rows only (engine
+    // _algos_pending drops non-SWAP instType).
+    const algos = [];
+    for (const ot of ['trigger', 'conditional']) {
+      let after = '';
+      for (let page = 0; page < 10; page++) {
+        const params = [['ordType', ot], ['limit', '100']];
+        if (after) params.push(['after', after]);
+        const r = await okxRequest(creds, 'GET', '/api/v5/trade/orders-algo-pending', params, null, route);
+        if (!r.ok) return r;
+        const lst = ((r.data || {}).data) || [];
+        for (const o of lst) { if (String((o || {}).instType || 'SWAP') === 'SWAP') algos.push(o); }
+        if (lst.length < 100) break;
+        after = String((lst[lst.length - 1] || {}).algoId || '');
+        if (!after) break;
+      }
+    }
+    return { ok: true,
+             balance: ((bal.data || {}).data) || [],
+             positions: ((pos.data || {}).data) || [],
+             futOrders: fo.rows, spotOrders: so.rows, algoOrders: algos };
+  }
+
+  // Gate native account read (#1716): signed GETs mirroring GateAdapter's
+  // state seed. Futures size/left are SIGNED CONTRACTS → base via
+  // quanto_multiplier renderer-side (panel Gate catalog ct_val). Unified
+  // detection follows the gate-unified-detection rule: a POSITIVE
+  // /unified/accounts balance is proof-positive of unified mode; a failed
+  // mode read that the funds probe can't resolve surfaces as an error, never
+  // a silent "classic" assumption. Fail-closed per leg.
+  async function execGateAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'gate');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const spotAcc = await gateRequest(creds, 'GET', '/spot/accounts', null, null, route);
+    if (!spotAcc.ok) return spotAcc;
+    const pos = await gateRequest(creds, 'GET', '/futures/usdt/positions', null, null, route);
+    if (!pos.ok && String(pos.message || '').indexOf('futures account') < 0) return pos;
+    // Classic futures wallet: a spot-only account 404s USER_NOT_FOUND — that
+    // is a normal state (no futures account), not a fatal leg.
+    const futAcc = await gateRequest(creds, 'GET', '/futures/usdt/accounts', null, null, route);
+    if (!futAcc.ok && String(futAcc.message || '').indexOf('futures account') < 0) return futAcc;
+    // Unified mode + funds. The mode read may 403 on keys lacking the
+    // unified/account permission — carry mode + error, decide renderer-side.
+    let unifiedMode = null, unifiedErr = null, unifiedAcc = null;
+    const modeR = await gateRequest(creds, 'GET', '/unified/account_mode', null, null, route);
+    if (modeR.ok && modeR.data && typeof modeR.data === 'object' && modeR.data.mode) {
+      unifiedMode = String(modeR.data.mode) !== 'classic';
+    } else {
+      unifiedErr = (modeR.ok ? 'unified account_mode read failed'
+                             : String(modeR.message || 'unified account_mode read failed'));
+    }
+    // Probe /unified/accounts whenever mode says unified, the classic wallet
+    // is absent/zero, or the mode read failed (dust must not suppress it).
+    let classicBal = 0;
+    try { classicBal = Number((futAcc.data || {}).total) || 0; } catch (e) { classicBal = 0; }
+    if (unifiedMode || !futAcc.ok || classicBal === 0 || unifiedErr) {
+      const uni = await gateRequest(creds, 'GET', '/unified/accounts', null, null, route);
+      if (uni.ok && uni.data && typeof uni.data === 'object') unifiedAcc = uni.data;
+    }
+    const spotOo = await gateRequest(creds, 'GET', '/spot/open_orders', null, null, route);
+    if (!spotOo.ok) return spotOo;
+    const futWalk = async (path) => {
+      const rows = [];
+      let offset = 0;
+      for (let page = 0; page < 10; page++) {
+        const r = await gateRequest(creds, 'GET', path,
+                                    [['status', 'open'], ['limit', '100'], ['offset', String(offset)]],
+                                    null, route);
+        if (!r.ok) return r;
+        const lst = Array.isArray(r.data) ? r.data : [];
+        for (const o of lst) rows.push(o);
+        if (lst.length < 100) break;
+        offset += 100;
+      }
+      return { ok: true, rows: rows };
+    };
+    const fo = await futWalk('/futures/usdt/orders');
+    if (!fo.ok) return fo;
+    const po = await futWalk('/futures/usdt/price_orders');
+    if (!po.ok) return po;
+    return { ok: true,
+             spotAccounts: Array.isArray(spotAcc.data) ? spotAcc.data : [],
+             positions: (pos.ok && Array.isArray(pos.data)) ? pos.data : [],
+             futAccount: futAcc.ok && futAcc.data && typeof futAcc.data === 'object' ? futAcc.data : null,
+             unified: unifiedMode, unifiedAccount: unifiedAcc, unifiedError: unifiedErr,
+             spotOrders: Array.isArray(spotOo.data) ? spotOo.data : [],
+             futOrders: fo.rows, priceOrders: po.rows };
+  }
+
+  // Bitget native account read (#1716): signed GETs mirroring BitgetAdapter's
+  // state seed. Spot + futures are SEPARATE accounts (no unified pool).
+  // Futures sizes are plain BASE coin (no multiplier). Fail-closed per leg.
+  async function execBitgetAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'bitget');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    if (!creds.pass) return { ok: false, message: 'Bitget API passphrase missing — re-provision Native trading on this device' };
+    const route = routeNorm(intent.route);
+    const pt = BITGET_PRODUCT_TYPE;
+    const spotAssets = await bitgetRequest(creds, 'GET', '/api/v2/spot/account/assets', null, null, route);
+    if (!spotAssets.ok) return spotAssets;
+    const futAcc = await bitgetRequest(creds, 'GET', '/api/v2/mix/account/accounts',
+                                       [['productType', pt]], null, route);
+    if (!futAcc.ok) return futAcc;
+    const pos = await bitgetRequest(creds, 'GET', '/api/v2/mix/position/all-position',
+                                    [['productType', pt], ['marginCoin', 'USDT']], null, route);
+    if (!pos.ok) return pos;
+    const dl = (r) => {
+      const d = (r.data || {}).data;
+      if (Array.isArray(d)) return d;
+      // mix pending/plan endpoints nest rows under data.entrustedList.
+      if (d && typeof d === 'object' && Array.isArray(d.entrustedList)) return d.entrustedList;
+      return [];
+    };
+    // idLessThan cursor-walk (engine _orders_pending / _plans_pending parity).
+    const walk = async (path, base) => {
+      const rows = [];
+      let after = '';
+      for (let page = 0; page < 10; page++) {
+        const params = base.concat([['limit', '100']]);
+        if (after) params.push(['idLessThan', after]);
+        const r = await bitgetRequest(creds, 'GET', path, params, null, route);
+        if (!r.ok) return r;
+        const lst = dl(r);
+        for (const o of lst) rows.push(o);
+        if (lst.length < 100) break;
+        after = String((lst[lst.length - 1] || {}).orderId || '');
+        if (!after) break;
+      }
+      return { ok: true, rows: rows };
+    };
+    const fo = await walk('/api/v2/mix/order/orders-pending', [['productType', pt]]);
+    if (!fo.ok) return fo;
+    const plans = [];
+    for (const planType of ['normal_plan', 'profit_loss']) {
+      const p = await walk('/api/v2/mix/order/orders-plan-pending', [['productType', pt], ['planType', planType]]);
+      if (!p.ok) return p;
+      for (const o of p.rows) plans.push(o);
+    }
+    const so = await walk('/api/v2/spot/trade/unfilled-orders', []);
+    if (!so.ok) return so;
+    return { ok: true,
+             spotAssets: dl(spotAssets), futAccounts: dl(futAcc), positions: dl(pos),
+             futOrders: fo.rows, planOrders: plans, spotOrders: so.rows };
+  }
+
+  // MEXC native account read (#1716): TWO hosts — spot api.mexc.com
+  // (Binance-style HMAC) and futures contract.mexc.com (ApiKey/Request-Time/
+  // Signature); mxRequest routes by `market`. Futures vol is CONTRACTS →
+  // base via contractSize renderer-side (panel MEXC catalog ctVal). Spot
+  // /api/v3/openOrders is SYMBOL-REQUIRED: try the bare call, else a bounded
+  // balance-derived <CCY>USDT symbol walk (engine _spot_open_orders parity;
+  // restricted symbols may 400 — best-effort, never fatal). Fail-closed on
+  // the futures legs; spot walk tolerates per-symbol failures.
+  async function execMexcAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'mexc');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const spotAcc = await mxRequest(creds, 'GET', 'spot', '/api/v3/account', null, null, route);
+    if (!spotAcc.ok) return spotAcc;
+    const futAsset = await mxRequest(creds, 'GET', 'futures',
+                                     '/api/v1/private/account/asset/USDT', null, null, route);
+    if (!futAsset.ok) return futAsset;
+    const pos = await mxRequest(creds, 'GET', 'futures',
+                                '/api/v1/private/position/open_positions', null, null, route);
+    if (!pos.ok) return pos;
+    const futWalk = async (path, extra) => {
+      const rows = [];
+      for (let page = 1; page <= 10; page++) {
+        const params = [['page_num', String(page)], ['page_size', '100']].concat(extra || []);
+        const r = await mxRequest(creds, 'GET', 'futures', path, params, null, route);
+        if (!r.ok) return r;
+        const lst = Array.isArray((r.data || {}).data) ? r.data.data : [];
+        for (const o of lst) rows.push(o);
+        if (lst.length < 100) break;
+      }
+      return { ok: true, rows: rows };
+    };
+    const fo = await futWalk('/api/v1/private/order/list/open_orders', null);
+    if (!fo.ok) return fo;
+    const plan = await futWalk('/api/v1/private/planorder/list/orders', [['states', '1']]);
+    if (!plan.ok) return plan;
+    // Spot open orders: symbol-required — bare call first, then the hint walk.
+    let spotOrders = [];
+    const bareSo = await mxRequest(creds, 'GET', 'spot', '/api/v3/openOrders', null, null, route);
+    if (bareSo.ok && Array.isArray(bareSo.data)) {
+      spotOrders = bareSo.data;
+    } else {
+      const syms = [];
+      for (const b of ((spotAcc.data || {}).balances) || []) {
+        const ccy = String((b || {}).asset || '');
+        if (ccy && ccy !== 'USDT' && ccy !== 'USDC') syms.push(ccy + 'USDT');
+        if (syms.length >= 10) break;
+      }
+      for (const sym of syms) {
+        const r = await mxRequest(creds, 'GET', 'spot', '/api/v3/openOrders',
+                                  [['symbol', sym]], null, route);
+        if (r.ok && Array.isArray(r.data)) spotOrders = spotOrders.concat(r.data);
+      }
+    }
+    return { ok: true,
+             spotBalances: ((spotAcc.data || {}).balances) || [],
+             futAsset: (futAsset.data || {}).data || null,
+             positions: ((pos.data || {}).data) || [],
+             futOrders: fo.rows, planOrders: plan.rows, spotOrders: spotOrders };
+  }
+
+  // KuCoin native account read (#1716): spot /api/v1/accounts (type=='trade'),
+  // futures /api/v1/account-overview + /positions, paged active futures orders
+  // (/orders?status=active) + untriggered stops (/stopOrders), spot active
+  // orders (/api/v1/orders?status=active). RAW rows go back; the panel supplies
+  // the ctVal map. Passphrase required (v2 signed header).
+  async function execKucoinAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'kucoin');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    if (!creds.pass) return { ok: false, message: 'KuCoin API passphrase missing — re-provision Native trading on this device' };
+    const route = routeNorm(intent.route);
+    const spotAcc = await kcRequest(creds, 'GET', 'spot', '/api/v1/accounts', null, null, route);
+    if (!spotAcc.ok) return spotAcc;
+    const overview = await kcRequest(creds, 'GET', 'futures',
+                                     '/api/v1/account-overview', [['currency', 'USDT']], null, route);
+    if (!overview.ok) return overview;
+    const pos = await kcRequest(creds, 'GET', 'futures', '/api/v1/positions', null, null, route);
+    if (!pos.ok) return pos;
+    // Paged list walk (KuCoin returns {data:{items,totalPage}}); cap at 10 pages.
+    const pageWalk = async (market, path, extra) => {
+      const rows = [];
+      for (let page = 1; page <= 10; page++) {
+        const params = [['currentPage', String(page)], ['pageSize', '200']].concat(extra || []);
+        const r = await kcRequest(creds, 'GET', market, path, params, null, route);
+        if (!r.ok) return r;
+        const d = (r.data || {}).data || {};
+        const items = Array.isArray(d.items) ? d.items : [];
+        for (const o of items) rows.push(o);
+        const totalPage = Number(d.totalPage) | 0;
+        if (page >= totalPage || items.length < 200) break;
+      }
+      return { ok: true, rows: rows };
+    };
+    const fo = await pageWalk('futures', '/api/v1/orders', [['status', 'active']]);
+    if (!fo.ok) return fo;
+    const stops = await pageWalk('futures', '/api/v1/stopOrders', null);
+    if (!stops.ok) return stops;
+    const so = await pageWalk('spot', '/api/v1/orders', [['status', 'active']]);
+    if (!so.ok) return so;
+    return { ok: true,
+             spotAccounts: ((spotAcc.data || {}).data) || [],
+             futOverview: (overview.data || {}).data || null,
+             positions: ((pos.data || {}).data) || [],
+             futOrders: fo.rows, stopOrders: stops.rows, spotOrders: so.rows };
+  }
+
+  // BitMEX native account read (#1716): /user/margin + /user/wallet (spot
+  // balances) + PUBLIC /wallet/assets (scale map), /position, /order (both
+  // markets — stops are plain orders). RAW rows + the scale map go back; the
+  // panel supplies the per-symbol u2pm from its futures catalog.
+  async function execBitmexAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'bitmex');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const margin = await bmxRequest(creds, 'GET', '/user/margin',
+                                    [['currency', 'all']], null, route);
+    if (!margin.ok) return margin;
+    const wallet = await bmxRequest(creds, 'GET', '/user/wallet',
+                                    [['currency', 'all']], null, route);
+    if (!wallet.ok) return wallet;
+    const pos = await bmxRequest(creds, 'GET', '/position',
+                                 [['filter', '{"isOpen":true}'], ['count', '500']], null, route);
+    if (!pos.ok) return pos;
+    const ord = await bmxRequest(creds, 'GET', '/order',
+                                 [['filter', '{"open":true}'], ['count', '500'], ['reverse', 'true']], null, route);
+    if (!ord.ok) return ord;
+    // PUBLIC scale map (currency → scale) so spot amounts descale exactly like
+    // the engine; a failed read leaves the panel's {XBt:8,USDt:6} fallback.
+    let scales = null;
+    try {
+      const rs = await httpJson(BITMEX_HOST, 'GET', BITMEX_API_PREFIX + '/wallet/assets',
+                                '', null, {}, route, 1024 * 1024);
+      const ds = JSON.parse(rs.text);
+      if (Array.isArray(ds)) {
+        scales = {};
+        for (const a of ds) {
+          const c = String((a || {}).currency || '');
+          const sc = (a || {}).scale;
+          if (c && sc != null) scales[c] = Number(sc) | 0;
+        }
+      }
+    } catch (e) { /* fallback scales handled panel-side */ }
+    const arr = (r) => (Array.isArray(r.data) ? r.data : []);
+    const marginRow = Array.isArray(margin.data)
+      ? (margin.data.filter((m) => String((m || {}).currency || '') === 'USDt')[0] || margin.data[0] || null)
+      : (margin.data || null);
+    return { ok: true, margin: marginRow, wallet: arr(wallet),
+             positions: arr(pos), orders: arr(ord), scales: scales };
+  }
+
+  // AsterDex native account read (#1716): Binance-family, EIP-712 signed.
+  // Futures /fapi/v2/balance + /fapi/v2/positionRisk (rewritten to v3 by
+  // ASTER_PATHS), spot /api/v3/account + /api/v3/openOrders (host sapi.*).
+  // No algo API — stops ride the futures /fapi/v1/openOrders list.
+  async function execAsterdexAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'asterdex');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const futBal = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/balance', [], route);
+    if (!futBal.ok) return futBal;
+    const pos = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk', [], route);
+    if (!pos.ok) return pos;
+    const fo = await asterRequest(creds, 'GET', 'futures', '/fapi/v1/openOrders', [], route);
+    if (!fo.ok) return fo;
+    const spotAcc = await asterRequest(creds, 'GET', 'spot', '/api/v3/account', [], route);
+    if (!spotAcc.ok) return spotAcc;
+    const so = await asterRequest(creds, 'GET', 'spot', '/api/v3/openOrders', [], route);
+    if (!so.ok) return so;
+    return { ok: true,
+             futBalance: Array.isArray(futBal.data) ? futBal.data : [],
+             positions: Array.isArray(pos.data) ? pos.data : [],
+             futOrders: Array.isArray(fo.data) ? fo.data : [],
+             spotBalances: ((spotAcc.data || {}).balances) || [],
+             spotOrders: Array.isArray(so.data) ? so.data : [] };
+  }
+
+  // Kraken native account read (#1716): dual-scope. Futures flex account
+  // (/derivatives/api/v3/accounts, key2), openpositions, openorders (stops in
+  // the same list). Spot BalanceEx + OpenOrders (spot key). RAW payloads go
+  // back; the panel supplies the altname→symbol map from its spot catalog.
+  // A failed futures scope surfaces its error (fail-closed, no partial spoof).
+  async function execKrakenAcctRead(intent) {
+    const creds = credsGet(intent.credSlot || 'kraken');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const flex = await krRequest(creds, 'GET', 'futures',
+                                 '/derivatives/api/v3/accounts', null, route);
+    if (!flex.ok) return flex;
+    const pos = await krRequest(creds, 'GET', 'futures',
+                                '/derivatives/api/v3/openpositions', null, route);
+    if (!pos.ok) return pos;
+    const fo = await krRequest(creds, 'GET', 'futures',
+                               '/derivatives/api/v3/openorders', null, route);
+    if (!fo.ok) return fo;
+    const bal = await krRequest(creds, 'POST', 'spot', '/0/private/BalanceEx', null, route);
+    if (!bal.ok) return bal;
+    const so = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
+    if (!so.ok) return so;
+    // Flatten the spot OpenOrders map to [{txid, o}] preserving the ids.
+    const spotOrders = [];
+    const openMap = (((so.data || {}).result) || {}).open || {};
+    for (const txid of Object.keys(openMap)) spotOrders.push({ txid: txid, o: openMap[txid] });
+    return { ok: true,
+             flexAccount: flex.data || null,
+             spotBalances: bal.data || null,
+             positions: ((pos.data || {}).openPositions) || [],
+             futOrders: ((fo.data || {}).openOrders) || [],
+             spotOrders: spotOrders };
+  }
+
   // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
   // panel's "Catalogs & candles: Native" axis (Phemex REST has no CORS, so
   // the fetch must run here in the main process; honors the user proxy via
@@ -5159,9 +5565,74 @@ function createTradeNative(opts) {
   // /public/products and the two public kline endpoints only, never an open
   // proxy. No creds involved.
   const PHEMEX_KLINE_TFS = [60, 300, 900, 1800, 3600];
+  // Generic PUBLIC catalog/kline raw-GET bridge (#1716): the RELAY-ONLY /
+  // CORS-closed venues (KuCoin, Gate, BitMEX, Kraken, MEXC, Arcus) whose
+  // catalogs+klines the browser can only reach via the server relay. On the
+  // desktop app the Electron MAIN process CAN dial their PUBLIC REST directly
+  // (CORS is irrelevant here), so the panel sends the SAME venue-relative path
+  // it would hand its relay endpoint and we execute the raw GET. The RAW BODY
+  // TEXT goes back verbatim — the panel's own parser stays the single source
+  // of truth, so output is byte-identical to the relay path. STRICT static
+  // allowlist per venue+market: exact host + path PREFIXES covering ONLY the
+  // catalog + candle/kline surface (mirrors main.py's relay allowlists). GET
+  // only, no creds, no open proxy. The key is (hostMarket||market) so Arcus'
+  // spot catalog — which rides the FUTURES host — resolves the arcus|futures
+  // entry (the panel passes hostMarket='futures' for that one call, exactly
+  // like _catVFetch's hostMarket quirk).
+  const CAT_GET_ALLOW = {
+    'kucoin|spot':    { host: 'api.kucoin.com',         base: '', prefixes: ['/api/v2/symbols', '/api/v1/market/candles'] },
+    'kucoin|futures': { host: 'api-futures.kucoin.com', base: '', prefixes: ['/api/v1/contracts/active', '/api/v1/kline/query'] },
+    'gate|spot':      { host: 'api.gateio.ws', base: '/api/v4', prefixes: ['/spot/currency_pairs', '/spot/candlesticks'] },
+    'gate|futures':   { host: 'api.gateio.ws', base: '/api/v4', prefixes: ['/futures/usdt/contracts', '/futures/usdt/candlesticks'] },
+    'bitmex|spot':    { host: 'www.bitmex.com', base: '', prefixes: ['/api/v1/instrument/active', '/api/v1/trade/bucketed'] },
+    'bitmex|futures': { host: 'www.bitmex.com', base: '', prefixes: ['/api/v1/instrument/active', '/api/v1/trade/bucketed'] },
+    'mexc|spot':      { host: 'api.mexc.com',      base: '', prefixes: ['/api/v3/exchangeInfo', '/api/v3/klines'] },
+    'mexc|futures':   { host: 'contract.mexc.com', base: '', prefixes: ['/api/v1/contract/detail', '/api/v1/contract/kline/'] },
+    'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC'] },
+    'kraken|futures': { host: 'futures.kraken.com', base: '', prefixes: ['/derivatives/api/v3/instruments', '/api/charts/v1/trade/'] },
+    // Arcus futures host also carries the SPOT catalog overview (hostMarket
+    // quirk) → its prefix list includes /v1/api-meta/spot/overview.
+    'arcus|futures':  { host: 'api.arcus.xyz',            base: '', prefixes: ['/v1/markets', '/v1/candles', '/v1/api-meta/spot/overview'] },
+    'arcus|spot':     { host: 'indexer.spot.arcus.xyz',   base: '', prefixes: ['/token-candles/'] },
+  };
+  // 8MB cap: full venue catalogs (KuCoin symbols, MEXC exchangeInfo, etc.)
+  // routinely exceed httpJson's 256KB default — a truncated body would fail
+  // the panel parser (see .agents/memory/shell-httpjson-response-cap.md).
+  const CAT_GET_MAXBYTES = 8 * 1024 * 1024;
   async function execCatFetch(intent) {
-    if (intent.venue !== 'phemex') return { ok: false, message: 'native catalog fetch not supported for this venue' };
     const route = routeNorm(intent.route);
+    // Generic raw-GET branch (#1716) — must precede the phemex-only gate so
+    // the six relay-only venues route here; phemex keeps its typed branches.
+    if (intent.what === 'get') {
+      const venue = String(intent.venue || '');
+      const market = intent.market === 'spot' ? 'spot' : 'futures';
+      const hostMarket = intent.hostMarket === 'futures' ? 'futures'
+                       : intent.hostMarket === 'spot' ? 'spot' : market;
+      const ent = CAT_GET_ALLOW[venue + '|' + hostMarket];
+      if (!ent) return { ok: false, message: 'native catalog fetch not allowed for this venue/market' };
+      const raw = String(intent.path || '');
+      if (!raw || raw.length > 4096 || raw.indexOf('//') === 0)
+        return { ok: false, message: 'bad path' };
+      const qi = raw.indexOf('?');
+      const pathOnly = qi >= 0 ? raw.slice(0, qi) : raw;
+      const query = qi >= 0 ? raw.slice(qi + 1) : '';
+      if (pathOnly.indexOf('/') !== 0 || pathOnly.indexOf('..') >= 0)
+        return { ok: false, message: 'bad path' };
+      if (!ent.prefixes.some((p) => pathOnly === p || pathOnly.indexOf(p) === 0))
+        return { ok: false, message: 'path not in catalog allowlist' };
+      let r;
+      try {
+        r = await httpJson(ent.host, 'GET', ent.base + pathOnly, query,
+                           null, {}, route, CAT_GET_MAXBYTES);
+      } catch (e) {
+        return { ok: false, message: 'catalog fetch failed: ' + ((e && e.message) || 'error') };
+      }
+      // Non-2xx still returns ok:true with the status so the panel can treat
+      // the reply like a fetch Response (new Response(text, {status})). The
+      // RAW body text goes back untouched — the panel parser owns the shape.
+      return { ok: true, status: (r && r.status) || 0, text: (r && r.text) || '' };
+    }
+    if (intent.venue !== 'phemex') return { ok: false, message: 'native catalog fetch not supported for this venue' };
     if (intent.what === 'products') {
       try {
         const pr = await phemexProducts(route);
