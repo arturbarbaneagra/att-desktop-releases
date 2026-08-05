@@ -5021,6 +5021,31 @@ function createTradeNative(opts) {
   }
 
   // One intent → executed result (renderer-facing shape mirrors the engine).
+  // Native ACCOUNT-DATA read (#1701): positions / open orders / balances via
+  // this device's stored creds — read-only signed GETs, no order path. Raw
+  // venue rows go back to the renderer, whose pure builders map them into the
+  // /terminal/state venue-section shape.
+  async function execAcctRead(intent) {
+    if (intent.venue !== 'bybit') return { ok: false, message: 'native account reads not supported for this venue' };
+    const creds = credsGet(intent.credSlot || intent.venue);
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const bal = await bybRequest(creds, 'GET', '/v5/account/wallet-balance',
+                                 [['accountType', 'UNIFIED']], null, route);
+    if (!bal.ok) return bal;
+    const pos = await bybRequest(creds, 'GET', '/v5/position/list',
+                                 [['category', 'linear'], ['settleCoin', 'USDT'], ['limit', '200']], null, route);
+    if (!pos.ok) return pos;
+    const fo = await bybRequest(creds, 'GET', '/v5/order/realtime',
+                                [['category', 'linear'], ['settleCoin', 'USDT'], ['limit', '50']], null, route);
+    if (!fo.ok) return fo;
+    const so = await bybRequest(creds, 'GET', '/v5/order/realtime',
+                                [['category', 'spot'], ['limit', '50']], null, route);
+    if (!so.ok) return so;
+    const lst = (r) => (((r.data || {}).result) || {}).list || [];
+    return { ok: true, balance: lst(bal), positions: lst(pos), futOrders: lst(fo), spotOrders: lst(so) };
+  }
+
   async function execIntent(intent) {
     // Read-only latency probe (op:'ping_rt') — handled BEFORE validation and
     // creds: no keys, no signing, no order. One cheap public GET/POST against
@@ -5029,6 +5054,7 @@ function createTradeNative(opts) {
     // handler's via-echo confirms the "Trading: Native·…" label. Old shells
     // without this branch fall through to validateIntent's 'unknown op' — the
     // panel treats that as unsupported and stamps nothing.
+    if (intent && typeof intent === 'object' && intent.op === 'acct_read') return await execAcctRead(intent);
     if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
       if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
       const tgt = pingRtTarget(intent.venue, intent.market === 'spot' ? 'spot' : 'futures');
