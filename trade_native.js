@@ -2050,6 +2050,87 @@ function formEnc(pairs) {
 }
 
 // ---------------------------------------------------------------------------
+// acct_read rate-limit guard + single-flight (#1724) — pure, node-tested.
+// The panel polls native account reads per venue at a budget-audited cadence
+// (panel TERM_ACCT_POLL_VENUE_MS), but rate-limit hits can still arrive
+// (external tools sharing the key, native trading bursts on the same key/IP,
+// multiple windows). This shared guard wraps EVERY venue's acct_read:
+//   1. cool-down gate: after a venue signals rate-limiting, further reads
+//      short-circuit here (no HTTP) until the venue-specific cool-down ends,
+//      returning { ok:false, rateLimited:true, retryInMs } so the panel can
+//      show the amber "paced" state instead of the red error chip;
+//   2. single-flight + short memo per venue+account: concurrent reads from
+//      multiple boards/windows share ONE in-flight promise, and a read
+//      landing within ACCT_READ_MEMO_MS reuses the last result — N windows
+//      cost the venue exactly one request train per poll tick.
+// NEVER a silent server fallback — failures stay visible (fail-visible rule).
+// Venue cool-downs sized to documented budgets (see panel poll-map audit):
+// slower-recovering counters (Kraken spot decay 0.33-0.5/s, Binance ban
+// escalation) cool longer than plain per-second limiters.
+const ACCT_RL_COOLDOWN_MS = {
+  bybit: 10000, okx: 10000, bitget: 10000,
+  phemex: 15000, gate: 15000, kucoin: 15000, asterdex: 15000,
+  mexc: 20000, bitmex: 20000,
+  binance: 30000, kraken: 30000,
+};
+const ACCT_RL_MAX_MS = 120000;
+const ACCT_READ_MEMO_MS = 1200;
+// One read outcome → was it a rate-limit? Explicit flag (wrappers that parse
+// Retry-After) or the uniform "Rate limited by <venue>" message every venue
+// wrapper emits for 429 statuses AND body-code maps (OKX 50011, KuCoin
+// 429000, Bybit 10006/10018, Binance -1003, Gate TOO_MANY_REQUESTS,
+// Bitget 429, MEXC 510, Phemex 10004/39995).
+function acctRlHit(r) {
+  if (!r || r.ok) return false;
+  if (r.rateLimited) return true;
+  return /rate limit|too many request/i.test(String(r.message || ''));
+}
+// Cool-down for one venue: an explicit venue hint (Retry-After ms) wins,
+// else the per-venue table, else a 15s default; capped at ACCT_RL_MAX_MS.
+function acctRlWaitMs(venue, hintMs) {
+  if (Number.isFinite(hintMs) && hintMs > 0) return Math.min(hintMs, ACCT_RL_MAX_MS);
+  const c = ACCT_RL_COOLDOWN_MS[String(venue || '')];
+  return (Number.isFinite(c) && c > 0) ? c : 15000;
+}
+// Guard factory: wraps the raw per-venue dispatcher. Pure state machine over
+// an injectable clock so the dedup/backoff behavior is node-testable.
+function acctReadGuard(runRaw, nowFn) {
+  const now = typeof nowFn === 'function' ? nowFn : Date.now;
+  const rlUntil = {};    // venue → cool-down end ts
+  const inflight = {};   // venue|credSlot → in-flight promise
+  const memo = {};       // venue|credSlot → { ts, r }
+  return async function (intent) {
+    const venue = String((intent && intent.venue) || '');
+    const key = venue + '|' + String((intent && intent.credSlot) || venue);
+    const t0 = now();
+    const left = (rlUntil[venue] || 0) - t0;
+    if (left > 0) {
+      return { ok: false, rateLimited: true, retryInMs: left,
+               message: 'Rate limited — pacing reads, retry in ' + Math.ceil(left / 1000) + 's' };
+    }
+    const m = memo[key];
+    if (m && t0 - m.ts < ACCT_READ_MEMO_MS) return m.r;
+    if (inflight[key]) return await inflight[key];
+    const p = (async () => {
+      const r = await runRaw(intent);
+      if (acctRlHit(r)) {
+        const wait = acctRlWaitMs(venue, Number.isFinite(r.retryInMs) ? r.retryInMs : null);
+        rlUntil[venue] = now() + wait;
+        r.rateLimited = true;
+        if (!(Number.isFinite(r.retryInMs) && r.retryInMs > 0)) r.retryInMs = wait;
+      }
+      return r;
+    })();
+    inflight[key] = p;
+    try {
+      const r = await p;
+      memo[key] = { ts: now(), r: r };
+      return r;
+    } finally { delete inflight[key]; }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Runtime wiring (electron main). Everything below touches the network /
 // disk / IPC and is exercised only inside the shell.
 // ---------------------------------------------------------------------------
@@ -2201,7 +2282,10 @@ function createTradeNative(opts) {
           // (reused) socket — surfaced via lastSocketReused() in the exec echo.
           _lastReused = !!req.reusedSocket;
           resolve({ status: res.statusCode, text: buf,
-                    date: (res.headers && res.headers.date) || null });
+                    date: (res.headers && res.headers.date) || null,
+                    // #1724: Retry-After surfaced so 429 branches can hand the
+                    // acct_read guard an honest venue cool-down hint.
+                    ra: (res.headers && res.headers['retry-after']) || null });
         });
       });
       // 'finish' fires only after the request has been fully written to a
@@ -2383,7 +2467,11 @@ function createTradeNative(opts) {
                          { 'X-MBX-APIKEY': creds.key }, route, maxBytes);
     } catch (e) { return transportFail(e, 'Binance'); }
     if (r.status === 429 || r.status === 418) {
-      return { ok: false, message: 'Rate limited by Binance — retry shortly', code: null };
+      // #1724: honor Binance's Retry-After (seconds; 418 = IP ban escalation)
+      // as an explicit cool-down hint for the acct_read guard.
+      const ras = Number(r.ra);
+      return { ok: false, rateLimited: true, message: 'Rate limited by Binance — retry shortly', code: null,
+               retryInMs: (Number.isFinite(ras) && ras > 0) ? Math.min(ras * 1000, ACCT_RL_MAX_MS) : null };
     }
     let data = null;
     try { data = JSON.parse(r.text); } catch (e) { data = null; }
@@ -3395,7 +3483,13 @@ function createTradeNative(opts) {
       r = await httpJson(BITMEX_HOST, method, BITMEX_API_PREFIX + path, q,
                          bodyStr || null, headers, route);
     } catch (e) { return transportFail(e, 'BitMEX'); }
-    if (r.status === 429) return { ok: false, message: 'Rate limited by BitMEX — retry shortly' };
+    if (r.status === 429) {
+      // #1724: BitMEX ships an honest Retry-After (seconds) — hand it to the
+      // acct_read guard as an explicit venue cool-down hint.
+      const ras = Number(r.ra);
+      return { ok: false, rateLimited: true, message: 'Rate limited by BitMEX — retry shortly',
+               retryInMs: (Number.isFinite(ras) && ras > 0) ? Math.min(ras * 1000, ACCT_RL_MAX_MS) : null };
+    }
     let data;
     try { data = r.text ? JSON.parse(r.text) : {}; } catch (e) {
       return { ok: false, message: 'BitMEX returned HTTP ' + r.status };
@@ -5052,7 +5146,12 @@ function createTradeNative(opts) {
   // this device's stored creds — read-only signed GETs, no order path. Raw
   // venue rows go back to the renderer, whose pure builders map them into the
   // /terminal/state venue-section shape.
-  async function execAcctRead(intent) {
+  // #1724: every acct_read rides the shared rate-limit guard + single-flight
+  // (acctReadGuard above): cool-down short-circuit after a venue rate-limits,
+  // one in-flight request train per venue+account shared across all boards
+  // AND windows (this main process is the single funnel), short result memo.
+  const execAcctRead = acctReadGuard(execAcctReadRaw, Date.now);
+  async function execAcctReadRaw(intent) {
     if (intent.venue === 'binance') return await execBinanceAcctRead(intent);
     if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
     if (intent.venue === 'okx') return await execOkxAcctRead(intent);
@@ -5514,6 +5613,8 @@ function createTradeNative(opts) {
   // balances) + PUBLIC /wallet/assets (scale map), /position, /order (both
   // markets — stops are plain orders). RAW rows + the scale map go back; the
   // panel supplies the per-symbol u2pm from its futures catalog.
+  const BMX_SCALES_TTL_MS = 6 * 3600 * 1000;   // static public metadata (#1724)
+  const _bmxScalesCache = { v: null, ts: 0 };
   async function execBitmexAcctRead(intent) {
     const creds = credsGet(intent.credSlot || 'bitmex');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -5532,20 +5633,27 @@ function createTradeNative(opts) {
     if (!ord.ok) return ord;
     // PUBLIC scale map (currency → scale) so spot amounts descale exactly like
     // the engine; a failed read leaves the panel's {XBt:8,USDt:6} fallback.
-    let scales = null;
-    try {
-      const rs = await httpJson(BITMEX_HOST, 'GET', BITMEX_API_PREFIX + '/wallet/assets',
-                                '', null, {}, route, 1024 * 1024);
-      const ds = JSON.parse(rs.text);
-      if (Array.isArray(ds)) {
-        scales = {};
-        for (const a of ds) {
-          const c = String((a || {}).currency || '');
-          const sc = (a || {}).scale;
-          if (c && sc != null) scales[c] = Number(sc) | 0;
+    // #1724: static public metadata — cached 6h so the poll train drops from
+    // 5 to 4 requests (BitMEX budget is 120 req/min per key, the tightest of
+    // all acct_read venues). Output shape unchanged (same map, same fallback).
+    let scales = _bmxScalesCache.v;
+    if (!scales || Date.now() - _bmxScalesCache.ts > BMX_SCALES_TTL_MS) {
+      try {
+        const rs = await httpJson(BITMEX_HOST, 'GET', BITMEX_API_PREFIX + '/wallet/assets',
+                                  '', null, {}, route, 1024 * 1024);
+        const ds = JSON.parse(rs.text);
+        if (Array.isArray(ds)) {
+          scales = {};
+          for (const a of ds) {
+            const c = String((a || {}).currency || '');
+            const sc = (a || {}).scale;
+            if (c && sc != null) scales[c] = Number(sc) | 0;
+          }
+          _bmxScalesCache.v = scales;
+          _bmxScalesCache.ts = Date.now();
         }
-      }
-    } catch (e) { /* fallback scales handled panel-side */ }
+      } catch (e) { /* fallback scales handled panel-side; keep any stale cache */ }
+    }
     const arr = (r) => (Array.isArray(r.data) ? r.data : []);
     const marginRow = Array.isArray(margin.data)
       ? (margin.data.filter((m) => String((m || {}).currency || '') === 'USDt')[0] || margin.data[0] || null)
@@ -6135,6 +6243,12 @@ module.exports = {
   krFutOrderParams,
   krSpotOrderParams,
   krPositionRows,
+  // pure — acct_read rate-limit guard (#1724)
+  ACCT_RL_COOLDOWN_MS,
+  ACCT_READ_MEMO_MS,
+  acctRlHit,
+  acctRlWaitMs,
+  acctReadGuard,
   // runtime
   createTradeNative,
 };
