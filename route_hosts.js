@@ -84,4 +84,28 @@ function bypassHostsFor(tokens) {
   return out;
 }
 
-module.exports = { VENUE_ROUTE_HOSTS, routeNorm, bypassHostsFor };
+// Per-host extra handshake headers for the NATIVE WS dial. Binance's nbstream
+// (Alpha wsa streams) sits behind web-CDN bot-walling that is network-path
+// dependent: on some egress paths a bare `ws`-library dial (no Origin/UA)
+// handshakes fine but never delivers data frames (reproduced live 2026-08-06
+// through a proxy egress: bare dial = 0 frames, browser-like headers = data).
+// Send the same Origin/User-Agent a real Chromium tab would, for exactly this
+// host only — everything else keeps the bare dial (their APIs are
+// programmatic-client-friendly and unexpected headers are a risk, not a help).
+const NATIVE_WS_EXTRA_HEADERS = {
+  'nbstream.binance.com': {
+    'Origin': 'https://www.binance.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  },
+};
+
+// Headers to add to a native WS dial of `url`, or undefined for the normal
+// bare dial. Pure + fail-safe: junk URLs return undefined.
+function nativeWsHeadersFor(url) {
+  try {
+    const h = new URL(String(url || '')).hostname;
+    return NATIVE_WS_EXTRA_HEADERS[h];
+  } catch (e) { return undefined; }
+}
+
+module.exports = { VENUE_ROUTE_HOSTS, routeNorm, bypassHostsFor, nativeWsHeadersFor };

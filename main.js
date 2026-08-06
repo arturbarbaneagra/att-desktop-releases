@@ -704,7 +704,7 @@ const https = require('https');
 // Electron): bullet-response validation + keepalive clamp + dial-URL builder.
 const { KC_BULLET_HOSTS, kcBulletParse, kcDialUrl } = require('./kucoin_bullet');
 const { nativeProxyUrl } = require('./proxy_url');
-const { routeNorm, bypassHostsFor } = require('./route_hosts');
+const { routeNorm, bypassHostsFor, nativeWsHeadersFor } = require('./route_hosts');
 // Shared keep-alive proxy-agent cache lives in trade_native.js so the native
 // WS bridge, the KuCoin bullet fetch, and the native trading HTTPS requests
 // all reuse ONE warm agent per proxy config (flushed on proxy change below).
@@ -851,6 +851,9 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
       agent: ag.agent,
       handshakeTimeout: 15000,
       perMessageDeflate: false,
+      // Per-host browser-like handshake headers (nbstream bot-walls bare
+      // dials on some network paths — see route_hosts.nativeWsHeadersFor).
+      headers: nativeWsHeadersFor(url),
     });
   } catch (e) {
     return { ok: false, error: 'open-failed' };
