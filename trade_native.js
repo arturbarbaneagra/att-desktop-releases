@@ -54,7 +54,12 @@ const KEEPALIVE_MSECS = 15000;
 // bursts while forcing reuse.
 const KA_MAX_SOCKETS = 4;
 const _kaAgents = new Map();   // 'direct' | '<scheme>|<proxyUrl>' → Agent
-let _kaWarmed = new Set();     // warm-up keys ('<venue>') — cleared on flush
+// Warm-up bookkeeping keyed per venue+HOST (split-REST-host venues — kraken
+// api./futures., mexc api./contract., binance, kucoin, asterdex — must warm
+// EVERY host their orders can dial, not just the futures one). Value = last
+// warm attempt ms so opportunistic re-warms (board open / window focus) are
+// rate-limited without any timer loop. Cleared on agent flush.
+let _kaWarmed = new Map();     // '<venue>|<host>' → last warm ts (ms)
 
 function kaAgentKey(scheme, proxyUrl) {
   return proxyUrl ? String(scheme) + '|' + String(proxyUrl) : 'direct';
@@ -555,6 +560,36 @@ function pingRtTarget(venue, market) {
     return { host: ARCUS_HOST, method: 'GET', path: '/health', body: null };
   }
   return null;
+}
+
+// Warm-up target list per venue — EVERY distinct REST host the venue's
+// orders can dial (split-host venues resolve different pingRtTarget hosts per
+// market; single-host venues dedupe to one entry). Each entry carries the
+// market whose probe it rode so callers can feed the matching clock-offset
+// cache when the target IS the venue time endpoint. key = venue+'|'+host —
+// per-host warm bookkeeping. Pure — node-testable.
+function warmTargetsFor(venue) {
+  const out = [];
+  const seen = {};
+  for (const mk of ['futures', 'spot']) {
+    const t = pingRtTarget(venue, mk);
+    if (!t || seen[t.host]) continue;
+    seen[t.host] = true;
+    out.push({ key: venue + '|' + t.host, host: t.host, method: t.method,
+               path: t.path, body: t.body, market: mk });
+  }
+  return out;
+}
+
+// Opportunistic re-warm rate limit: warm sockets die after idle
+// (proxy/CF keep-alive timeouts), so cheap user signals (board open, window
+// focus) re-warm — but at most once per WARM_MIN_GAP_MS per venue+host.
+// last == null/undefined/0 → never warmed → due. Pure — node-testable.
+const WARM_MIN_GAP_MS = 60 * 1000;
+function rewarmDue(lastMs, nowMs, minGapMs) {
+  const gap = (minGapMs == null) ? WARM_MIN_GAP_MS : Number(minGapMs);
+  if (!lastMs) return true;
+  return (Number(nowMs) - Number(lastMs)) >= gap;
 }
 
 function sltpTriggerOk(kind, posSide, trigger, mark) {
@@ -2240,6 +2275,23 @@ function createTradeNative(opts) {
     return { refuse: true };   // never dial direct past an enabled proxy
   }
 
+  // Dead-socket eviction: when a reused keep-alive socket turns out dead
+  // (venue/Cloudflare killed it while idle — first write fails ECONNRESET),
+  // its LIFO siblings in the FREE pool are almost certainly dead too.
+  // Destroy the free sockets ONLY (never in-flight ones) so the retry dials
+  // a fresh tunnel instead of writing into another corpse. Same proxy route
+  // — this evicts sockets, it never changes the egress.
+  function evictFreeSockets(ag) {
+    if (!ag || !ag.freeSockets) return;
+    try {
+      for (const k of Object.keys(ag.freeSockets)) {
+        for (const s of (ag.freeSockets[k] || []).slice()) {
+          try { s.destroy(); } catch (e2) { /* non-fatal */ }
+        }
+      }
+    } catch (e) { /* non-fatal */ }
+  }
+
   // Last completed request's socket-reuse flag (req.reusedSocket) — the
   // smallest honest field signal that keep-alive pooling is really working
   // on the user's route. Echoed as via.reused by att:trade-exec.
@@ -2302,7 +2354,17 @@ function createTradeNative(opts) {
     // double-fill risk, nothing reached the venue); post-transmit dead-socket
     // errors keep the strict GET/DELETE-only matrix. See httpRetryAllowed.
     return attempt().catch((e) => {
-      if (httpRetryAllowed(method, e, !!(e && e.reqSent))) return attempt();
+      if (httpRetryAllowed(method, e, !!(e && e.reqSent))) {
+        // Stale-socket failure → flush the agent's FREE pool first so the
+        // retry is guaranteed a fresh socket (LIFO could otherwise hand it
+        // another idle corpse the venue/CF killed in the same sweep).
+        if (staleSocketError(e)) {
+          const ag = agentFor(route);
+          if (ag && ag.agent) evictFreeSockets(ag.agent);
+          else if (ag && !ag.refuse) evictFreeSockets(sharedKeepAliveAgent(null, null));
+        }
+        return attempt();
+      }
       throw e;
     });
   }
@@ -2313,12 +2375,15 @@ function createTradeNative(opts) {
   // TTL; probe failure keeps the last offset (0 initially — old behavior).
   // Probes ride the SAME httpJson + route as the venue's orders.
   const venueClk = {};                 // probeKey → { offsetMs, ts }
-  async function ensureVenueTime(venue, market, route) {
+  // force=true (warm-up path only) skips the fresh-return so the probe GET
+  // actually rides the wire (re-warming the keep-alive socket) AND refreshes
+  // the offset; the TTL stamp still updates, so signed calls stay probe-free.
+  async function ensureVenueTime(venue, market, route, force) {
     const key = venueTimeProbeKey(venue, market);
     if (!key) return 0;
     const spec = VENUE_TIME_PROBES[key];
     const st = venueClk[key] || (venueClk[key] = { offsetMs: 0, ts: 0 });
-    if (Date.now() - st.ts < TIMESYNC_TTL_MS) return st.offsetMs;
+    if (!force && Date.now() - st.ts < TIMESYNC_TTL_MS) return st.offsetMs;
     st.ts = Date.now();                // stamp first — one probe per TTL even on failure
     try {
       const t0 = Date.now();
@@ -5262,7 +5327,11 @@ function createTradeNative(opts) {
     const wl = await signedRequest(creds, {
       method: 'GET', path: '/spot/wallets', query: '', body: null }, route);
     if (!wl.ok) return wl;
-    const wallets = Array.isArray(wl.data) ? wl.data : [];
+    // Shape-tolerant: /spot/wallets data is a bare list today, but a wrapped
+    // {rows:[…]} variant must not silently empty the spot holdings (the DOM
+    // posrow derives from these rows — engine twin unwraps identically).
+    const wallets = Array.isArray(wl.data) ? wl.data
+      : (wl.data && Array.isArray(wl.data.rows)) ? wl.data.rows : [];
     const so = await signedRequest(creds, {
       method: 'GET', path: '/spot/orders', query: '', body: null }, route);
     let spotRows;
@@ -5315,6 +5384,53 @@ function createTradeNative(opts) {
     // additive — absent on clean reads so legacy payloads stay byte-identical
     if (partialErrors.length) out.partialErrors = partialErrors;
     return out;
+  }
+
+  // Phemex native fills read: signed /api-data trades GETs for a BOUNDED
+  // caller-supplied symbol set (panel caps per market; re-capped here) — the
+  // Your-trades archive source on device-key-only setups (the server engine
+  // has no key to fetch with). RAW venue rows go back verbatim: the ENGINE
+  // parses them with its own fetch_fills normalizers via /native_fills, so
+  // there is exactly ONE parser truth and no fabricated fields. One page per
+  // symbol (limit 200), never a pagination walk; own single-flight latch
+  // (panel cadence is ≥20s — an overlapping call is a quiet no-op error).
+  // Fail-visible: any failed leg fails the whole read so the panel never
+  // half-advances its since-cursor.
+  let _phFillsBusy = false;
+  async function execPhemexFillsRead(intent) {
+    const creds = credsGet(intent.credSlot || 'phemex');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    if (_phFillsBusy) return { ok: false, message: 'fills read already in flight' };
+    _phFillsBusy = true;
+    try {
+      const route = routeNorm(intent.route);
+      const now = Date.now();
+      let end = Math.floor(Number(intent.endMs) || 0);
+      if (!(end > 0) || end > now + 60000) end = now;
+      let start = Math.floor(Number(intent.startMs) || 0);
+      if (!(start > 0) || start >= end) start = end - 24 * 3600 * 1000;
+      if (end - start > 26 * 3600 * 1000) start = end - 26 * 3600 * 1000;
+      const symsOf = (v) => (Array.isArray(v) ? v : []).map(String)
+        .filter((s) => s && s.length <= 32 && /^[A-Za-z0-9]+$/.test(s)).slice(0, 6);
+      const futures = {}, spot = {};
+      for (const sym of symsOf(intent.futSymbols)) {
+        const r = await signedRequest(creds, {
+          method: 'GET', path: '/api-data/g-futures/trades',
+          query: 'symbol=' + encodeURIComponent(sym) + '&start=' + start + '&end=' + end + '&limit=200',
+          body: null }, route);
+        if (!r.ok) return r;
+        futures[sym] = (r.data && r.data.rows) || (Array.isArray(r.data) ? r.data : []);
+      }
+      for (const sym of symsOf(intent.spotSymbols)) {
+        const r = await signedRequest(creds, {
+          method: 'GET', path: '/api-data/spots/trades',
+          query: 'symbol=' + encodeURIComponent(sym) + '&start=' + start + '&end=' + end + '&limit=200',
+          body: null }, route);
+        if (!r.ok) return r;
+        spot[sym] = (r.data && r.data.rows) || (Array.isArray(r.data) ? r.data : []);
+      }
+      return { ok: true, futures: futures, spot: spot };
+    } finally { _phFillsBusy = false; }
   }
 
   // OKX native account read (#1716): signed GETs mirroring OkxAdapter's REST
@@ -5743,6 +5859,18 @@ function createTradeNative(opts) {
   // spot catalog — which rides the FUTURES host — resolves the arcus|futures
   // entry (the panel passes hostMarket='futures' for that one call, exactly
   // like _catVFetch's hostMarket quirk).
+  // Browser-style headers for Cloudflare-fronted venue REST. Kraken spot
+  // (api.kraken.com) sits entirely behind Cloudflare, which fingerprints
+  // UA-less Node requests on cold/idle proxy tunnels and kills them at the
+  // CONNECTION level (resets — the panel sees status-0 errNet every poll;
+  // same bot-wall family as the Lighter 405s). A plain browser UA + Accept
+  // keeps the raw GET on the SAME proxy route (no silent bypass) while
+  // presenting as ordinary client traffic. Other venues stay header-less —
+  // byte-identical behavior where nothing is broken.
+  const CAT_BROWSER_HDRS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+  };
   const CAT_GET_ALLOW = {
     'kucoin|spot':    { host: 'api.kucoin.com',         base: '', prefixes: ['/api/v2/symbols', '/api/v1/market/candles'] },
     'kucoin|futures': { host: 'api-futures.kucoin.com', base: '', prefixes: ['/api/v1/contracts/active', '/api/v1/kline/query'] },
@@ -5756,8 +5884,8 @@ function createTradeNative(opts) {
     // (panel gates them on the 'cat:mexc2' cap — see preload.js).
     'mexc|spot':      { host: 'api.mexc.com',      base: '', prefixes: ['/api/v3/exchangeInfo', '/api/v3/klines', '/api/v3/trades', '/api/v3/ticker/24hr', '/api/v3/ticker/price'] },
     'mexc|futures':   { host: 'contract.mexc.com', base: '', prefixes: ['/api/v1/contract/detail', '/api/v1/contract/kline/', '/api/v1/contract/deals/', '/api/v1/contract/ticker'] },
-    'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC'] },
-    'kraken|futures': { host: 'futures.kraken.com', base: '', prefixes: ['/derivatives/api/v3/instruments', '/api/charts/v1/trade/'] },
+    'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC'], hdrs: CAT_BROWSER_HDRS },
+    'kraken|futures': { host: 'futures.kraken.com', base: '', prefixes: ['/derivatives/api/v3/instruments', '/api/charts/v1/trade/'], hdrs: CAT_BROWSER_HDRS },
     // Arcus futures host also carries the SPOT catalog overview (hostMarket
     // quirk) → its prefix list includes /v1/api-meta/spot/overview.
     'arcus|futures':  { host: 'api.arcus.xyz',            base: '', prefixes: ['/v1/markets', '/v1/candles', '/v1/api-meta/spot/overview'] },
@@ -5835,9 +5963,13 @@ function createTradeNative(opts) {
       let r;
       try {
         r = await httpJson(ent.host, 'GET', ent.base + pathOnly, query,
-                           null, {}, route, CAT_GET_MAXBYTES);
+                           null, ent.hdrs || {}, route, CAT_GET_MAXBYTES);
       } catch (e) {
-        return { ok: false, message: 'catalog fetch failed: ' + ((e && e.message) || 'error') };
+        // Surface the REAL transport error (code + message) — "network error"
+        // debugging must never require guessing timeout vs ECONNRESET vs
+        // proxy CONNECT failure (the panel crumb log carries this verbatim).
+        const code = (e && e.code) ? String(e.code) + ' ' : '';
+        return { ok: false, message: 'catalog fetch failed: ' + code + ((e && e.message) || 'error') };
       }
       // Non-2xx still returns ok:true with the status so the panel can treat
       // the reply like a fetch Response (new Response(text, {status})). The
@@ -5908,10 +6040,26 @@ function createTradeNative(opts) {
     // without this branch fall through to validateIntent's 'unknown op' — the
     // panel treats that as unsupported and stamps nothing.
     if (intent && typeof intent === 'object' && intent.op === 'acct_read') return await execAcctRead(intent);
+    // Phemex native fills read (Your-trades archive source on device-key-only
+    // setups) — creds-signed but read-only; venue-gated (Phemex-first pattern).
+    if (intent && typeof intent === 'object' && intent.op === 'fills_read') {
+      if (intent.venue !== 'phemex') return { ok: false, message: 'fills_read not supported for this venue' };
+      return await execPhemexFillsRead(intent);
+    }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
     if (intent && typeof intent === 'object' && intent.op === 'cat_http') return await execCatHttp(intent);
     if (intent && typeof intent === 'object' && intent.op === 'cat_fetch') return await execCatFetch(intent);
+    // Opportunistic re-warm (op:'warm') — no keys, no signing, no order.
+    // Fire-and-forget warm of every REST host the venue's orders can dial
+    // (rate-limited per venue+host inside warmVenue); returns ok immediately.
+    // Old shells fall through to 'unknown op' — the panel treats that as
+    // unsupported and simply stops sending warms.
+    if (intent && typeof intent === 'object' && intent.op === 'warm') {
+      if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
+      warmVenue(intent.venue, routeNorm(intent.route));
+      return { ok: true };
+    }
     if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
       if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
       const tgt = pingRtTarget(intent.venue, intent.market === 'spot' ? 'spot' : 'futures');
@@ -6041,19 +6189,34 @@ function createTradeNative(opts) {
     }
   }
 
-  // First-action warmth: when trading is ARMED for a venue (creds set), fire
-  // ONE cheap unauthenticated GET/POST at the venue's REST host so the first
-  // real order doesn't pay the SOCKS+TCP+TLS handshake. Once per venue per
-  // agent generation (_kaWarmed is cleared by flushKeepAliveAgents, so a
-  // proxy change re-warms on the next arm). Fire-and-forget — NO timer loop.
-  function warmVenue(venue) {
+  // First-action warmth: when trading is ARMED for a venue (creds set) — and
+  // opportunistically on cheap user signals (op:'warm' from board open /
+  // window focus) — fire ONE cheap unauthenticated GET/POST at EVERY REST
+  // host the venue's orders can dial (split-host venues: kraken api. +
+  // futures., mexc, binance, kucoin, asterdex) so the first real order
+  // doesn't pay the SOCKS+TCP+TLS handshake. Where the warm target IS the
+  // venue's time endpoint the GET rides ensureVenueTime(force) so it ALSO
+  // pre-resolves the clock offset — the first signed request then stamps a
+  // cached offset instead of round-tripping a time probe on a cold socket
+  // (kraken spot's Cloudflare front made that doubly expensive). Rate-limited
+  // per venue+host (WARM_MIN_GAP_MS); _kaWarmed is cleared by
+  // flushKeepAliveAgents, so a proxy change re-warms on the next arm.
+  // Fire-and-forget, silent on failure — NO timer loop.
+  function warmVenue(venue, route) {
     try {
-      if (_kaWarmed.has(venue)) return;
-      _kaWarmed.add(venue);
-      const tgt = pingRtTarget(venue, 'futures');
-      if (!tgt) return;
-      httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, undefined)
-        .catch(() => { /* warm-up is best-effort; real action will surface errors */ });
+      const now = Date.now();
+      for (const tgt of warmTargetsFor(venue)) {
+        if (!rewarmDue(_kaWarmed.get(tgt.key), now)) continue;
+        _kaWarmed.set(tgt.key, now);
+        if (venueTimeProbeKey(venue, tgt.market)) {
+          // Target is the venue time endpoint → warm + seed the offset cache.
+          ensureVenueTime(venue, tgt.market, route, true)
+            .catch(() => { /* best-effort; real action surfaces errors */ });
+        } else {
+          httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, route)
+            .catch(() => { /* warm-up is best-effort; real action will surface errors */ });
+        }
+      }
     } catch (e) { /* non-fatal */ }
   }
 
@@ -6125,6 +6288,9 @@ module.exports = {
   sltpTriggerOk,
   tradeViaFromAgent,
   pingRtTarget,
+  warmTargetsFor,
+  rewarmDue,
+  WARM_MIN_GAP_MS,
   phemexErrorMessage,
   phemexSymbolRequired,
   // shared keep-alive agent cache (used by main.js's native-WS bridge too)
