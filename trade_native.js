@@ -5352,7 +5352,8 @@ function createTradeNative(opts) {
         for (const w of wallets) {
           const nz = (Number(w && w.balanceEv) || 0)
                    + (Number(w && w.lockedTradingBalanceEv) || 0)
-                   + (Number(w && w.lockedWithdrawEv) || 0);
+                   + (Number(w && w.lockedWithdrawEv) || 0)
+                   + (Number(w && w.balanceRv) || 0);   // #1785 Rv-variant tolerance (engine twin)
           if (nz) curs[String(w.currency || '')] = 1;
         }
         for (const p of ((pr.raw && pr.raw.products) || [])) {
