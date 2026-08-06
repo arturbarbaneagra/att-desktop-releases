@@ -5750,8 +5750,12 @@ function createTradeNative(opts) {
     'gate|futures':   { host: 'api.gateio.ws', base: '/api/v4', prefixes: ['/futures/usdt/contracts', '/futures/usdt/candlesticks'] },
     'bitmex|spot':    { host: 'www.bitmex.com', base: '', prefixes: ['/api/v1/instrument/active', '/api/v1/trade/bucketed'] },
     'bitmex|futures': { host: 'www.bitmex.com', base: '', prefixes: ['/api/v1/instrument/active', '/api/v1/trade/bucketed'] },
-    'mexc|spot':      { host: 'api.mexc.com',      base: '', prefixes: ['/api/v3/exchangeInfo', '/api/v3/klines'] },
-    'mexc|futures':   { host: 'contract.mexc.com', base: '', prefixes: ['/api/v1/contract/detail', '/api/v1/contract/kline/'] },
+    // MEXC carries EXTRA public read prefixes beyond catalog+kline (trade
+    // seeds + tickers): both hosts are CORS-closed in browsers, so the
+    // remaining public REST legs ride this same raw-GET bridge on desktop
+    // (panel gates them on the 'cat:mexc2' cap — see preload.js).
+    'mexc|spot':      { host: 'api.mexc.com',      base: '', prefixes: ['/api/v3/exchangeInfo', '/api/v3/klines', '/api/v3/trades', '/api/v3/ticker/24hr', '/api/v3/ticker/price'] },
+    'mexc|futures':   { host: 'contract.mexc.com', base: '', prefixes: ['/api/v1/contract/detail', '/api/v1/contract/kline/', '/api/v1/contract/deals/', '/api/v1/contract/ticker'] },
     'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC'] },
     'kraken|futures': { host: 'futures.kraken.com', base: '', prefixes: ['/derivatives/api/v3/instruments', '/api/charts/v1/trade/'] },
     // Arcus futures host also carries the SPOT catalog overview (hostMarket
