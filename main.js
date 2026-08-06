@@ -300,6 +300,13 @@ function makeWindowOpenHandler(win) {
 function wireWindowNav(win) {
   win.webContents.setWindowOpenHandler(makeWindowOpenHandler(win));
 
+  // Launch-scoped first-load retry budget: a transient failure of the INITIAL
+  // document load (e.g. the launch connection storm contending through the
+  // user's proxy) self-heals with 1-2 automatic retries before settling on the
+  // offline fallback. Cleared on the first successful load, so later failures
+  // (Ctrl+R while offline etc.) go straight to the fallback as before.
+  win.__firstLoadRetriesLeft = 2;
+
   win.webContents.on('will-navigate', (event, url) => {
     if (!isAppOrigin(url) && !url.startsWith('file:')) {
       event.preventDefault();
@@ -310,7 +317,26 @@ function wireWindowNav(win) {
   win.webContents.on('did-fail-load', (event, errorCode, errorDesc, validatedURL, isMainFrame) => {
     if (!isMainFrame) return;
     if (errorCode === -3) return; // ERR_ABORTED (in-page nav etc.)
+    // First-load retry (launch-scoped, see __firstLoadRetriesLeft above): back
+    // off 1s then 2.5s. The fallback page must still appear eventually — after
+    // the budget is spent this falls through to showFallback (its own escape
+    // hatches, incl. "Disable proxy & retry", stay untouched).
+    if (win.__firstLoadRetriesLeft > 0 && isAppOrigin(validatedURL)) {
+      win.__firstLoadRetriesLeft -= 1;
+      const delay = win.__firstLoadRetriesLeft > 0 ? 1000 : 2500;
+      setTimeout(() => {
+        if (win.isDestroyed()) return;
+        win.loadURL(validatedURL).catch(() => showFallback(win, validatedURL));
+      }, delay);
+      return;
+    }
     showFallback(win, validatedURL);
+  });
+
+  win.webContents.on('did-finish-load', () => {
+    // A successful document load ends the launch retry window.
+    win.__firstLoadRetriesLeft = 0;
+    maybeReloadLoginRace(win);
   });
 
   // Games-style fullscreen escape hatch (MANDATORY): F11 toggles fullscreen and
@@ -360,6 +386,28 @@ function wireWindowNav(win) {
   const wcId = win.webContents.id;
   win.webContents.on('did-start-loading', () => closeNativeSocketsFor(wcId));
   win.webContents.on('destroyed', () => closeNativeSocketsFor(wcId));
+}
+
+// Belt-and-braces for the cookie-ready race: if a window's first document
+// rendered the LOGIN page while the shared session is actually authenticated
+// (session cookie present), reload it once — the reload sends the cookie and
+// gets the real panel. A genuinely logged-out user has no session cookie, so
+// their login page stays untouched in every window. At most ONE reload per
+// window, ever (__loginRaceReloaded), so this can never loop.
+function maybeReloadLoginRace(win) {
+  if (win.__loginRaceReloaded) return;
+  let title = '';
+  try {
+    if (!isAppOrigin(win.webContents.getURL())) return;
+    title = win.webContents.getTitle() || '';
+  } catch (e) { return; }
+  // The login page is the only app page titled "… — Sign in" (login.html).
+  if (!/sign in/i.test(title)) return;
+  session.fromPartition(PARTITION).cookies.get({ url: APP_URL }).then((cookies) => {
+    if (!cookies.some((c) => c.name === 'sid')) return; // really logged out
+    win.__loginRaceReloaded = true;
+    if (!win.isDestroyed()) win.webContents.reload();
+  }).catch(() => { /* non-fatal */ });
 }
 
 // Permission allowlist for the shared app session (set once; all windows on the
@@ -429,7 +477,11 @@ function registerFeatureWindow(win, id) {
 // Create a feature window directly (used to reopen saved windows on launch).
 // Optional `url` carries a deep-linked open (e.g. ?feature=hld&hv=…&haddr=…);
 // launch-reopen never passes one, so restarts load the bare feature page.
-function createFeatureWindow(id, url) {
+// Optional `loadDelayMs` (launch-reopen only) staggers the INITIAL loadURL so a
+// many-window launch doesn't fire every document+asset burst simultaneously
+// through the proxy; the window itself is created immediately (bounds/position
+// appear at once, painted with the app background color until its turn).
+function createFeatureWindow(id, url, loadDelayMs) {
   const existing = featureWindows.get(id);
   if (existing && !existing.isDestroyed()) {
     if (existing.isMinimized()) existing.restore();
@@ -440,14 +492,27 @@ function createFeatureWindow(id, url) {
   const win = new BrowserWindow(featureWindowOptions(featureWindowState(id).bounds));
   registerFeatureWindow(win, id);
   const target = (url && isAppOrigin(url)) ? url : (APP_URL + '/?feature=' + id);
-  win.loadURL(target).catch(() => showFallback(win, target));
+  const doLoad = () => {
+    if (win.isDestroyed()) return;
+    win.loadURL(target).catch(() => showFallback(win, target));
+  };
+  if (typeof loadDelayMs === 'number' && loadDelayMs > 0) setTimeout(doLoad, loadDelayMs);
+  else doLoad();
 }
 
 // On launch, reopen every feature window that was open when the app last quit.
+// Initial loads are STAGGERED (300ms apart, after the main window's load) so
+// the simultaneous first-document + asset/API bursts of many windows don't
+// contend through the user's proxy and fail/half-paint (launch-scoped only —
+// user-initiated window.open loads immediately as before).
 function reopenFeatureWindows() {
   const fw = loadSettings().featureWindows || {};
+  let n = 0;
   Object.keys(fw).forEach((id) => {
-    if ((FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id)) && fw[id] && fw[id].open) createFeatureWindow(id);
+    if ((FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id)) && fw[id] && fw[id].open) {
+      n += 1;
+      createFeatureWindow(id, null, 300 * n);
+    }
   });
 }
 
@@ -1544,6 +1609,14 @@ app.whenReady().then(async () => {
   // Apply the saved proxy BEFORE the first window loads so the initial page load
   // (and the auto-updater on the default session) already goes through the tunnel.
   await applyProxyToSessions(getProxyConfig());
+  // Cookie-ready gate: Electron loads the persisted cookie store from disk
+  // asynchronously — a window whose first loadURL fires before it's ready sends
+  // an UNAUTHENTICATED document request and gets the login page even though the
+  // user is logged in. Any resolved cookies.get() proves the store is loaded,
+  // so await one read on the app partition before creating ANY window. The
+  // result itself doesn't gate anything — a genuinely logged-out user (no
+  // session cookie) must still load and see the login page normally.
+  try { await session.fromPartition(PARTITION).cookies.get({ url: APP_URL }); } catch (e) { /* non-fatal */ }
   createWindow();
   reopenFeatureWindows();   // restore feature windows that were open at last quit
   createTray();
