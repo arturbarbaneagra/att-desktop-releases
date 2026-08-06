@@ -325,6 +325,21 @@ function wireWindowNav(win) {
     } else if (input.key === 'Escape' && win.isFullScreen()) {
       event.preventDefault();
       try { win.setFullScreen(false); } catch (e) { /* non-fatal */ }
+      return;
+    }
+    // With the application menu removed (Menu.setApplicationMenu(null)) the
+    // default role accelerators are gone, so reload and DevTools are
+    // re-registered here explicitly (per window, incl. pop-outs):
+    const ctrlOnly = input.control && !input.alt && !input.meta;
+    if (ctrlOnly && !input.shift && (input.key === 'r' || input.key === 'R')) {
+      event.preventDefault(); // Ctrl+R — normal reload
+      try { win.webContents.reload(); } catch (e) { /* non-fatal */ }
+    } else if ((ctrlOnly && input.shift && (input.key === 'r' || input.key === 'R')) || input.key === 'F5') {
+      event.preventDefault(); // Ctrl+Shift+R / F5 — hard reload
+      try { win.webContents.reloadIgnoringCache(); } catch (e) { /* non-fatal */ }
+    } else if (input.key === 'F12' || (ctrlOnly && input.shift && (input.key === 'i' || input.key === 'I'))) {
+      event.preventDefault(); // F12 / Ctrl+Shift+I — DevTools
+      try { win.webContents.toggleDevTools(); } catch (e) { /* non-fatal */ }
     }
   });
 
@@ -1516,6 +1531,14 @@ function createTray() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(async () => {
+  // No application menu, ever: kills the ALT-revealed File/Edit/View/Window/Help
+  // bar in EVERY window (main, feature pop-outs, floats) and the Alt+key
+  // accelerator entry points. Shortcuts users rely on that the default menu used
+  // to provide (Ctrl+R reload, F12/Ctrl+Shift+I DevTools) are re-registered in
+  // wireWindowNav's before-input-event handler; F11 fullscreen and Ctrl+wheel
+  // zoom were already custom. The tray context menu (buildTrayMenu) is separate
+  // and unaffected. Clipboard/undo work natively in inputs without a menu.
+  Menu.setApplicationMenu(null);
   app.setAppUserModelId('com.atraderstool.desktop'); // Windows notifications attribution
   setupSession();
   // Apply the saved proxy BEFORE the first window loads so the initial page load
