@@ -27,9 +27,16 @@
     font-size: 13px; line-height: 1.5; color: #adbac7;
   }
   .proxy-note code { color: #e6edf3; }
+  /* Windows overlay title bar (#1793): the page owns the bar, so give the
+     fallback a full-width CSS drag strip (native caption buttons overlay it
+     top-right). Inert under a native frame (env() resolves to 0 height). */
+  .ttbdrag { position: fixed; top: 0; left: 0; right: 0;
+             height: env(titlebar-area-height, 0px);
+             -webkit-app-region: drag; app-region: drag; }
 </style>
 </head>
 <body>
+  <div class="ttbdrag"></div>
   <div class="box">
     <div class="dot">📡</div>
     <h1>Can't reach atraderstool.com</h1>

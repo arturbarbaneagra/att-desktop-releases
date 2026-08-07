@@ -56,18 +56,43 @@ ipcRenderer.on('att:proxy-open-settings', () => {
 // behavior. Its presence (window.attApp) is also how the panel tells it's running
 // inside a desktop build new enough to show the Restart + Fullscreen buttons.
 let _fullscreenChangeCb = null;
+let _updateStateCb = null;   // titlebar Restart button accent (#1793)
 try {
   contextBridge.exposeInMainWorld('attApp', {
     restart: () => ipcRenderer.invoke('att:app-restart'),
     toggleFullscreen: () => ipcRenderer.invoke('att:toggle-fullscreen'),
     getFullscreen: () => ipcRenderer.invoke('att:get-fullscreen'),
     onFullscreenChange: (cb) => { _fullscreenChangeCb = (typeof cb === 'function') ? cb : null; },
+    // Update-state mirror for the in-titlebar Restart button (#1793): the panel
+    // accents the button ("restart to update") when a downloaded update is
+    // pending. Same payload main.js pushes for the shell-owned update bar;
+    // status/version only — no renderer-supplied data flows back.
+    onUpdateState: (cb) => { _updateStateCb = (typeof cb === 'function') ? cb : null; },
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel simply hides the buttons */ }
 
 ipcRenderer.on('att:fullscreen-changed', (_e, isFull) => {
   try { if (_fullscreenChangeCb) _fullscreenChangeCb(!!isFull); } catch (e) { /* non-fatal */ }
 });
+
+// ---------------------------------------------------------------------------
+// Admin diagnostic logger bridge (#1786) — window.attDiag
+// ---------------------------------------------------------------------------
+// Slim pipe for the admin-only per-launch diagnostic log. The MAIN process
+// owns gating (fail closed on role), sanitization and rate limiting; this
+// bridge only forwards. role() is how the panel reports the logged-in session
+// role after /api/me; log() pipes key panel events (WS lifecycle, REST-failure
+// breadcrumbs, park/hydrate, /state pacing) — a no-op when no logger is live.
+try {
+  contextBridge.exposeInMainWorld('attDiag', {
+    role: (isAdmin) => { try { ipcRenderer.send('att:diag-role', isAdmin === true); } catch (e) { /* non-fatal */ } },
+    get: () => ipcRenderer.invoke('att:diag-get'),
+    setEnabled: (on) => ipcRenderer.invoke('att:diag-set-enabled', on === true),
+    log: (cat, ev, data) => {
+      try { ipcRenderer.send('att:diag-event', { cat: String(cat), ev: String(ev), data: data }); } catch (e) { /* non-fatal */ }
+    },
+  });
+} catch (e) { /* non-fatal — bridge unavailable, panel simply skips diag */ }
 
 // ---------------------------------------------------------------------------
 // Native market-data WebSocket bridge — window.attNativeWS
@@ -299,9 +324,24 @@ function hideBar() {
   if (bar) bar.style.display = 'none';
 }
 
+// With the Windows overlay title bar (#1793) the page starts BELOW the native
+// caption-button strip, so the fixed bar must sit under it, never over the
+// native buttons / drag region. 0 on native-framed platforms and in fullscreen.
+function ttbTop() {
+  try {
+    const wco = navigator.windowControlsOverlay;
+    if (wco && wco.visible && typeof wco.getTitlebarAreaRect === 'function') {
+      const r = wco.getTitlebarAreaRect();
+      if (r && r.height > 0) return Math.round(r.height);
+    }
+  } catch (e) { /* non-fatal */ }
+  return 0;
+}
+
 function showBar(text, clickable, key, opts) {
   const o = opts || {};
   const b = ensureBar();
+  b.style.top = ttbTop() + 'px';
   const label = document.getElementById(BAR_ID + '_label');
   if (label) label.textContent = text;
   b.setAttribute('data-clickable', clickable ? '1' : '0');

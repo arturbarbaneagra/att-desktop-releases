@@ -49,6 +49,33 @@ function isScratchFeatureId(f) {
 // (panel.html).
 const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist', 'terminal_alerts'];
 
+// ---------------------------------------------------------------------------
+// Admin-only diagnostic logger (#1786) — see diag_log.js. `diag` stays null
+// for regular users (fail closed: settings.diag.admin must ALREADY be true
+// from a prior admin session — no role known = no logger, no files). dlog()
+// is the zero-overhead guard every call site rides.
+// ---------------------------------------------------------------------------
+const { createDiagLogger } = require('./diag_log');
+let diag = null;
+function dlog(win, cat, ev, data) {
+  if (diag) diag.log(win, cat, ev, data);
+}
+function diagDir() {
+  return path.join(app.getPath('userData'), 'logs');
+}
+function diagSettings() {
+  const d = loadSettings().diag;
+  return (d && typeof d === 'object') ? d : {};
+}
+// Construct the logger for this launch — ONLY when a prior session proved the
+// user is admin AND the toggle isn't off. Toggle changes take effect next
+// launch by design (the file covers a whole launch or none of it).
+function initDiag() {
+  const d = diagSettings();
+  if (!(d.admin === true && d.enabled !== false)) return;
+  try { diag = createDiagLogger({ dir: diagDir() }); } catch (e) { diag = null; }
+}
+
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
@@ -198,6 +225,15 @@ function pushZoom(win, id) {
   try { win.webContents.send('att:zoom-apply', savedZoomFor(id)); } catch (e) { /* non-fatal */ }
 }
 
+// Diag window tag for a BrowserWindow: 'main', a feature id, or 'wc<N>'.
+function diagWinId(win) {
+  if (win === mainWindow) return 'main';
+  for (const [id, w] of featureWindows.entries()) {
+    if (w === win) return id;
+  }
+  try { return 'wc' + win.webContents.id; } catch (e) { return 'win'; }
+}
+
 // Map an IPC sender back to its window id: null = main window, a string = feature
 // id, undefined = unknown (ignored). Lets att:zoom-changed persist to the right key.
 function windowIdForSender(sender) {
@@ -208,11 +244,28 @@ function windowIdForSender(sender) {
   return undefined;
 }
 
+// Windows-only overlay title bar (#1793): titleBarStyle 'hidden' +
+// titleBarOverlay keeps the NATIVE min/max/close caption buttons (drawn by the
+// OS, double-click-to-maximize etc. all native) while letting the page own the
+// rest of the bar — the panel renders a slim drag strip with an in-bar Restart
+// button (windowControlsOverlay API). Other platforms keep the fully native
+// frame exactly as before (empty object = zero change), and pages that don't
+// render a strip (login, offline fallback) carry their own CSS drag region.
+const TITLEBAR_OVERLAY_HEIGHT = 32;
+function titleBarOpts() {
+  if (process.platform !== 'win32') return {};
+  return {
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: '#0d1117', symbolColor: '#c9d1d9', height: TITLEBAR_OVERLAY_HEIGHT },
+  };
+}
+
 // BrowserWindow options shared by every feature window (same login partition,
 // security + look as the main window). `bounds` seeds size/position.
 function featureWindowOptions(bounds) {
   const b = bounds || {};
   return {
+    ...titleBarOpts(),
     width: b.width || 900,
     height: b.height || 800,
     x: typeof b.x === 'number' ? b.x : undefined,
@@ -321,16 +374,26 @@ function wireWindowNav(win) {
     // off 1s then 2.5s. The fallback page must still appear eventually — after
     // the budget is spent this falls through to showFallback (its own escape
     // hatches, incl. "Disable proxy & retry", stay untouched).
+    dlog(diagWinId(win), 'win', 'fail-load', { code: errorCode, desc: String(errorDesc || ''), retriesLeft: win.__firstLoadRetriesLeft });
     if (win.__firstLoadRetriesLeft > 0 && isAppOrigin(validatedURL)) {
       win.__firstLoadRetriesLeft -= 1;
       const delay = win.__firstLoadRetriesLeft > 0 ? 1000 : 2500;
       setTimeout(() => {
         if (win.isDestroyed()) return;
+        dlog(diagWinId(win), 'win', 'retry-load', { delay });
         win.loadURL(validatedURL).catch(() => showFallback(win, validatedURL));
       }, delay);
       return;
     }
+    dlog(diagWinId(win), 'win', 'fallback', {});
     showFallback(win, validatedURL);
+  });
+
+  win.webContents.on('did-finish-load', () => {
+    dlog(diagWinId(win), 'win', 'loaded', {});
+  });
+  win.webContents.on('render-process-gone', (event, details) => {
+    dlog(diagWinId(win), 'win', 'renderer-gone', { reason: details && details.reason, exitCode: details && details.exitCode });
   });
 
   win.webContents.on('did-finish-load', () => {
@@ -491,6 +554,7 @@ function createFeatureWindow(id, url, loadDelayMs) {
   }
   const win = new BrowserWindow(featureWindowOptions(featureWindowState(id).bounds));
   registerFeatureWindow(win, id);
+  dlog(id, 'win', 'create', { delayed: typeof loadDelayMs === 'number' && loadDelayMs > 0 });
   const target = (url && isAppOrigin(url)) ? url : (APP_URL + '/?feature=' + id);
   const doLoad = () => {
     if (win.isDestroyed()) return;
@@ -611,6 +675,9 @@ function reloadAllWindows() {
 // saved host/port is activated or just turned off (host/port are kept so a later
 // Enable works without re-typing).
 async function setProxyAndReconnect(cfg) {
+  // Proxy config is never a secret (no SOCKS auth exists here), but log only
+  // scheme/host/port + enabled anyway (design rule).
+  dlog('main', 'net', 'proxy-set', cfg ? { enabled: !!cfg.enabled, scheme: cfg.scheme, host: cfg.host, port: cfg.port } : { enabled: false });
   saveSettings({ proxy: cfg });
   await applyProxyToSessions(cfg && cfg.enabled ? cfg : null);
   for (const ses of proxyTargetSessions()) {
@@ -736,6 +803,69 @@ ipcMain.handle('att:proxy-clear', async (event) => {
   await setProxyAndReconnect(next);
   return { ok: true, proxy: publicProxyState() };
 });
+
+// ---------------------------------------------------------------------------
+// Diagnostic-logger IPC (#1786) — role gate + settings toggle + renderer pipe
+// ---------------------------------------------------------------------------
+// The panel reports the logged-in role after /api/me. Fail closed both ways:
+// admin=true only ever set from an authenticated app-origin page's report;
+// a non-admin report clears the flag AND stops any live logger immediately.
+ipcMain.on('att:diag-role', (event, isAdmin) => {
+  if (proxySenderKind(event) !== 'app') return;
+  const d = diagSettings();
+  if (isAdmin === true) {
+    if (d.admin !== true) saveSettings({ diag: Object.assign({}, d, { admin: true }) });
+    refreshTrayMenu();   // "Open log folder" appears for admins
+  } else {
+    if (d.admin === true) saveSettings({ diag: Object.assign({}, d, { admin: false }) });
+    if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } diag = null; }
+    refreshTrayMenu();
+  }
+});
+
+// Settings-card state for the admin-only "Diagnostic logging" toggle.
+ipcMain.handle('att:diag-get', (event) => {
+  if (proxySenderKind(event) !== 'app') return null;
+  const d = diagSettings();
+  return {
+    admin: d.admin === true,
+    enabled: d.enabled !== false,
+    active: !!diag,                      // logging THIS launch?
+    dir: diagDir(),
+  };
+});
+
+// Toggle takes effect NEXT launch (a launch's file covers all of it or none).
+ipcMain.handle('att:diag-set-enabled', (event, on) => {
+  if (proxySenderKind(event) !== 'app') return { ok: false, error: 'forbidden' };
+  const d = diagSettings();
+  if (d.admin !== true) return { ok: false, error: 'forbidden' };
+  saveSettings({ diag: Object.assign({}, d, { enabled: on === true }) });
+  dlog('main', 'app', 'diag-toggle', { on: on === true });
+  return { ok: true, enabled: on === true };
+});
+
+// Renderer/terminal event pipe: the panel posts key events (WS lifecycle,
+// REST-failure breadcrumbs, park/hydrate, /state pacing) here. Sanitization +
+// per-key rate limiting happen inside diag.log; payload shape is clamped so a
+// renderer can never write arbitrary bulk. Silently a no-op when no logger.
+ipcMain.on('att:diag-event', (event, payload) => {
+  if (!diag) return;
+  if (proxySenderKind(event) !== 'app') return;
+  if (!payload || typeof payload !== 'object') return;
+  const cat = typeof payload.cat === 'string' ? payload.cat : '';
+  const ev = typeof payload.ev === 'string' ? payload.ev : '';
+  if (!cat || !ev) return;
+  let data = (payload.data && typeof payload.data === 'object') ? payload.data : null;
+  const wid = windowIdForSender(event.sender);
+  const win = wid === null ? 'main' : (typeof wid === 'string' ? wid : 'wc' + event.sender.id);
+  diag.log(win, 'r:' + cat, ev, data);
+});
+
+function openDiagFolder() {
+  try { fs.mkdirSync(diagDir(), { recursive: true }); } catch (e) { /* non-fatal */ }
+  try { shell.openPath(diagDir()); } catch (e) { /* non-fatal */ }
+}
 
 // Tray escape hatches: enable the saved config, disable it, or open the settings
 // card in the panel. These stay available even when a bad proxy blacks out all
@@ -942,7 +1072,9 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
   const emit = (msg) => {
     try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
   };
-  ws.on('open', () => emit({ id, type: 'open' }));
+  const diagHost = (() => { try { return new URL(String(url)).hostname; } catch (e) { return ''; } })();
+  const diagT0 = Date.now();
+  ws.on('open', () => { dlog('main', 'ws', 'open', { k: diagHost, id, host: diagHost, ms: Date.now() - diagT0, route: ag.agent ? 'proxy' : 'direct' }); emit({ id, type: 'open' }); });
   // via = the path MAIN actually applied (not what the renderer requested):
   // an agent means the tunnel is really in use; no agent means the dial goes
   // over the plain internet (proxy off / explicit Direct). A refused open
@@ -966,9 +1098,11 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
     nativeSockets.delete(id);
     let r = '';
     try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
+    dlog('main', 'ws', 'close', { k: diagHost, id, host: diagHost, code });
     emit({ id, type: 'close', code: code, reason: r });
   });
   ws.on('error', (err) => {
+    dlog('main', 'ws', 'error', { k: diagHost, id, host: diagHost, msg: (err && err.message) || 'error' });
     emit({ id, type: 'error', message: (err && err.message) || 'error' });
   });
   return { ok: true, id, via };
@@ -1115,6 +1249,10 @@ createTradeNative({
   getProxyConfig,
   senderOk: nativeWsSenderOk,
   userDataDir: () => app.getPath('userData'),
+  // Diagnostic tap (#1786): no-op unless the admin logger is live. trade_native
+  // only ever passes pre-shaped, secret-free summaries (host/path/status/ms —
+  // never headers, bodies, queries or creds); diag.log sanitizes again anyway.
+  diag: (cat, ev, data) => dlog('main', cat, ev, data),
 });
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1526,7 @@ function createWindow() {
   const bounds = settings.bounds || {};
 
   mainWindow = new BrowserWindow({
+    ...titleBarOpts(),
     width: bounds.width || 1400,
     height: bounds.height || 900,
     x: bounds.x,
@@ -1519,9 +1658,16 @@ function buildTrayMenu() {
     ],
   };
 
+  // Admin-only (#1786): quick access to the diagnostic log folder. Shown only
+  // once a prior admin session set the flag — regular users never see it.
+  const diagItems = diagSettings().admin === true
+    ? [{ label: 'Open log folder', click: () => openDiagFolder() }, { type: 'separator' }]
+    : [];
+
   return Menu.buildFromTemplate([
     ...updateItems,
     proxyItem,
+    ...diagItems,
     { type: 'separator' },
     {
       label: 'Show / Hide',
@@ -1605,6 +1751,17 @@ app.whenReady().then(async () => {
   // and unaffected. Clipboard/undo work natively in inputs without a menu.
   Menu.setApplicationMenu(null);
   app.setAppUserModelId('com.atraderstool.desktop'); // Windows notifications attribution
+  // Diagnostic logger first, so every subsequent launch step is captured.
+  initDiag();
+  if (diag) {
+    const cfg = getProxyConfig();
+    dlog('main', 'app', 'start', {
+      version: app.getVersion(),
+      packaged: app.isPackaged,
+      portable: isPortableBuild(),
+      proxy: cfg ? { enabled: cfg.enabled, scheme: cfg.scheme, host: cfg.host, port: cfg.port } : null,
+    });
+  }
   setupSession();
   // Apply the saved proxy BEFORE the first window loads so the initial page load
   // (and the auto-updater on the default session) already goes through the tunnel.
@@ -1616,8 +1773,11 @@ app.whenReady().then(async () => {
   // so await one read on the app partition before creating ANY window. The
   // result itself doesn't gate anything — a genuinely logged-out user (no
   // session cookie) must still load and see the login page normally.
+  const cookieGateT0 = Date.now();
   try { await session.fromPartition(PARTITION).cookies.get({ url: APP_URL }); } catch (e) { /* non-fatal */ }
+  dlog('main', 'app', 'cookie-gate', { ms: Date.now() - cookieGateT0 });
   createWindow();
+  dlog('main', 'win', 'create-main', {});
   reopenFeatureWindows();   // restore feature windows that were open at last quit
   createTray();
   setupAutoUpdater();
@@ -1629,6 +1789,8 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  dlog('main', 'app', 'quit', {});
+  if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } }
 });
 
 app.on('window-all-closed', () => {
