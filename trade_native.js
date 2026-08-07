@@ -2457,6 +2457,68 @@ function krOrdersReconcile(orders, liveIds, now) {
   return gone;
 }
 
+// --- #1832 Kraken spot private-REST points ledger (pure) --------------------
+// Live diag proof (v1.5.44, 4.3min REPPO scalp): the #1826/#1828 fast lane
+// (TradesHistory 2 + OpenOrders 1 + BalanceEx 1 per ack burst) exhausted
+// Kraken's small private query counter (~15pts starter, decay ~0.33pt/s) and
+// Kraken then rejected WHATEVER came next — including CancelOrder (cancel_all
+// failed 2/6; a pressed Space left live orders). Kraken returns
+// `EAPI:Rate limit exceeded` INSIDE an HTTP 200 body, so `s:200` diag rows
+// looked healthy. Fix: a per-key token bucket mirroring the venue counter.
+// STRICT priority — order/cancel calls never wait behind queries (they spend
+// unconditionally); queries may spend only down to a reserved floor that
+// keeps enough points for a burst of cancels, else they defer briefly or
+// skip (fail-soft — the WS echo remains venue truth; a skipped confirm is
+// logged via kr_budget, never an error). Sits ABOVE the signer/nonce path:
+// gating happens before a nonce is drawn, so nonce serialization is intact.
+const KR_LEDGER_MAX = 15;          // starter-tier private query counter
+const KR_LEDGER_DECAY = 0.33;      // pts/s decay (starter — worst case)
+const KR_LEDGER_FLOOR = 6;         // reserved: a burst of priority calls
+const KR_QUERY_WAIT_MAX_MS = 2500; // queries defer at most this, then skip
+const KR_CANCEL_RETRY_MS = 5000;   // bounded rate-limited cancel retry
+const KR_CANCEL_RETRY_GAP_MS = 700;
+// Private path → { cls, cost } (Kraken docs: TradesHistory/Ledgers-family
+// cost 2, other queries 1; order entry/cancel ride a separate order limiter
+// but a saturated query counter still rejects them, so they spend 1 as
+// priority calls — recorded, never gated).
+function krCallCost(path) {
+  const p = String(path || '');
+  if (/CancelOrder|CancelAll|CancelOrderBatch/i.test(p)) return { cls: 'cancel', cost: 1 };
+  if (/AddOrder|EditOrder|AmendOrder/i.test(p)) return { cls: 'order', cost: 1 };
+  if (/TradesHistory|Ledgers|QueryLedgers|QueryTrades|ClosedOrders|QueryOrders/i.test(p)) {
+    return { cls: 'query', cost: 2 };
+  }
+  return { cls: 'query', cost: 1 };   // OpenOrders/BalanceEx/GetWebSocketsToken…
+}
+function krLedgerNew(now) { return { pts: KR_LEDGER_MAX, ts: Number(now) || 0 }; }
+function krLedgerRefill(L, now) {
+  const dt = Math.max(0, (Number(now) || 0) - L.ts) / 1000;
+  L.pts = Math.min(KR_LEDGER_MAX, L.pts + dt * KR_LEDGER_DECAY);
+  L.ts = Number(now) || 0;
+}
+// Gate a call: priority classes ('order'/'cancel') ALWAYS send (spend,
+// clamped at 0 — the venue counter can't go negative on our mirror);
+// queries send only while (pts - cost) stays >= the floor, else
+// { waitMs } (bounded defer) or { skip:true } when the wait exceeds the cap.
+function krLedgerGate(L, cls, cost, now) {
+  krLedgerRefill(L, now);
+  if (cls !== 'query') { L.pts = Math.max(0, L.pts - cost); return { send: true }; }
+  if (L.pts - cost >= KR_LEDGER_FLOOR) { L.pts -= cost; return { send: true }; }
+  const need = (KR_LEDGER_FLOOR + cost) - L.pts;
+  const waitMs = Math.ceil((need / KR_LEDGER_DECAY) * 1000);
+  if (waitMs > KR_QUERY_WAIT_MAX_MS) return { skip: true, waitMs: waitMs };
+  return { waitMs: waitMs };
+}
+// Venue said `EAPI:Rate limit` → our mirror was optimistic; drain to 0 so
+// queries back off for a full floor-refill while priority calls still send.
+function krLedgerDrain(L, now) { L.pts = 0; L.ts = Number(now) || 0; }
+// Non-mutating headroom peek (fast-lane trim decisions).
+function krLedgerPts(L, now) {
+  const dt = Math.max(0, (Number(now) || 0) - L.ts) / 1000;
+  return Math.min(KR_LEDGER_MAX, L.pts + dt * KR_LEDGER_DECAY);
+}
+function krIsRateLimited(msg) { return /rate ?limit/i.test(String(msg || '')); }
+
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
 // PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
 function krPositionRows(data) {
@@ -4445,12 +4507,37 @@ function createTradeNative(opts) {
   // PER KEY). Never more than one retry: these errors count toward Kraken's
   // rate limit.
   const KR_NONCE_RETRY_LEAD_MS = 1500;
-  async function krRequest(creds, method, market, path, params, route, _nretry) {
+  // #1832 per-spot-key points ledgers (runtime map over the pure ledger).
+  const krLedgers = {};   // spot api key → { pts, ts }
+  function krLedgerFor(key) {
+    return krLedgers[key] || (krLedgers[key] = krLedgerNew(Date.now()));
+  }
+  async function krRequest(creds, method, market, path, params, route, _nretry, _cxl0) {
     const pair = krPairFor(creds, market);
     if (!pair) {
       return { ok: false, message: market === 'futures'
         ? 'No Kraken futures API key saved — add a futures.kraken.com key pair'
         : 'No Kraken spot API key saved — add a kraken.com key pair' };
+    }
+    // #1832 points-ledger gate — spot private only, ABOVE the nonce/signer
+    // path (a deferred call draws its nonce after the wait, so the monotonic
+    // stream never inverts). Priority (order/cancel) never waits; queries
+    // defer down to the cancel-reserved floor, or skip (fail-soft, logged).
+    const krCC = market === 'futures' ? null : krCallCost(path);
+    if (krCC && !_nretry && !_cxl0) {
+      const led = krLedgerFor(pair.key);
+      for (;;) {
+        const g = krLedgerGate(led, krCC.cls, krCC.cost, Date.now());
+        if (g.send) break;
+        tdiag('trade', 'kr_budget', { k: 'kraken', p: path,
+          act: g.skip ? 'skip' : 'defer', waitMs: g.waitMs,
+          pts: Math.round(krLedgerPts(led, Date.now()) * 10) / 10 });
+        if (g.skip) {
+          return { ok: false, skipped: true,
+                   message: 'kr_budget: deferred by the rate-points ledger' };
+        }
+        await krWsSleep(g.waitMs);
+      }
     }
     const plist = (params || []).slice();
     const headers = {};
@@ -4505,7 +4592,28 @@ function createTradeNative(opts) {
       if (msg.indexOf('EAPI:Invalid nonce') >= 0 && !_nretry) {
         const bump = Date.now() + KR_NONCE_RETRY_LEAD_MS;
         if (bump > krNonceLast) krNonceLast = bump;
-        return krRequest(creds, method, market, path, params, route, true);
+        return krRequest(creds, method, market, path, params, route, true, _cxl0);
+      }
+      // #1832: `EAPI:Rate limit` rides an HTTP 200 body — mirror venue truth
+      // (drain our ledger so queries back off) and NEVER let a cancel fail
+      // silently: retry with short backoff until it lands or the bounded
+      // deadline passes, then fail LOUD (a silent failed Space is worse
+      // than a late error).
+      if (krIsRateLimited(msg) && krCC) {
+        try { krLedgerDrain(krLedgerFor(pair.key), Date.now()); } catch (e) {}
+        if (krCC.cls === 'cancel') {
+          const t0 = _cxl0 || Date.now();
+          if (Date.now() - t0 + KR_CANCEL_RETRY_GAP_MS < KR_CANCEL_RETRY_MS) {
+            tdiag('trade', 'kr_budget', { k: 'kraken', p: path,
+              act: 'cancel_retry', sinceMs: Date.now() - t0 });
+            await krWsSleep(KR_CANCEL_RETRY_GAP_MS);
+            return krRequest(creds, method, market, path, params, route,
+                             _nretry, t0);
+          }
+          return { ok: false, message:
+            'CANCEL FAILED — Kraken rate limit persisted ~5s (' + msg
+            + ') — check open orders NOW' };
+        }
       }
       return { ok: false, message: msg };
     }
@@ -6841,11 +6949,16 @@ function createTradeNative(opts) {
         // merging per-asset on top (both are venue truth, newest wins soon)
         sess.spot.totals = krBalanceExTotals(bal.data);
       }
-      const so = await krRequest(L.creds, 'POST', 'spot',
-                                 '/0/private/OpenOrders', null, L.route);
-      if (so.ok && sess) {
-        const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
-        krOrdersReconcile(sess.spot.orders, ids, Date.now());
+      // #1832 trim: OpenOrders exists to reconcile confirmed-gone rows — an
+      // EMPTY local map has nothing to reconcile, skip the point entirely.
+      let so = { ok: true, skipped: true };
+      if (!sess || Object.keys(sess.spot.orders || {}).length) {
+        so = await krRequest(L.creds, 'POST', 'spot',
+                             '/0/private/OpenOrders', null, L.route);
+        if (so.ok && sess) {
+          const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
+          krOrdersReconcile(sess.spot.orders, ids, Date.now());
+        }
       }
       // #1828 fast venue-truth fills: one recent-window TradesHistory page
       // rides the same confirm (nonce-serialized signer, coalesced burst).
@@ -6856,7 +6969,18 @@ function createTradeNative(opts) {
       // twice. Cache pushes are dedupe-only; the engine stays the archive's
       // sole writer via the panel's /native_fills POST.
       try {
-        if (sess && sess.spot.fills) {
+        // #1832 trim: TradesHistory is the fast lane's priciest call (2 pts)
+        // and only accelerates the fill chime — under ledger pressure skip
+        // it outright (the WS echo still lands, just later; logged, not an
+        // error). Priority (cancel) headroom is what the floor protects.
+        const krP = krPairFor(L.creds, 'spot');
+        const thOk = krP &&
+          krLedgerPts(krLedgerFor(krP.key), Date.now()) >= KR_LEDGER_FLOOR + 3;
+        if (!thOk) {
+          tdiag('trade', 'kr_budget', { k: 'kraken',
+            p: '/0/private/TradesHistory', act: 'skip_confirm' });
+        }
+        if (thOk && sess && sess.spot.fills) {
           let codeMap = {};
           try { codeMap = ((await krProducts(L.route)) || {}).spotCode || {}; } catch (e2) {}
           const th = await krRequest(L.creds, 'POST', 'spot',
@@ -6880,7 +7004,15 @@ function createTradeNative(opts) {
       // the confirm changed session state — bust again so a read memoized
       // during the confirm can't serve the pre-confirm view for ~1.2s
       try { execAcctRead.bust('kraken', slot); } catch (e) { /* diag-only */ }
-      tdiag('acct', 'kr_confirm', { ok: !!(bal.ok && so.ok) });
+      // #1832 diag honesty: carry the first Kraken error string + skip flag —
+      // body-level errors under HTTP 200 are otherwise invisible in the log.
+      const kcd = { ok: !!(bal.ok && so.ok) };
+      if (bal.skipped || so.skipped) kcd.skipped = true;
+      if (!kcd.ok) {
+        kcd.err = String((!bal.ok && bal.message) || (!so.ok && so.message)
+                         || '').slice(0, 120);
+      }
+      tdiag('acct', 'kr_confirm', kcd);
     } catch (e) { /* best-effort: the next steady-state read is the truth */ }
     if (krConfirmDone(L.st, Date.now())) krConfirmSchedule(slot, L);
   }
@@ -7472,6 +7604,10 @@ function createTradeNative(opts) {
                      market: intent.market, symbol: intent.symbol,
                      side: intent.side, qty: intent.qty,
                      ok: !!(r && r.ok), ms: Date.now() - diagT0 };
+        // #1832 diag honesty: the venue error string (first error code) on
+        // every failed trade — Kraken's EAPI:Rate limit rides an HTTP 200
+        // body, so without this the log shows only healthy-looking s:200.
+        if (!dd.ok && r && r.message) dd.err = String(r.message).slice(0, 120);
         tdiag('trade', op, dd);
       }
     }
@@ -7658,6 +7794,18 @@ module.exports = {
   krAssetWsName,
   krBalanceExTotals,
   krOrdersReconcile,
+  // pure — Kraken private-REST points ledger (#1832)
+  KR_LEDGER_MAX,
+  KR_LEDGER_DECAY,
+  KR_LEDGER_FLOOR,
+  KR_QUERY_WAIT_MAX_MS,
+  KR_CANCEL_RETRY_MS,
+  krCallCost,
+  krLedgerNew,
+  krLedgerGate,
+  krLedgerDrain,
+  krLedgerPts,
+  krIsRateLimited,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
   krRestSpotWsRow,
