@@ -2157,6 +2157,28 @@ function krRestSpotWsRow(tid, t, codeMap) {
   if (t.cost != null) row.cost = String(t.cost);
   return row;
 }
+// Seed pagination (pure): spot TradesHistory is offset-paged (50/page,
+// server-side start bound); returns the next `ofs` or null when the window
+// is covered. Mirrors the engine's _spot_trades_walk termination rule.
+function krSeedSpotNext(res, ofs, got) {
+  if (!got || got < 50) return null;
+  const total = Number((res || {}).count) || 0;
+  const next = ofs + got;
+  return next < total ? next : null;
+}
+// Futures /api/v3/fills pages BACKWARDS via lastFillTime (≤100 fills before
+// it). Returns the next cursor ISO, or null once a short page arrives or the
+// page already reaches past startMs. Mirrors the engine's _fut_fills_walk.
+function krSeedFutNext(fills, startMs) {
+  if (!Array.isArray(fills) || fills.length < 100) return null;
+  let oldest = null;
+  for (const f of fills) {
+    const t = Date.parse(String(((f || {}).fillTime) || ''));
+    if (Number.isFinite(t) && (oldest === null || t < oldest)) oldest = t;
+  }
+  if (oldest === null || oldest <= startMs) return null;
+  return new Date(oldest).toISOString();
+}
 // Futures GET /derivatives/api/v3/fills row → ws/v1 fills feed shape.
 function krRestFutWsRow(f) {
   if (!f || typeof f !== 'object' || !String(f.fill_id || '')) return null;
@@ -6604,7 +6626,14 @@ function createTradeNative(opts) {
   // shapes (krRestSpotWsRow / krRestFutWsRow) and dedupe by exec id — never a
   // second record of a fill the WS already cached. NOT a steady-state REST
   // poller (#1804 rule): strictly rate-limited per session, panel-triggered.
+  // PAGED: default responses cover only the last ~50/100 rows (same bound as
+  // the WS snapshots), so the seed walks the FULL panel POST window (24h)
+  // with the engine walkers' cursors — spot start+ofs, futures lastFillTime —
+  // bounded by KR_FILLS_SEED_MAX_PAGES and paced between calls.
   const KR_FILLS_SEED_MIN_MS = 15000;
+  const KR_FILLS_SEED_WINDOW_MS = 24 * 3600 * 1000;  // = panel fresh-session POST window
+  const KR_FILLS_SEED_MAX_PAGES = 5;
+  const KR_FILLS_SEED_PAGE_GAP_MS = 400;
   async function execKrakenFillsSeed(intent) {
     const creds = credsGet(intent.credSlot || 'kraken');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -6616,26 +6645,43 @@ function createTradeNative(opts) {
       return { ok: true, paced: true, spot: 0, futures: 0 };
     }
     sess.seedT = now;
+    const startMs = now - KR_FILLS_SEED_WINDOW_MS;
     const out = { ok: true, spot: 0, futures: 0 };
     if (krPairFor(creds, 'spot')) {
-      const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory', null, route);
-      if (!th.ok) return th;
       let codeMap = {};
       try { codeMap = ((await krProducts(route)) || {}).spotCode || {}; } catch (e) {}
-      const trades = (((th.data || {}).result) || {}).trades || {};
-      for (const tid of Object.keys(trades)) {
-        const e = krRestSpotWsRow(tid, trades[tid], codeMap);
-        const r = e && krWsSpotFillRow(e);
-        if (r && krFillsCachePush(sess.spot.fills, r)) out.spot++;
+      let ofs = 0;
+      for (let page = 0; page < KR_FILLS_SEED_MAX_PAGES && ofs !== null; page++) {
+        if (page) await new Promise((rs) => setTimeout(rs, KR_FILLS_SEED_PAGE_GAP_MS));
+        const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory',
+          [['start', String(startMs / 1000)], ['ofs', String(ofs)]], route);
+        if (!th.ok) return th;
+        const res = ((th.data || {}).result) || {};
+        const trades = res.trades || {};
+        const tids = Object.keys(trades);
+        for (const tid of tids) {
+          const e = krRestSpotWsRow(tid, trades[tid], codeMap);
+          const r = e && krWsSpotFillRow(e);
+          if (r && krFillsCachePush(sess.spot.fills, r)) out.spot++;
+        }
+        ofs = krSeedSpotNext(res, ofs, tids.length);
       }
     }
     if (krPairFor(creds, 'futures')) {
-      const fh = await krRequest(creds, 'GET', 'futures', '/derivatives/api/v3/fills', null, route);
-      if (!fh.ok) return fh;
-      for (const f of ((fh.data || {}).fills) || []) {
-        const e = krRestFutWsRow(f);
-        const r = e && krWsFutFillRow(e);
-        if (r && krFillsCachePush(sess.fut.fills, r)) out.futures++;
+      let cursor = null;
+      for (let page = 0; page < KR_FILLS_SEED_MAX_PAGES; page++) {
+        if (page) await new Promise((rs) => setTimeout(rs, KR_FILLS_SEED_PAGE_GAP_MS));
+        const fh = await krRequest(creds, 'GET', 'futures', '/derivatives/api/v3/fills',
+          cursor ? [['lastFillTime', cursor]] : null, route);
+        if (!fh.ok) return fh;
+        const fills = ((fh.data || {}).fills) || [];
+        for (const f of fills) {
+          const e = krRestFutWsRow(f);
+          const r = e && krWsFutFillRow(e);
+          if (r && krFillsCachePush(sess.fut.fills, r)) out.futures++;
+        }
+        cursor = krSeedFutNext(fills, startMs);
+        if (!cursor) break;
       }
     }
     return out;
@@ -7278,6 +7324,8 @@ module.exports = {
   krWsSpotFillRow,
   krRestSpotWsRow,
   krRestFutWsRow,
+  krSeedSpotNext,
+  krSeedFutNext,
   krWsFutFillRow,
   krFillsCachePush,
   krFillsWindow,
