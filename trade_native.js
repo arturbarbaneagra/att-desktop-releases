@@ -2125,6 +2125,14 @@ function krFillsWindow(C, startMs, endMs) {
   }
   return out;
 }
+// fills_read per-scope gate: a scope is readable ONLY when its WS is live
+// AND the seed snapshot (spot snap_trades / futures fills_snapshot) has
+// landed. An empty read before seeding would let the panel advance its
+// coverage cursor past the seed window — snapshot fills arriving later
+// would then fall outside the 2-min overlap and never reach the archive.
+function krFillsScopeReady(live, C) {
+  return !!(live && C && C.seeded);
+}
 // ws/v1 open_orders order dict → REST openorders row shape (qty=REMAINING;
 // direction 1=sell; type limit/stop/take_profit → lmt/stop/take_profit).
 function krWsFutOrderRest(o) {
@@ -4449,7 +4457,13 @@ function createTradeNative(opts) {
           return;
         }
         if (msg.channel === 'executions') {
-          if (String(msg.type || '') === 'snapshot') S.orders = {};
+          if (String(msg.type || '') === 'snapshot') {
+            S.orders = {};
+            // #1814: the snap_trades snapshot IS the fills seed — until it
+            // lands, fills_read must NOT report this scope (an empty read
+            // would advance the panel cursor past the seed window).
+            if (S.fills) S.fills.seeded = true;
+          }
           for (const e of (msg.data || [])) {
             if (!e || typeof e !== 'object') continue;
             // #1814: trade executions feed the native fills cache (dedupe
@@ -4624,11 +4638,14 @@ function createTradeNative(opts) {
         } else if (feed === 'fills_snapshot' || feed === 'fills') {
           // #1814: native fills cache — the snapshot (last 100 fills) is
           // the futures seed back-record; fill_id dedupes the overlap.
-          // Deliberately NOT part of ready(): fills never gate the scope.
+          // NOT part of ready() (fills never gate trading), but the seeded
+          // flag gates fills_read: an empty read before the snapshot lands
+          // would advance the panel cursor past the seed window.
           for (const f of (msg.fills || [])) {
             const fr = krWsFutFillRow(f);
             if (fr) krFillsCachePush(F.fills, fr);
           }
+          if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
         }
         // heartbeat frames → liveness only
       });
@@ -6513,17 +6530,17 @@ function createTradeNative(opts) {
     if (end - start > 26 * 3600 * 1000) start = end - 26 * 3600 * 1000;
     const out = { ok: true, wsSpot: false, wsFut: false, spot: [], futures: [] };
     if (krPairFor(creds, 'spot')) {
-      if (!(sess && krWsLive(sess.spot))) {
+      if (!krFillsScopeReady(sess && krWsLive(sess.spot), sess && sess.spot.fills)) {
         return { ok: false, message: (sess && (sess.spot.err || sess.fut.err))
-                                     || 'Kraken spot WS not connected' };
+                                     || 'Kraken spot fills not seeded yet' };
       }
       out.wsSpot = true;
       out.spot = krFillsWindow(sess.spot.fills, start, end);
     }
     if (krPairFor(creds, 'futures')) {
-      if (!(sess && krWsLive(sess.fut))) {
+      if (!krFillsScopeReady(sess && krWsLive(sess.fut), sess && sess.fut.fills)) {
         return { ok: false, message: (sess && (sess.fut.err || sess.spot.err))
-                                     || 'Kraken futures WS not connected' };
+                                     || 'Kraken futures fills not seeded yet' };
       }
       out.wsFut = true;
       out.futures = krFillsWindow(sess.fut.fills, start, end);
@@ -7163,6 +7180,7 @@ module.exports = {
   krWsFutFillRow,
   krFillsCachePush,
   krFillsWindow,
+  krFillsScopeReady,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
