@@ -2129,8 +2129,15 @@ function acctRlWaitMs(venue, hintMs) {
 }
 // Guard factory: wraps the raw per-venue dispatcher. Pure state machine over
 // an injectable clock so the dedup/backoff behavior is node-testable.
-function acctReadGuard(runRaw, nowFn) {
+// Optional onEvent(ev, info) diagnostic tap (#1786): 'paced' (cool-down
+// short-circuit), 'memo' (fresh-result reuse), 'coalesced' (joined an
+// in-flight train). Injected, never required — the guard stays pure.
+function acctReadGuard(runRaw, nowFn, onEvent) {
   const now = typeof nowFn === 'function' ? nowFn : Date.now;
+  const emit = (ev, info) => {
+    if (typeof onEvent !== 'function') return;
+    try { onEvent(ev, info); } catch (e) { /* diagnostics never break reads */ }
+  };
   const rlUntil = {};    // venue → cool-down end ts
   const inflight = {};   // venue|credSlot → in-flight promise
   const memo = {};       // venue|credSlot → { ts, r }
@@ -2140,12 +2147,13 @@ function acctReadGuard(runRaw, nowFn) {
     const t0 = now();
     const left = (rlUntil[venue] || 0) - t0;
     if (left > 0) {
+      emit('paced', { venue: venue, retryInMs: left });
       return { ok: false, rateLimited: true, retryInMs: left,
                message: 'Rate limited — pacing reads, retry in ' + Math.ceil(left / 1000) + 's' };
     }
     const m = memo[key];
-    if (m && t0 - m.ts < ACCT_READ_MEMO_MS) return m.r;
-    if (inflight[key]) return await inflight[key];
+    if (m && t0 - m.ts < ACCT_READ_MEMO_MS) { emit('memo', { venue: venue }); return m.r; }
+    if (inflight[key]) { emit('coalesced', { venue: venue }); return await inflight[key]; }
     const p = (async () => {
       const r = await runRaw(intent);
       if (acctRlHit(r)) {
@@ -2175,6 +2183,15 @@ function createTradeNative(opts) {
   const getProxyConfig = opts.getProxyConfig;
   const senderOk = opts.senderOk;              // top-level app-origin frame gate
   const userDataDir = opts.userDataDir;        // function → app.getPath('userData')
+  // Admin diagnostic tap (#1786) — optional; no-op when absent (regular users).
+  // HARD RULE at every call site below: only secret-free summaries are passed
+  // (host/path/method/status/ms/row counts) — NEVER headers, query strings
+  // (they carry signatures), bodies, or creds. The logger sanitizes again.
+  const diagTap = typeof opts.diag === 'function' ? opts.diag : null;
+  function tdiag(cat, ev, data) {
+    if (!diagTap) return;
+    try { diagTap(cat, ev, data); } catch (e) { /* diagnostics never break trading */ }
+  }
 
   const credsFile = () => path.join(userDataDir(), 'trade_creds.json');
 
@@ -2304,6 +2321,7 @@ function createTradeNative(opts) {
   function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
     const attempt = () => new Promise((resolve, reject) => {
+      const diagT0 = Date.now();
       // Per-attempt transmit flag: flipped only after the request has fully
       // flushed to a live (TLS-complete) socket. An error with sent=false is
       // a connect-phase failure — nothing reached the venue.
@@ -2333,6 +2351,13 @@ function createTradeNative(opts) {
           // Field diagnosability: remember whether this request rode a warm
           // (reused) socket — surfaced via lastSocketReused() in the exec echo.
           _lastReused = !!req.reusedSocket;
+          // Diag: method/host/PATH ONLY (query carries signatures), status,
+          // latency, body size + truncation flag, socket reuse. Rate-limit
+          // key = host so one venue's burst can't drown the others.
+          tdiag('http', 'res', { k: host, host: host, m: method, p: reqPath,
+                                 s: res.statusCode, ms: Date.now() - diagT0,
+                                 b: buf.length, tr: buf.length >= cap,
+                                 reused: !!req.reusedSocket });
           resolve({ status: res.statusCode, text: buf,
                     date: (res.headers && res.headers.date) || null,
                     // #1724: Retry-After surfaced so 429 branches can hand the
@@ -2346,7 +2371,13 @@ function createTradeNative(opts) {
       // honest pre/post-transmit boundary.
       req.on('finish', () => { sent = true; });
       req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) { /* noop */ } });
-      req.on('error', (e) => { try { if (e && typeof e === 'object') e.reqSent = sent; } catch (e2) {} reject(e); });
+      req.on('error', (e) => {
+        tdiag('http', 'err', { k: host, host: host, m: method, p: reqPath,
+                               ms: Date.now() - diagT0, sent: sent,
+                               code: (e && e.code) || '', msg: (e && e.message) || 'error' });
+        try { if (e && typeof e === 'object') e.reqSent = sent; } catch (e2) {}
+        reject(e);
+      });
       req.end(bodyStr || '');
     });
     // Phase-aware retry (ONE retry total): connect-phase failures where the
@@ -2399,7 +2430,11 @@ function createTradeNative(opts) {
         sv = spec.ext(JSON.parse(r.text));
       }
       if (isFinite(sv) && sv > 1e12) st.offsetMs = venueClkOffset(sv, t0, t1);
-    } catch (e) { /* keep last offset (0 initially — engine-parity behavior) */ }
+      tdiag('clk', 'probe', { k: key, venue: venue, offsetMs: st.offsetMs, ms: t1 - t0 });
+    } catch (e) {
+      tdiag('clk', 'probe-fail', { k: key, venue: venue, msg: (e && e.message) || 'error' });
+      /* keep last offset (0 initially — engine-parity behavior) */
+    }
     return st.offsetMs;
   }
 
@@ -5215,7 +5250,8 @@ function createTradeNative(opts) {
   // (acctReadGuard above): cool-down short-circuit after a venue rate-limits,
   // one in-flight request train per venue+account shared across all boards
   // AND windows (this main process is the single funnel), short result memo.
-  const execAcctRead = acctReadGuard(execAcctReadRaw, Date.now);
+  const execAcctRead = acctReadGuard(execAcctReadRaw, Date.now,
+    (ev, info) => tdiag('acct', ev, info));
   async function execAcctReadRaw(intent) {
     if (intent.venue === 'binance') return await execBinanceAcctRead(intent);
     if (intent.venue === 'phemex') return await execPhemexAcctRead(intent);
@@ -6232,6 +6268,8 @@ function createTradeNative(opts) {
     if (!creds || typeof creds !== 'object') return { ok: false, error: 'bad-creds' };
     const r = credsSet(sn.slot, creds);
     if (r && r.ok) warmVenue(sn.base);   // arm → pre-open one warm connection
+    // Diag: the ARM event only — slot name, success. NEVER key material.
+    tdiag('acct', 'arm', { slot: sn.slot, ok: !!(r && r.ok) });
     return r;
   });
   ipcMain.handle('att:trade-creds-wipe', (event, venue) => {
@@ -6244,8 +6282,25 @@ function createTradeNative(opts) {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
     return credsStatus();
   });
+  // Diag: array-field row counts of a read result (positions/orders/wallets/
+  // fills lengths) — counts only, never row contents.
+  function diagRowCounts(r) {
+    const out = {};
+    if (!r || typeof r !== 'object') return out;
+    for (const k of Object.keys(r)) {
+      if (Array.isArray(r[k])) out[k] = r[k].length;
+      else if (r[k] && typeof r[k] === 'object') {
+        for (const k2 of Object.keys(r[k])) {
+          if (Array.isArray(r[k][k2])) out[k + '.' + k2] = r[k][k2].length;
+        }
+      }
+    }
+    return out;
+  }
+
   ipcMain.handle('att:trade-exec', async (event, intent) => {
     if (!senderOk(event)) return { ok: false, message: 'forbidden' };
+    const diagT0 = Date.now();
     const r = await execIntent(intent);
     // Echo the path this exec ACTUALLY used (agentFor is the same pick every
     // request in the intent rode) so the panel can label "Trading:
@@ -6260,6 +6315,25 @@ function createTradeNative(opts) {
         if (_lastReused !== null) r.via.reused = _lastReused;
       }
       catch (e) { /* non-fatal — label just stays pending */ }
+    }
+    // Diag summaries for the read + order layers (#1786), after the via stamp
+    // (test pins slice the handler head). Orders log venue/market/symbol/side/
+    // qty ONLY (design rule); reads log status, pacing and row counts.
+    if (diagTap && intent && typeof intent === 'object') {
+      const op = String(intent.op || '');
+      if (op === 'acct_read' || op === 'fills_read') {
+        const dd = { k: String(intent.venue || ''), venue: intent.venue,
+                     market: intent.market, ok: !!(r && r.ok),
+                     paced: !!(r && r.rateLimited), ms: Date.now() - diagT0,
+                     rows: diagRowCounts(r && r.data ? r.data : r) };
+        tdiag('acct', op, dd);
+      } else if (op === 'order' || op === 'cancel' || op === 'cancel_all' || op === 'close_pos') {
+        const dd = { k: String(intent.venue || ''), venue: intent.venue,
+                     market: intent.market, symbol: intent.symbol,
+                     side: intent.side, qty: intent.qty,
+                     ok: !!(r && r.ok), ms: Date.now() - diagT0 };
+        tdiag('trade', op, dd);
+      }
     }
     return r;
   });

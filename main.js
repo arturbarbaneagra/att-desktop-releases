@@ -48,6 +48,36 @@ function isScratchFeatureId(f) {
 // Lockstep with the terminal_trades / terminal_watchlist entries in POPOUT_FEATURES
 // (panel.html).
 const SECTION_FEATURE_IDS = ['terminal_trades', 'terminal_watchlist', 'terminal_alerts'];
+// Sniffing-session + snoop pop-outs (#1794): DYNAMIC id families like scratch —
+// sniff_win_<encoded-session-id> (one window per sniffing session) and
+// snoop_win_<hash> (one window per snooped wallet+coin). Open-ended families →
+// recognized by predicate, kept OUT of FEATURE_IDS. Both are restored at launch
+// when open at last quit (a sniff session that no longer exists renders an
+// honest "session ended" note the user closes). User-closing ANY window of
+// these families deletes its per-id saved state outright (session/wallet ids
+// are transient — keeping open:false rows + bounds forever would grow settings
+// without bound; see registerFeatureWindow). Lockstep with _sniffPopFid /
+// _snoopPopFid + _popoutFeatureId in panel.html.
+function isSniffWinFeatureId(f) {
+  return typeof f === 'string' && /^sniff_win_[A-Za-z0-9_-]{1,100}$/.test(f);
+}
+function isSnoopWinFeatureId(f) {
+  return typeof f === 'string' && /^snoop_win_[0-9a-f]{8}$/.test(f);
+}
+function isDynFeatureId(f) {
+  return isSniffWinFeatureId(f) || isSnoopWinFeatureId(f);
+}
+// Backstop cap for the dynamic families: the panel enforces its own cap with a
+// user-facing toast BEFORE window.open (localStorage alive roster); this guard
+// only refuses runaway window creation if that ever fails.
+const DYN_FEATURE_WIN_CAP = 8;
+function dynFeatureWinCount() {
+  let n = 0;
+  for (const [id, w] of featureWindows) {
+    if (isDynFeatureId(id) && w && !w.isDestroyed()) n += 1;
+  }
+  return n;
+}
 
 // ---------------------------------------------------------------------------
 // Admin-only diagnostic logger (#1786) — see diag_log.js. `diag` stays null
@@ -170,7 +200,7 @@ function featureIdFromUrl(url) {
     // dynamic scratch windows so window.open spawns a real new window for any of
     // them. Feature windows + scratch windows are reopened on launch when they were
     // open at last quit; section pop-outs likewise (see reopenFeatureWindows).
-    return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f) || isScratchFeatureId(f)) ? f : null;
+    return (FEATURE_IDS.includes(f) || SECTION_FEATURE_IDS.includes(f) || isScratchFeatureId(f) || isDynFeatureId(f)) ? f : null;
   } catch (e) {
     return null;
   }
@@ -190,6 +220,15 @@ function rawFeatureIdFromUrl(url) {
   } catch (e) {
     return null;
   }
+}
+
+// Delete a feature window's saved record entirely (dynamic-family ids only —
+// per-session ids must not pile up as dead settings rows; #1794).
+function removeFeatureWindowState(id) {
+  const cur = loadSettings();
+  const fw = Object.assign({}, cur.featureWindows || {});
+  delete fw[id];
+  saveSettings({ featureWindows: fw });
 }
 
 // Merge a patch into settings.featureWindows[id] (bounds / open flag).
@@ -325,6 +364,9 @@ function makeWindowOpenHandler(win) {
         // above other apps. Deny the window.open so Electron makes no owned child.
         // Pass the FULL url so deep-link params (hv/haddr/hcoin) survive the hop —
         // reopen-on-launch still uses the bare ?feature=<id> URL (no stale wallet).
+        // Dynamic sniff/snoop families ride a silent backstop cap (the panel
+        // already toasted + refused at its own cap before window.open).
+        if (isDynFeatureId(id) && dynFeatureWinCount() >= DYN_FEATURE_WIN_CAP) return { action: 'deny' };
         createFeatureWindow(id, url);
         return { action: 'deny' };
       }
@@ -530,7 +572,12 @@ function registerFeatureWindow(win, id) {
   // keep open:true so the whole arrangement is restored. isQuitting tells them
   // apart. Feature windows never minimize to tray — default close destroys them.
   win.on('close', () => {
-    if (!isQuitting) saveFeatureWindowState(id, { open: false });
+    if (isQuitting) return;
+    // Dynamic-family ids (sniff/snoop, #1794) are transient: a user close
+    // deletes the whole saved record (bounds included) instead of keeping
+    // open:false rows for session ids that will never come back.
+    if (isDynFeatureId(id)) removeFeatureWindowState(id);
+    else saveFeatureWindowState(id, { open: false });
   });
   win.on('closed', () => {
     if (featureWindows.get(id) === win) featureWindows.delete(id);
@@ -573,7 +620,7 @@ function reopenFeatureWindows() {
   const fw = loadSettings().featureWindows || {};
   let n = 0;
   Object.keys(fw).forEach((id) => {
-    if ((FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id)) && fw[id] && fw[id].open) {
+    if ((FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id) || isDynFeatureId(id)) && fw[id] && fw[id].open) {
       n += 1;
       createFeatureWindow(id, null, 300 * n);
     }
