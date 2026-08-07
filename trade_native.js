@@ -2340,6 +2340,20 @@ function krSynPrune(orders, now) {
   }
   return n;
 }
+// Snapshot-race carry: the spot session goes live on the subscribe ACKs,
+// BEFORE its executions snapshot is applied — an order ACKed in that gap
+// writes a synthetic row the (older) snapshot cannot contain, so a plain
+// `S.orders = {}` reset would erase it and resurrect the multi-second
+// missing-badge/hold gap. Carry ONLY still-fresh synthetic rows across the
+// reset; they stay TTL-bounded (krSynPrune) and echo-confirmed as usual.
+function krSynCarry(orders, now) {
+  const kept = {};
+  for (const oid of Object.keys(orders || {})) {
+    const ts = (orders[oid] || {})._synTs;
+    if (ts != null && now - ts <= KR_SYN_TTL_MS) kept[oid] = orders[oid];
+  }
+  return kept;
+}
 // cancel_all ACK sweep: drop every row on the symbol. field = 'symbol'
 // (spot WS-v2 rows) or 'instrument' (futures ws/v1 rows); case-insensitive.
 function krSynSweepSymbol(orders, symbol, field) {
@@ -4579,7 +4593,9 @@ function createTradeNative(opts) {
         }
         if (msg.channel === 'executions') {
           if (String(msg.type || '') === 'snapshot') {
-            S.orders = {};
+            // #1822: keep fresh optimistic rows — a snapshot captured before
+            // a just-ACKed order must not erase its synthetic badge/hold
+            S.orders = krSynCarry(S.orders, Date.now());
             // #1814: the snap_trades snapshot IS the fills seed — until it
             // lands, fills_read must NOT report this scope (an empty read
             // would advance the panel cursor past the seed window).
@@ -4736,7 +4752,10 @@ function createTradeNative(opts) {
         }
         const feed = String(msg.feed || '');
         if (feed === 'open_orders_snapshot') {
-          F.orders = {};
+          // #1822: same snapshot race as spot — REST order acks are
+          // WS-independent, so a reconnect snapshot older than a just-ACKed
+          // order must not erase its fresh synthetic row
+          F.orders = krSynCarry(F.orders, Date.now());
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
             if (oid) F.orders[oid] = o;
@@ -7431,6 +7450,7 @@ module.exports = {
   krSynSpotOrder,
   krSynFutOrder,
   krSynPrune,
+  krSynCarry,
   krSynSweepSymbol,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
