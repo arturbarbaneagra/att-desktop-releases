@@ -2080,6 +2080,51 @@ function krWsPermMsg(err) {
 }
 // Spot WS-v2 executions order_status values that mean the order LEFT the book.
 const KR_WS_SPOT_GONE = { filled: 1, canceled: 1, cancelled: 1, expired: 1 };
+// --- Kraken native fills cache (#1814) --------------------------------------
+// The WS sessions ingest executions into a bounded per-scope cache so a
+// device-key-only setup has a fills source (the server engine has no key).
+// RAW venue rows are cached verbatim — the ENGINE parses them with its own
+// normalizers via /native_fills (single parser truth, phemex precedent).
+// Spot WS-v2 executions trade event → cache row. null = not a trade fill.
+function krWsSpotFillRow(e) {
+  if (!e || typeof e !== 'object') return null;
+  if (String(e.exec_type || '') !== 'trade') return null;
+  if (!String(e.exec_id || e.trade_id || '')) return null;
+  if (!(Number(e.last_qty) > 0)) return null;
+  const ts = e.timestamp ? Date.parse(e.timestamp) : NaN;
+  return { id: String(e.exec_id || e.trade_id),
+           ts: Number.isFinite(ts) ? ts : Date.now(), raw: e };
+}
+// Futures ws/v1 `fills` feed row → cache row. fill_id keys the dedupe — the
+// SAME id REST /derivatives/api/v3/fills publishes, so engine-side dedupe
+// keys stay identical to engine-fetched copies.
+function krWsFutFillRow(f) {
+  if (!f || typeof f !== 'object') return null;
+  if (!String(f.fill_id || '')) return null;
+  if (!(Number(f.qty) > 0)) return null;
+  return { id: String(f.fill_id), ts: Number(f.time) || 0, raw: f };
+}
+// Bounded dedupe push; oldest rows (and their seen keys) roll off past cap.
+function krFillsCachePush(C, row, cap) {
+  if (!C || !row) return false;
+  if (C.seen[row.id]) return false;
+  cap = cap || 500;
+  C.seen[row.id] = 1;
+  C.rows.push(row);
+  if (C.rows.length > cap) {
+    const drop = C.rows.splice(0, C.rows.length - cap);
+    for (const d of drop) delete C.seen[d.id];
+  }
+  return true;
+}
+// fills_read window filter: RAW rows with ts inside [startMs, endMs].
+function krFillsWindow(C, startMs, endMs) {
+  const out = [];
+  for (const r of ((C && C.rows) || [])) {
+    if (r.ts >= startMs && r.ts <= endMs) out.push(r.raw);
+  }
+  return out;
+}
 // ws/v1 open_orders order dict → REST openorders row shape (qty=REMAINING;
 // direction 1=sell; type limit/stop/take_profit → lmt/stop/take_profit).
 function krWsFutOrderRest(o) {
@@ -4293,9 +4338,11 @@ function createTradeNative(opts) {
       s = krWsSessions[slot] = {
         tail: tail, closed: false, route: routeNorm(route),
         spot: { running: false, up: false, ws: null, err: null, lastMsg: 0,
-                orders: {}, totals: null, reqId: 0, pending: {} },
+                orders: {}, totals: null, reqId: 0, pending: {},
+                fills: { rows: [], seen: {} } },
         fut: { running: false, up: false, ws: null, err: null, lastMsg: 0,
-               orders: {}, positions: null, flex: null },
+               orders: {}, positions: null, flex: null,
+               fills: { rows: [], seen: {} } },
       };
     }
     if (krPairFor(creds, 'spot') && !s.spot.running) krWsSpotLoop(slot, s, creds);
@@ -4367,9 +4414,12 @@ function createTradeNative(opts) {
       ws.on('open', () => {
         S.lastMsg = Date.now();
         try {
+          // snap_trades: the subscribe-time snapshot back-records the 50
+          // most recent trades — the fills seed window (#1814; fills made
+          // before the socket came up must not stick OPEN in the blotter).
           ws.send(JSON.stringify({ method: 'subscribe', params: {
             channel: 'executions', token: token,
-            snap_orders: true, snap_trades: false } }));
+            snap_orders: true, snap_trades: true } }));
           ws.send(JSON.stringify({ method: 'subscribe', params: {
             channel: 'balances', token: token } }));
         } catch (e) { done(e); }
@@ -4402,6 +4452,13 @@ function createTradeNative(opts) {
           if (String(msg.type || '') === 'snapshot') S.orders = {};
           for (const e of (msg.data || [])) {
             if (!e || typeof e !== 'object') continue;
+            // #1814: trade executions feed the native fills cache (dedupe
+            // by exec_id — snapshot + live overlap is a no-op). Snapshot
+            // trade rows may carry NO order_status: never let one land in
+            // the open-orders map as a phantom row.
+            const fr = krWsSpotFillRow(e);
+            if (fr) krFillsCachePush(S.fills, fr);
+            if (fr && e.order_status == null) continue;
             const oid = String(e.order_id || '');
             if (!oid) continue;
             if (KR_WS_SPOT_GONE[String(e.order_status || '').toLowerCase()]) {
@@ -4523,7 +4580,7 @@ function createTradeNative(opts) {
           try { signed = krFutWsSign(pair.secret, msg.message); }
           catch (e) { done(new Error('invalid futures secret')); return; }
           try {
-            for (const feed of ['open_orders', 'open_positions', 'balances']) {
+            for (const feed of ['open_orders', 'open_positions', 'balances', 'fills']) {
               ws.send(JSON.stringify({ event: 'subscribe', feed: feed,
                                        api_key: pair.key,
                                        original_challenge: msg.message,
@@ -4564,8 +4621,16 @@ function createTradeNative(opts) {
             F.flex = msg.flex_futures;
             ready();
           }
+        } else if (feed === 'fills_snapshot' || feed === 'fills') {
+          // #1814: native fills cache — the snapshot (last 100 fills) is
+          // the futures seed back-record; fill_id dedupes the overlap.
+          // Deliberately NOT part of ready(): fills never gate the scope.
+          for (const f of (msg.fills || [])) {
+            const fr = krWsFutFillRow(f);
+            if (fr) krFillsCachePush(F.fills, fr);
+          }
         }
-        // fills / heartbeat frames → liveness only (device keeps fills [])
+        // heartbeat frames → liveness only
       });
       ws.on('error', (e) => done(e || new Error('ws error')));
       ws.on('close', () => done(new Error('stream closed')));
@@ -6425,6 +6490,47 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // Kraken native fills read (#1814): the private WS sessions above INGEST
+  // executions (spot WS-v2 `executions` trade events incl. the snap_trades
+  // seed snapshot; futures ws/v1 `fills` feed incl. its last-100 snapshot)
+  // into bounded per-scope caches. This op serves the cached RAW venue rows
+  // for [startMs, endMs]; the panel POSTs them to the engine's /native_fills
+  // where kraken-shape normalizers parse them (engine stays the archive's
+  // ONLY writer — phemex precedent). Fail-visible per scope: a key pair
+  // whose WS is not live fails the WHOLE read so the panel never advances
+  // its coverage cursor over a blind spot (no REST fallback — steady-state
+  // REST nonce use is exactly what #1804 removed).
+  async function execKrakenFillsRead(intent) {
+    const creds = credsGet(intent.credSlot || 'kraken');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const sess = krWsEnsure(intent.credSlot || 'kraken', creds, route);
+    const now = Date.now();
+    let end = Math.floor(Number(intent.endMs) || 0);
+    if (!(end > 0) || end > now + 60000) end = now;
+    let start = Math.floor(Number(intent.startMs) || 0);
+    if (!(start > 0) || start >= end) start = end - 24 * 3600 * 1000;
+    if (end - start > 26 * 3600 * 1000) start = end - 26 * 3600 * 1000;
+    const out = { ok: true, wsSpot: false, wsFut: false, spot: [], futures: [] };
+    if (krPairFor(creds, 'spot')) {
+      if (!(sess && krWsLive(sess.spot))) {
+        return { ok: false, message: (sess && (sess.spot.err || sess.fut.err))
+                                     || 'Kraken spot WS not connected' };
+      }
+      out.wsSpot = true;
+      out.spot = krFillsWindow(sess.spot.fills, start, end);
+    }
+    if (krPairFor(creds, 'futures')) {
+      if (!(sess && krWsLive(sess.fut))) {
+        return { ok: false, message: (sess && (sess.fut.err || sess.spot.err))
+                                     || 'Kraken futures WS not connected' };
+      }
+      out.wsFut = true;
+      out.futures = krFillsWindow(sess.fut.fills, start, end);
+    }
+    return out;
+  }
+
   // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
   // panel's "Catalogs & candles: Native" axis (Phemex REST has no CORS, so
   // the fetch must run here in the main process; honors the user proxy via
@@ -6630,8 +6736,9 @@ function createTradeNative(opts) {
     // Phemex native fills read (Your-trades archive source on device-key-only
     // setups) — creds-signed but read-only; venue-gated (Phemex-first pattern).
     if (intent && typeof intent === 'object' && intent.op === 'fills_read') {
-      if (intent.venue !== 'phemex') return { ok: false, message: 'fills_read not supported for this venue' };
-      return await execPhemexFillsRead(intent);
+      if (intent.venue === 'phemex') return await execPhemexFillsRead(intent);
+      if (intent.venue === 'kraken') return await execKrakenFillsRead(intent);   // #1814 WS-cache read
+      return { ok: false, message: 'fills_read not supported for this venue' };
     }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
@@ -7051,6 +7158,11 @@ module.exports = {
   krWsSpotHolds,
   krWsSpotBalanceEx,
   krWsSpotOpenOrders,
+  // pure — Kraken native fills cache (#1814)
+  krWsSpotFillRow,
+  krWsFutFillRow,
+  krFillsCachePush,
+  krFillsWindow,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
