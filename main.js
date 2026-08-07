@@ -352,7 +352,7 @@ function makeWindowOpenHandler(win) {
           try {
             let extra = false;
             new URL(url).searchParams.forEach((v, k) => { if (k !== 'feature') extra = true; });
-            if (extra) existing.loadURL(url).catch(() => showFallback(existing, url));
+            if (extra) loadAppUrl(existing, url);   // #1801: watchdog-armed like any app-origin loadURL
           } catch (e) {}
           if (existing.isMinimized()) existing.restore();
           existing.show();
@@ -402,6 +402,8 @@ function wireWindowNav(win) {
   // (Ctrl+R while offline etc.) go straight to the fallback as before.
   win.__firstLoadRetriesLeft = 2;
 
+  win.on('closed', () => clearLoadWatchdog(win));   // #1801
+
   win.webContents.on('will-navigate', (event, url) => {
     if (!isAppOrigin(url) && !url.startsWith('file:')) {
       event.preventDefault();
@@ -411,6 +413,8 @@ function wireWindowNav(win) {
 
   win.webContents.on('did-fail-load', (event, errorCode, errorDesc, validatedURL, isMainFrame) => {
     if (!isMainFrame) return;
+    clearLoadWatchdog(win);          // #1801: a definitive result — the stall timer must not fire
+    launchGateWinDone(win);          // #1801: this window's first load resolved
     if (errorCode === -3) return; // ERR_ABORTED (in-page nav etc.)
     // First-load retry (launch-scoped, see __firstLoadRetriesLeft above): back
     // off 1s then 2.5s. The fallback page must still appear eventually — after
@@ -423,7 +427,7 @@ function wireWindowNav(win) {
       setTimeout(() => {
         if (win.isDestroyed()) return;
         dlog(diagWinId(win), 'win', 'retry-load', { delay });
-        win.loadURL(validatedURL).catch(() => showFallback(win, validatedURL));
+        loadAppUrl(win, validatedURL);   // #1801: re-arm the stalled-load watchdog on the retry
       }, delay);
       return;
     }
@@ -432,6 +436,8 @@ function wireWindowNav(win) {
   });
 
   win.webContents.on('did-finish-load', () => {
+    clearLoadWatchdog(win);          // #1801
+    launchGateWinDone(win);          // #1801
     dlog(diagWinId(win), 'win', 'loaded', {});
   });
   win.webContents.on('render-process-gone', (event, details) => {
@@ -603,12 +609,135 @@ function createFeatureWindow(id, url, loadDelayMs) {
   registerFeatureWindow(win, id);
   dlog(id, 'win', 'create', { delayed: typeof loadDelayMs === 'number' && loadDelayMs > 0 });
   const target = (url && isAppOrigin(url)) ? url : (APP_URL + '/?feature=' + id);
+  launchGateTrack(win);   // #1801: no-op unless a proxied launch closed the gate
   const doLoad = () => {
     if (win.isDestroyed()) return;
-    win.loadURL(target).catch(() => showFallback(win, target));
+    loadAppUrl(win, target);
   };
   if (typeof loadDelayMs === 'number' && loadDelayMs > 0) setTimeout(doLoad, loadDelayMs);
   else doLoad();
+}
+
+// ---------------------------------------------------------------------------
+// Documents-first launch gate (#1801, proxy black-windows fix)
+// ---------------------------------------------------------------------------
+// With the session proxy ENABLED, a many-window launch + all-tab hydration
+// opens a huge simultaneous burst of exchange websockets through one SOCKS
+// tunnel; Chromium caps sockets per proxy, so the other windows' DOCUMENT
+// fetches queue behind long-lived WS forever → black windows with no
+// did-fail-load. Fix: the panel's heavy connection ramp (all-tab hydration)
+// waits until every launch-reopened window has fired did-finish-load /
+// did-fail-load (or a timeout), signalled over the attApp bridge
+// (getLaunchGate/onLaunchGate — parameterless/boolean only). Proxy disabled →
+// the gate is NEVER closed, so behavior is byte-identical to today.
+const LAUNCH_GATE_TIMEOUT_MS = 25000;
+let launchGateOpen = true;      // open by default; closed ONLY for a proxied multi-window launch
+let launchGateArmed = false;    // true once reopenFeatureWindows finished registering windows
+let launchGateTimer = null;
+const launchGatePending = new Set();   // BrowserWindows still owing a first load result
+
+function launchGateBroadcast() {
+  const wins = [mainWindow, ...featureWindows.values()];
+  for (const w of wins) {
+    if (w && !w.isDestroyed()) {
+      try { w.webContents.send('att:launch-gate'); } catch (e) { /* non-fatal */ }
+    }
+  }
+}
+
+function launchGateRelease(reason) {
+  if (launchGateOpen) return;
+  launchGateOpen = true;
+  if (launchGateTimer) { clearTimeout(launchGateTimer); launchGateTimer = null; }
+  dlog('main', 'app', 'launch-gate-open', { reason, pending: launchGatePending.size });
+  launchGatePending.clear();
+  launchGateBroadcast();
+}
+
+// Called from createWindow/createFeatureWindow while the gate is closed and not
+// yet armed — i.e. only for the launch-created windows the gate waits on.
+function launchGateTrack(win) {
+  if (launchGateOpen || launchGateArmed) return;
+  launchGatePending.add(win);
+  win.on('closed', () => launchGateWinDone(win));
+}
+
+// A window's first document load resolved (finish, fail, stall or close).
+function launchGateWinDone(win) {
+  if (launchGateOpen) return;
+  if (!launchGatePending.delete(win)) return;
+  if (launchGateArmed && launchGatePending.size === 0) launchGateRelease('all-loaded');
+}
+
+// Close the gate BEFORE any window is created (whenReady) so no load event can
+// race the registration. Only when the proxy is enabled AND there are saved-open
+// feature windows to reopen — otherwise the gate stays open and nothing changes.
+function launchGateMaybeClose() {
+  const cfg = getProxyConfig();
+  if (!cfg || !cfg.enabled) return;
+  const fw = loadSettings().featureWindows || {};
+  const anyOpen = Object.keys(fw).some((id) =>
+    (FEATURE_IDS.includes(id) || SECTION_FEATURE_IDS.includes(id) || isScratchFeatureId(id) || isDynFeatureId(id)) && fw[id] && fw[id].open);
+  if (!anyOpen) return;
+  launchGateOpen = false;
+  dlog('main', 'app', 'launch-gate-close', {});
+}
+
+// Arm after reopenFeatureWindows registered every launch window: from here the
+// gate opens when the pending set drains (or the timeout fires — a stalled
+// window must never hold every OTHER window's feeds hostage forever).
+function launchGateArm() {
+  if (launchGateOpen) return;
+  launchGateArmed = true;
+  dlog('main', 'app', 'launch-gate-armed', { windows: launchGatePending.size });
+  if (launchGatePending.size === 0) { launchGateRelease('all-loaded'); return; }
+  launchGateTimer = setTimeout(() => { launchGateTimer = null; launchGateRelease('timeout'); }, LAUNCH_GATE_TIMEOUT_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Stalled-load watchdog (#1801 regression guard): through a saturated proxy an
+// app-origin document load can hang firing NEITHER did-finish-load NOR
+// did-fail-load — the window sits black forever and the fallback page never
+// appears. If neither event lands within the budget: diag-log, stop() the load
+// and route into the SAME __firstLoadRetriesLeft ladder as a real failure →
+// eventually showFallback ("Disable proxy & retry"). Armed only at app-origin
+// loadURL calls (never file:// fallback loads, never in-page navs); cleared on
+// finish/fail/destroy.
+const LOAD_STALL_MS = 25000;
+
+function clearLoadWatchdog(win) {
+  if (win.__loadStallT) { clearTimeout(win.__loadStallT); win.__loadStallT = null; }
+}
+
+function armLoadWatchdog(win, url) {
+  clearLoadWatchdog(win);
+  if (!isAppOrigin(url)) return;
+  win.__loadStallT = setTimeout(() => {
+    win.__loadStallT = null;
+    if (win.isDestroyed()) return;
+    dlog(diagWinId(win), 'win', 'load-stalled', { retriesLeft: win.__firstLoadRetriesLeft });
+    try { win.webContents.stop(); } catch (e) { /* non-fatal */ }
+    launchGateWinDone(win);   // a stalled window must not hold the launch gate
+    if (win.__firstLoadRetriesLeft > 0) {
+      win.__firstLoadRetriesLeft -= 1;
+      const delay = win.__firstLoadRetriesLeft > 0 ? 1000 : 2500;
+      setTimeout(() => {
+        if (win.isDestroyed()) return;
+        dlog(diagWinId(win), 'win', 'retry-load', { delay, stalled: true });
+        loadAppUrl(win, url);
+      }, delay);
+      return;
+    }
+    dlog(diagWinId(win), 'win', 'fallback', { stalled: true });
+    showFallback(win, url);
+  }, LOAD_STALL_MS);
+}
+
+// Every app-origin loadURL goes through here so the stalled-load watchdog is
+// armed exactly at loadURL time (file:// fallback loads bypass this on purpose).
+function loadAppUrl(win, url) {
+  armLoadWatchdog(win, url);
+  win.loadURL(url).catch(() => { clearLoadWatchdog(win); showFallback(win, url); });
 }
 
 // On launch, reopen every feature window that was open when the app last quit.
@@ -625,6 +754,7 @@ function reopenFeatureWindows() {
       createFeatureWindow(id, null, 300 * n);
     }
   });
+  launchGateArm();   // #1801: gate opens when every reopened window's first load resolves
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,6 +1695,10 @@ ipcMain.handle('att:get-fullscreen', (event) => {
   return !!(win && !win.isDestroyed() && win.isFullScreen());
 });
 
+// #1801 documents-first launch gate: current state for the panel's hydration
+// hold. Boolean-only — no renderer-supplied data (attApp security rule).
+ipcMain.handle('att:get-launch-gate', () => launchGateOpen === true);
+
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -1657,7 +1791,8 @@ function createWindow() {
     mainWindow = null;
   });
 
-  mainWindow.loadURL(APP_URL).catch(() => showFallback(mainWindow));
+  launchGateTrack(mainWindow);   // #1801: main window's document counts toward the gate too
+  loadAppUrl(mainWindow, APP_URL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,9 +1958,10 @@ app.whenReady().then(async () => {
   const cookieGateT0 = Date.now();
   try { await session.fromPartition(PARTITION).cookies.get({ url: APP_URL }); } catch (e) { /* non-fatal */ }
   dlog('main', 'app', 'cookie-gate', { ms: Date.now() - cookieGateT0 });
+  launchGateMaybeClose();   // #1801: BEFORE any window exists, so no load event races the gate
   createWindow();
   dlog('main', 'win', 'create-main', {});
-  reopenFeatureWindows();   // restore feature windows that were open at last quit
+  reopenFeatureWindows();   // restore feature windows that were open at last quit (arms the gate)
   createTray();
   setupAutoUpdater();
 

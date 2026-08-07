@@ -57,12 +57,20 @@ ipcRenderer.on('att:proxy-open-settings', () => {
 // inside a desktop build new enough to show the Restart + Fullscreen buttons.
 let _fullscreenChangeCb = null;
 let _updateStateCb = null;   // titlebar Restart button accent (#1793)
+let _launchGateCb = null;    // #1801 documents-first launch gate open signal
 try {
   contextBridge.exposeInMainWorld('attApp', {
     restart: () => ipcRenderer.invoke('att:app-restart'),
     toggleFullscreen: () => ipcRenderer.invoke('att:toggle-fullscreen'),
     getFullscreen: () => ipcRenderer.invoke('att:get-fullscreen'),
     onFullscreenChange: (cb) => { _fullscreenChangeCb = (typeof cb === 'function') ? cb : null; },
+    // #1801 documents-first launch gate: with the session proxy enabled the
+    // shell holds the panel's heavy connection ramp (all-tab hydration) until
+    // every launch-reopened window's document load resolved. Parameterless /
+    // boolean only, per the bridge's security rule. Missing on older shells —
+    // the panel must treat absence as "no gating".
+    getLaunchGate: () => ipcRenderer.invoke('att:get-launch-gate'),
+    onLaunchGate: (cb) => { _launchGateCb = (typeof cb === 'function') ? cb : null; },
     // Update-state mirror for the in-titlebar Restart button (#1793): the panel
     // accents the button ("restart to update") when a downloaded update is
     // pending. Same payload main.js pushes for the shell-owned update bar;
@@ -73,6 +81,10 @@ try {
 
 ipcRenderer.on('att:fullscreen-changed', (_e, isFull) => {
   try { if (_fullscreenChangeCb) _fullscreenChangeCb(!!isFull); } catch (e) { /* non-fatal */ }
+});
+
+ipcRenderer.on('att:launch-gate', () => {
+  try { if (_launchGateCb) _launchGateCb(); } catch (e) { /* non-fatal */ }
 });
 
 // ---------------------------------------------------------------------------
