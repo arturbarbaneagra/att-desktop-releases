@@ -6861,7 +6861,11 @@ function createTradeNative(opts) {
           try { codeMap = ((await krProducts(L.route)) || {}).spotCode || {}; } catch (e2) {}
           const th = await krRequest(L.creds, 'POST', 'spot',
             '/0/private/TradesHistory',
-            [['start', String((Date.now() - KR_CONFIRM_TRADES_WINDOW_MS) / 1000)]],
+            [['start', String((Date.now() - KR_CONFIRM_TRADES_WINDOW_MS) / 1000)],
+             // #1829: default consolidate_taker=true merges a taker order's
+             // executions into ONE synthetic trade (own txid, avg px) that
+             // sits beside the per-execution WS rows and double-counts qty.
+             ['consolidate_taker', 'false']],
             L.route);
           if (th.ok) {
             const trades = ((((th.data || {}).result) || {}).trades) || {};
@@ -6960,7 +6964,9 @@ function createTradeNative(opts) {
         if (page) await new Promise((rs) => setTimeout(rs, KR_FILLS_SEED_PAGE_GAP_MS));
         const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory',
           [['start', String(startMs / 1000)], ['end', String(now / 1000)],
-           ['ofs', String(ofs)]], route);
+           // #1829: per-execution rows only — the consolidated synthetic
+           // trade (own txid) would double-count beside its WS legs.
+           ['ofs', String(ofs)], ['consolidate_taker', 'false']], route);
         if (!th.ok) return th;
         const res = ((th.data || {}).result) || {};
         const trades = res.trades || {};
