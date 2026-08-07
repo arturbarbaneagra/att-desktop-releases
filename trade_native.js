@@ -2133,6 +2133,42 @@ function krFillsWindow(C, startMs, endMs) {
 function krFillsScopeReady(live, C) {
   return !!(live && C && C.seeded);
 }
+// #1820 one-shot REST own-trades seed converters: REST rows convert into the
+// SAME raw WS shapes the caches hold, so the ENGINE's WS normalizers parse
+// them and the exec-id dedupe collapses the REST/WS copies of one fill (spot
+// WS-v2 exec_id IS the TradesHistory txid — same T…-…-… space; futures
+// fill_id is REST-identical by design). Truth rule: an unmappable pair code
+// returns null — never record a guessed symbol.
+// Spot /0/private/TradesHistory result.trades entry → WS-v2 executions shape.
+function krRestSpotWsRow(tid, t, codeMap) {
+  if (!tid || !t || typeof t !== 'object') return null;
+  const sym = (codeMap || {})[String(t.pair || '')];
+  if (!sym) return null;
+  const ms = Math.round(Number(t.time) * 1000);
+  if (!(ms > 0) || !(Number(t.vol) > 0)) return null;
+  const quote = String(sym).split('/')[1] || '';
+  const row = { exec_type: 'trade', exec_id: String(tid),
+                order_id: String(t.ordertxid || ''),
+                symbol: sym, side: String(t.type || '').toLowerCase(),
+                last_qty: String(t.vol), last_price: String(t.price || '0'),
+                fees: (Number(t.fee) > 0 && quote)
+                  ? [{ asset: quote, qty: String(t.fee) }] : [],
+                timestamp: new Date(ms).toISOString() };
+  if (t.cost != null) row.cost = String(t.cost);
+  return row;
+}
+// Futures GET /derivatives/api/v3/fills row → ws/v1 fills feed shape.
+function krRestFutWsRow(f) {
+  if (!f || typeof f !== 'object' || !String(f.fill_id || '')) return null;
+  const ms = Date.parse(String(f.fillTime || ''));
+  if (!Number.isFinite(ms) || !(Number(f.size) > 0)) return null;
+  return { instrument: String(f.symbol || '').toUpperCase(),
+           time: ms, price: f.price,
+           buy: String(f.side || '').toLowerCase() === 'buy',
+           qty: f.size, order_id: String(f.order_id || ''),
+           fill_id: String(f.fill_id),
+           fill_type: String(f.fillType || '') };
+}
 // ws/v1 open_orders order dict → REST openorders row shape (qty=REMAINING;
 // direction 1=sell; type limit/stop/take_profit → lmt/stop/take_profit).
 function krWsFutOrderRest(o) {
@@ -4668,7 +4704,7 @@ function createTradeNative(opts) {
   async function krProducts(route) {
     if (krProdCache && Date.now() - krProdCache.ts < PRODUCTS_TTL_MS) return krProdCache.v;
     const cap = 8 * 1024 * 1024;
-    const v = { futures: {}, spot: {} };
+    const v = { futures: {}, spot: {}, spotCode: {} };
     try {
       const rf = await httpJson(KRAKEN_FUT_HOST, 'GET', '/derivatives/api/v3/instruments',
                                 '', null, {}, route, cap);
@@ -4693,6 +4729,10 @@ function createTradeNative(opts) {
         const sym = ws.split('/').map((p) => fix[p] || p).join('/');
         v.spot[sym] = { alt: String(s.altname || code),
                         qty_step: krDecStep(s.lot_decimals) || '1' };
+        // #1820: pair-code → display symbol (TradesHistory rows name the
+        // pair by CODE or altname; the REST fills seed maps them here)
+        v.spotCode[code] = sym;
+        v.spotCode[String(s.altname || code)] = sym;
       }
     } catch (e) { /* fail-visible at order time (spec miss) */ }
     if (Object.keys(v.futures).length || Object.keys(v.spot).length) {
@@ -6555,6 +6595,52 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // #1820 one-shot REST own-trades SEED: on the post-trade kick (and once per
+  // panel session) the panel asks for a REST copy of recent fills so first
+  // paint and the archive never wait on the spot WS executions delivery
+  // (observed ~5s late over proxied routes) or on the bounded reconnect
+  // snapshots (last-50 spot / last-100 futures — an app restart loses fills
+  // beyond them if they were never ingested). Rows convert to the SAME raw WS
+  // shapes (krRestSpotWsRow / krRestFutWsRow) and dedupe by exec id — never a
+  // second record of a fill the WS already cached. NOT a steady-state REST
+  // poller (#1804 rule): strictly rate-limited per session, panel-triggered.
+  const KR_FILLS_SEED_MIN_MS = 15000;
+  async function execKrakenFillsSeed(intent) {
+    const creds = credsGet(intent.credSlot || 'kraken');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const sess = krWsEnsure(intent.credSlot || 'kraken', creds, route);
+    if (!sess) return { ok: false, message: 'Kraken session unavailable' };
+    const now = Date.now();
+    if (sess.seedT && now - sess.seedT < KR_FILLS_SEED_MIN_MS) {
+      return { ok: true, paced: true, spot: 0, futures: 0 };
+    }
+    sess.seedT = now;
+    const out = { ok: true, spot: 0, futures: 0 };
+    if (krPairFor(creds, 'spot')) {
+      const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory', null, route);
+      if (!th.ok) return th;
+      let codeMap = {};
+      try { codeMap = ((await krProducts(route)) || {}).spotCode || {}; } catch (e) {}
+      const trades = (((th.data || {}).result) || {}).trades || {};
+      for (const tid of Object.keys(trades)) {
+        const e = krRestSpotWsRow(tid, trades[tid], codeMap);
+        const r = e && krWsSpotFillRow(e);
+        if (r && krFillsCachePush(sess.spot.fills, r)) out.spot++;
+      }
+    }
+    if (krPairFor(creds, 'futures')) {
+      const fh = await krRequest(creds, 'GET', 'futures', '/derivatives/api/v3/fills', null, route);
+      if (!fh.ok) return fh;
+      for (const f of ((fh.data || {}).fills) || []) {
+        const e = krRestFutWsRow(f);
+        const r = e && krWsFutFillRow(e);
+        if (r && krFillsCachePush(sess.fut.fills, r)) out.futures++;
+      }
+    }
+    return out;
+  }
+
   // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
   // panel's "Catalogs & candles: Native" axis (Phemex REST has no CORS, so
   // the fetch must run here in the main process; honors the user proxy via
@@ -6763,6 +6849,12 @@ function createTradeNative(opts) {
       if (intent.venue === 'phemex') return await execPhemexFillsRead(intent);
       if (intent.venue === 'kraken') return await execKrakenFillsRead(intent);   // #1814 WS-cache read
       return { ok: false, message: 'fills_read not supported for this venue' };
+    }
+    // #1820 one-shot REST fills seed (kraken) — rate-limited inside; old
+    // shells fall through to 'unknown op' and the panel treats it as a no-op.
+    if (intent && typeof intent === 'object' && intent.op === 'fills_seed') {
+      if (intent.venue === 'kraken') return await execKrakenFillsSeed(intent);
+      return { ok: false, message: 'fills_seed not supported for this venue' };
     }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
@@ -7184,6 +7276,8 @@ module.exports = {
   krWsSpotOpenOrders,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
+  krRestSpotWsRow,
+  krRestFutWsRow,
   krWsFutFillRow,
   krFillsCachePush,
   krFillsWindow,
