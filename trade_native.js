@@ -2299,6 +2299,62 @@ function krWsSpotOpenOrders(orders, altOf) {
   return rows;
 }
 
+// --- #1822 optimistic REST/WS-ack echo (pure) -------------------------------
+// Kraken's private WS delivers execution echoes ~3–6s late over proxied
+// routes (measured: order ack t+0.4s, WS execution rows t+5.6s). Since #1804
+// the acct reads are WS-first, so order badges + spot holds waited on the
+// echo. On a successful order/cancel ACK the shell mutates its OWN WS
+// session order maps immediately: place → synthetic row (marked _synTs,
+// TTL-bounded — venue truth replaces it, expiry is fail-visible), cancel /
+// cancel_all → rows dropped. Totals are NEVER fabricated (truth rule) —
+// holds recompute from the corrected orders map, which is exactly the
+// free/locked split that flapped the posrow after Space.
+const KR_SYN_TTL_MS = 15000;
+// Synthetic spot WS-v2 executions row (limit only — market orders never rest).
+function krSynSpotOrder(oid, symbol, side, qty, price, cid, now) {
+  const row = { order_id: String(oid), symbol: String(symbol),
+                side: String(side).toLowerCase() === 'sell' ? 'sell' : 'buy',
+                order_type: 'limit', order_qty: Number(qty), cum_qty: 0,
+                limit_price: Number(price),
+                timestamp: new Date(now).toISOString(), _synTs: now };
+  if (cid) row.cl_ord_id = String(cid);
+  return row;
+}
+// Synthetic futures ws/v1 open_orders row (qty is REMAINING on that feed).
+function krSynFutOrder(oid, symbol, side, qty, price, cid, reduceOnly, now) {
+  const row = { order_id: String(oid),
+                instrument: String(symbol).toUpperCase(),
+                direction: String(side).toLowerCase() === 'sell' ? 1 : 0,
+                type: 'limit', limit_price: Number(price), qty: Number(qty),
+                filled: 0, reduce_only: !!reduceOnly, time: now, _synTs: now };
+  if (cid) row.cli_ord_id = String(cid);
+  return row;
+}
+// Expire never-confirmed synthetic rows (fail-visible: after the TTL the
+// badge honestly drops instead of fabricating a permanent order). In place.
+function krSynPrune(orders, now) {
+  let n = 0;
+  for (const oid of Object.keys(orders || {})) {
+    const ts = (orders[oid] || {})._synTs;
+    if (ts != null && now - ts > KR_SYN_TTL_MS) { delete orders[oid]; n += 1; }
+  }
+  return n;
+}
+// cancel_all ACK sweep: drop every row on the symbol. field = 'symbol'
+// (spot WS-v2 rows) or 'instrument' (futures ws/v1 rows); case-insensitive.
+function krSynSweepSymbol(orders, symbol, field) {
+  const want = String(symbol || '').toUpperCase();
+  const gone = [];
+  if (!want) return gone;
+  for (const oid of Object.keys(orders || {})) {
+    if (String((orders[oid] || {})[field] || '').toUpperCase() === want) {
+      delete orders[oid];
+      gone.push(oid);
+    }
+  }
+  return gone;
+}
+
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
 // PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
 function krPositionRows(data) {
@@ -4545,6 +4601,8 @@ function createTradeNative(opts) {
             } else {
               // delta frames carry partial fields — merge onto the row
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
+              // #1822: a real venue echo confirms the optimistic synthetic row
+              delete S.orders[oid]._synTs;
             }
           }
         } else if (msg.channel === 'balances') {
@@ -4834,6 +4892,13 @@ function createTradeNative(opts) {
             }
             const oid = String(((m.result || {}).order_id) || '');
             if (!oid) return { ok: false, message: 'Kraken returned no order id' };
+            // #1822: the ACK precedes the executions echo by seconds over
+            // proxied routes — echo the resting order into S.orders NOW so
+            // badges/holds don't wait on the venue echo.
+            if (t === 'limit') {
+              sessO.spot.orders[oid] =
+                krSynSpotOrder(oid, symbol, side, q, price, cid, Date.now());
+            }
             return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
           }
         }
@@ -4843,6 +4908,10 @@ function createTradeNative(opts) {
         const txids = (((r.data || {}).result) || {}).txid || [];
         const oid = txids.length ? String(txids[0]) : '';
         if (!oid) return { ok: false, message: 'Kraken returned no order id' };
+        if (t === 'limit' && sessO) {   // #1822 optimistic echo (REST ack)
+          sessO.spot.orders[oid] = krSynSpotOrder(oid, symbol, side, q, price,
+                                                  krClOrdId(clOrdID), Date.now());
+        }
         return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
       }
       const spec = prods.futures[symbol];
@@ -4864,6 +4933,16 @@ function createTradeNative(opts) {
         // (insufficientAvailableFunds & co.) — surface verbatim.
         return { ok: false, message: st || 'Kraken rejected the order' };
       }
+      // #1822 optimistic echo — plain resting limits only (stops live on the
+      // trigger feed, market orders never rest); positions stay venue-truth.
+      if (t === 'limit' && !isStop && !f.trigger) {
+        const sessF = krWsSessGet(intent.credSlot || 'kraken');
+        if (sessF) {
+          sessF.fut.orders[oid] = krSynFutOrder(oid, symbol, side, q, price,
+                                                krClOrdId(clOrdID),
+                                                !!f.reduceOnly, Date.now());
+        }
+      }
       return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
     }
     if (intent.op === 'order') {
@@ -4880,6 +4959,8 @@ function createTradeNative(opts) {
         const cs = ((r.data || {}).cancelStatus) || {};
         const st = String(cs.status || '');
         if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
+        const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
+        if (sessF) delete sessF.fut.orders[String(intent.orderID)];
         return { ok: true, cancelled: intent.orderID };
       }
       // #1804: WS cancel first — cancels are idempotent, so ANY WS failure
@@ -4889,12 +4970,16 @@ function createTradeNative(opts) {
         try {
           const m = await krWsSpotCall(sessC, 'cancel_order',
                                        { order_id: [String(intent.orderID)] });
-          if (m && m.success) return { ok: true, cancelled: intent.orderID };
+          if (m && m.success) {
+            delete sessC.spot.orders[String(intent.orderID)];   // #1822
+            return { ok: true, cancelled: intent.orderID };
+          }
         } catch (e) { /* REST fallback below */ }
       }
       const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                 [['txid', String(intent.orderID)]], route);
       if (!r.ok) return r;
+      if (sessC) delete sessC.spot.orders[String(intent.orderID)];   // #1822
       return { ok: true, cancelled: intent.orderID };
     }
     if (intent.op === 'cancel_all') {
@@ -4905,6 +4990,8 @@ function createTradeNative(opts) {
                                   '/derivatives/api/v3/cancelallorders',
                                   [['symbol', String(intent.symbol)]], route);
         if (!r.ok) return r;
+        const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
+        if (sessF) krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument');
         return { ok: true, cancelled: 'all' };
       }
       // Spot has NO per-pair sweep (CancelAll nukes every pair) → list the
@@ -4916,15 +5003,23 @@ function createTradeNative(opts) {
       if (!lo.ok) return lo;
       const open = ((((lo.data || {}).result) || {}).open) || {};
       let n = 0; let firstErr = null;
+      const sessA = krWsSessGet(intent.credSlot || 'kraken');   // #1822
       for (const txid of Object.keys(open)) {
         const pair = String((((open[txid] || {}).descr) || {}).pair || '');
         if (pair !== spec.alt) continue;
         const rc = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                    [['txid', txid]], route);
-        if (rc.ok) n += 1;
+        if (rc.ok) {
+          n += 1;
+          if (sessA) delete sessA.spot.orders[txid];   // #1822 per-txid ack
+        }
         else if (!firstErr) firstErr = rc.message;
       }
       if (firstErr && !n) return { ok: false, message: firstErr };
+      // #1822: the REST OpenOrders list itself lags the just-ACKed adds —
+      // sweep any remaining rows on the pair (incl. synthetics the list
+      // missed) so holds/badges reflect the cancel_all immediately.
+      if (sessA && !firstErr) krSynSweepSymbol(sessA.spot.orders, intent.symbol, 'symbol');
       return { ok: true, cancelled: 'all' };
     }
     const pr = await findPosRetry(fetchPos, intent.symbol);
@@ -6525,6 +6620,13 @@ function createTradeNative(opts) {
     // view never mixes with REST rows). REST fallback keeps the nonce
     // retry; the only steady-state REST nonce user is the rare token fetch.
     const sess = krWsEnsure(intent.credSlot || 'kraken', creds, route);
+    if (sess) {
+      // #1822: expire never-confirmed optimistic rows before serving reads
+      // (fail-visible TTL — venue truth replaces confirmed ones in place).
+      const nowP = Date.now();
+      krSynPrune(sess.spot.orders, nowP);
+      krSynPrune(sess.fut.orders, nowP);
+    }
     const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
     const wsFut = !!(sess && krWsLive(sess.fut));
     const out = { ok: true, wsSpot: wsSpot, wsFut: wsFut };
@@ -7324,6 +7426,12 @@ module.exports = {
   krWsSpotHolds,
   krWsSpotBalanceEx,
   krWsSpotOpenOrders,
+  // pure — Kraken optimistic REST-ack echo (#1822)
+  KR_SYN_TTL_MS,
+  krSynSpotOrder,
+  krSynFutOrder,
+  krSynPrune,
+  krSynSweepSymbol,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
   krRestSpotWsRow,
