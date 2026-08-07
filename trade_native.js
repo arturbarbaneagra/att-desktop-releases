@@ -4512,7 +4512,11 @@ function createTradeNative(opts) {
   function krLedgerFor(key) {
     return krLedgers[key] || (krLedgers[key] = krLedgerNew(Date.now()));
   }
-  async function krRequest(creds, method, market, path, params, route, _nretry, _cxl0) {
+  // _pri: caller-declared priority — a query REQUIRED by a cancel flow (spot
+  // cancel_all's OpenOrders id-discovery) rides the reserved lane: it never
+  // defers/skips at the floor, and a body-level rate limit retries on the
+  // bounded cancel deadline instead of failing the cancel silently.
+  async function krRequest(creds, method, market, path, params, route, _nretry, _cxl0, _pri) {
     const pair = krPairFor(creds, market);
     if (!pair) {
       return { ok: false, message: market === 'futures'
@@ -4524,6 +4528,7 @@ function createTradeNative(opts) {
     // stream never inverts). Priority (order/cancel) never waits; queries
     // defer down to the cancel-reserved floor, or skip (fail-soft, logged).
     const krCC = market === 'futures' ? null : krCallCost(path);
+    if (krCC && _pri) krCC.cls = 'cancel';   // reserved lane + loud retry
     if (krCC && !_nretry && !_cxl0) {
       const led = krLedgerFor(pair.key);
       for (;;) {
@@ -4592,7 +4597,7 @@ function createTradeNative(opts) {
       if (msg.indexOf('EAPI:Invalid nonce') >= 0 && !_nretry) {
         const bump = Date.now() + KR_NONCE_RETRY_LEAD_MS;
         if (bump > krNonceLast) krNonceLast = bump;
-        return krRequest(creds, method, market, path, params, route, true, _cxl0);
+        return krRequest(creds, method, market, path, params, route, true, _cxl0, _pri);
       }
       // #1832: `EAPI:Rate limit` rides an HTTP 200 body — mirror venue truth
       // (drain our ledger so queries back off) and NEVER let a cancel fail
@@ -4608,7 +4613,7 @@ function createTradeNative(opts) {
               act: 'cancel_retry', sinceMs: Date.now() - t0 });
             await krWsSleep(KR_CANCEL_RETRY_GAP_MS);
             return krRequest(creds, method, market, path, params, route,
-                             _nretry, t0);
+                             _nretry, t0, _pri);
           }
           return { ok: false, message:
             'CANCEL FAILED — Kraken rate limit persisted ~5s (' + msg
@@ -5226,7 +5231,12 @@ function createTradeNative(opts) {
       const prods = await krProducts(route);
       const spec = prods.spot[intent.symbol];
       if (!spec || !spec.alt) return { ok: false, message: 'Unknown spot symbol ' + intent.symbol };
-      const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
+      // #1832: this OpenOrders is REQUIRED by the cancel — it rides the
+      // priority lane (never deferred/skipped at the floor, rate-limit
+      // retried on the cancel deadline). A cancel_all must never come back
+      // "kr_budget" with live orders still resting.
+      const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders',
+                                 null, route, null, null, true);
       if (!lo.ok) return lo;
       const open = ((((lo.data || {}).result) || {}).open) || {};
       let n = 0; let firstErr = null;
