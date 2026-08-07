@@ -2105,10 +2105,13 @@ function krWsFutFillRow(f) {
   return { id: String(f.fill_id), ts: Number(f.time) || 0, raw: f };
 }
 // Bounded dedupe push; oldest rows (and their seen keys) roll off past cap.
+// Cache cap must hold a FULL seed walk (15 pages × ≤100 rows/page) or the
+// paged restart self-heal would evict its own oldest legs on push.
+const KR_FILLS_CACHE_CAP = 1600;
 function krFillsCachePush(C, row, cap) {
   if (!C || !row) return false;
   if (C.seen[row.id]) return false;
-  cap = cap || 500;
+  cap = cap || KR_FILLS_CACHE_CAP;
   C.seen[row.id] = 1;
   C.rows.push(row);
   if (C.rows.length > cap) {
@@ -6632,7 +6635,7 @@ function createTradeNative(opts) {
   // bounded by KR_FILLS_SEED_MAX_PAGES and paced between calls.
   const KR_FILLS_SEED_MIN_MS = 15000;
   const KR_FILLS_SEED_WINDOW_MS = 24 * 3600 * 1000;  // = panel fresh-session POST window
-  const KR_FILLS_SEED_MAX_PAGES = 5;
+  const KR_FILLS_SEED_MAX_PAGES = 15;                // = engine HIST_MAX_PAGES
   const KR_FILLS_SEED_PAGE_GAP_MS = 400;
   async function execKrakenFillsSeed(intent) {
     const creds = credsGet(intent.credSlot || 'kraken');
@@ -6654,7 +6657,8 @@ function createTradeNative(opts) {
       for (let page = 0; page < KR_FILLS_SEED_MAX_PAGES && ofs !== null; page++) {
         if (page) await new Promise((rs) => setTimeout(rs, KR_FILLS_SEED_PAGE_GAP_MS));
         const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory',
-          [['start', String(startMs / 1000)], ['ofs', String(ofs)]], route);
+          [['start', String(startMs / 1000)], ['end', String(now / 1000)],
+           ['ofs', String(ofs)]], route);
         if (!th.ok) return th;
         const res = ((th.data || {}).result) || {};
         const trades = res.trades || {};
