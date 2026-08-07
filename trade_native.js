@@ -4421,6 +4421,10 @@ function createTradeNative(opts) {
       }, 5000);
       ws.on('open', () => {
         S.lastMsg = Date.now();
+        // reconnect seed-race: THIS connection has not snapshotted yet —
+        // a stale seeded=true from the previous socket would let an empty
+        // fills_read succeed before the fresh snapshot lands.
+        if (S.fills) S.fills.seeded = false;
         try {
           // snap_trades: the subscribe-time snapshot back-records the 50
           // most recent trades — the fills seed window (#1814; fills made
@@ -4580,6 +4584,9 @@ function createTradeNative(opts) {
       };
       ws.on('open', () => {
         F.lastMsg = Date.now();
+        // reconnect seed-race: fills_snapshot for THIS connection is still
+        // pending — clear the previous socket's seeded latch (fail-closed).
+        if (F.fills) F.fills.seeded = false;
         try { ws.send(JSON.stringify({ event: 'challenge', api_key: pair.key })); }
         catch (e) { done(e); }
       });
