@@ -2380,6 +2380,7 @@ function krSynSweepSymbol(orders, symbol, field) {
 // OpenOrders) shortly after the ack, coalesced across ack bursts.
 const KR_CONFIRM_DELAY_MS = 400;      // ack → confirm (venue settle window)
 const KR_CONFIRM_MIN_GAP_MS = 1000;   // confirms never fire closer than this
+const KR_CONFIRM_TRADES_WINDOW_MS = 10 * 60 * 1000;  // recent own-trades page
 // Coalescing gate — pure state machine over an injected clock so the burst /
 // min-gap / rerun-after-in-flight behavior is node-testable. State shape:
 // { timerAt: null|ts, running: bool, again: bool, lastEnd: ts }.
@@ -2432,21 +2433,25 @@ function krBalanceExTotals(data) {
   for (const a of Object.keys(out)) out[a] = String(out[a]);
   return out;
 }
-// Post-confirm reconcile: a SYNTHETIC row the venue-truth OpenOrders page
-// does not list is confirmed gone — drop it now instead of waiting out the
-// 15s TTL. Venue-truth rows (no _synTs) are never touched (the WS stream
-// owns them), and fresh synthetics get a grace window: OpenOrders itself
-// lags just-ACKed adds (#1822 lesson), so a just-placed order must not have
-// its badge eaten by the confirm it triggered.
+// Post-confirm reconcile (#1828): the venue-truth OpenOrders page is the
+// FULL open set for the account — ANY map row absent from it is confirmed
+// gone, synthetic AND WS-echoed alike (an order that fills instantly as
+// taker produces no cancel and the WS "filled" echo can arrive tens of
+// seconds late or drop entirely; the badge must not wait it out). Spot map
+// keys ARE the REST txids (same id space — no mangling). Fresh rows get a
+// grace window: OpenOrders itself lags just-ACKed adds (#1822 lesson), so a
+// just-placed order must not have its badge eaten by the confirm it
+// triggered — _synTs (optimistic add) or _updTs (last WS write) both count.
 const KR_CONFIRM_ORDER_GRACE_MS = 2500;
-function krSynReconcile(orders, liveIds, now) {
+function krOrdersReconcile(orders, liveIds, now) {
   const live = {};
   for (const id of (liveIds || [])) live[String(id)] = 1;
   const gone = [];
   for (const oid of Object.keys(orders || {})) {
-    const ts = (orders[oid] || {})._synTs;
-    if (ts == null) continue;
-    if (now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
+    const o = orders[oid] || {};
+    const ts = (o._synTs != null) ? o._synTs
+             : (o._updTs != null) ? o._updTs : null;
+    if (ts != null && now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
     if (!live[oid]) { delete orders[oid]; gone.push(oid); }
   }
   return gone;
@@ -4710,6 +4715,10 @@ function createTradeNative(opts) {
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
               // #1822: a real venue echo confirms the optimistic synthetic row
               delete S.orders[oid]._synTs;
+              // #1828: last-WS-write stamp — the post-confirm reconcile's
+              // grace window (a row the venue just echoed must not be eaten
+              // by an OpenOrders page fetched moments earlier)
+              S.orders[oid]._updTs = Date.now();
             }
           }
         } else if (msg.channel === 'balances') {
@@ -6836,8 +6845,34 @@ function createTradeNative(opts) {
                                  '/0/private/OpenOrders', null, L.route);
       if (so.ok && sess) {
         const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
-        krSynReconcile(sess.spot.orders, ids, Date.now());
+        krOrdersReconcile(sess.spot.orders, ids, Date.now());
       }
+      // #1828 fast venue-truth fills: one recent-window TradesHistory page
+      // rides the same confirm (nonce-serialized signer, coalesced burst).
+      // Rows convert to the SAME raw WS shapes as the #1820 seed, so the
+      // exec-id dedupe (WS-v2 exec_id IS the TradesHistory txid) collapses
+      // the REST copy with the later WS echo — the panel's fills lane sees
+      // the fill ~1s after ack and the id-keyed chime rings ONCE, never
+      // twice. Cache pushes are dedupe-only; the engine stays the archive's
+      // sole writer via the panel's /native_fills POST.
+      try {
+        if (sess && sess.spot.fills) {
+          let codeMap = {};
+          try { codeMap = ((await krProducts(L.route)) || {}).spotCode || {}; } catch (e2) {}
+          const th = await krRequest(L.creds, 'POST', 'spot',
+            '/0/private/TradesHistory',
+            [['start', String((Date.now() - KR_CONFIRM_TRADES_WINDOW_MS) / 1000)]],
+            L.route);
+          if (th.ok) {
+            const trades = ((((th.data || {}).result) || {}).trades) || {};
+            for (const tid of Object.keys(trades)) {
+              const e2 = krRestSpotWsRow(tid, trades[tid], codeMap);
+              const r2 = e2 && krWsSpotFillRow(e2);
+              if (r2) krFillsCachePush(sess.spot.fills, r2);
+            }
+          }
+        }
+      } catch (e) { /* best-effort: the WS echo remains the fallback */ }
       // the confirm changed session state — bust again so a read memoized
       // during the confirm can't serve the pre-confirm view for ~1.2s
       try { execAcctRead.bust('kraken', slot); } catch (e) { /* diag-only */ }
@@ -7616,7 +7651,7 @@ module.exports = {
   krConfirmDone,
   krAssetWsName,
   krBalanceExTotals,
-  krSynReconcile,
+  krOrdersReconcile,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
   krRestSpotWsRow,
