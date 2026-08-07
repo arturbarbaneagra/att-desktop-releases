@@ -2136,6 +2136,43 @@ function krFillsWindow(C, startMs, endMs) {
 function krFillsScopeReady(live, C) {
   return !!(live && C && C.seeded);
 }
+// #1835: private-WS lag instrumentation. Kraken's executions echo lands
+// ~3-6s late in some sessions while REST RTT through the SAME proxy is
+// ~370ms — quantify WHERE the seconds go (venue-side delivery vs shell-side
+// handling). Per-connection recorder: raw lag = local arrival − venue event
+// ts (includes clock offset), base = rolling MIN over the connection's life
+// (clock-independent — the stream-lag rule: report delay ABOVE the best the
+// stream ever showed, never trust raw clock deltas alone); applyUs = shell
+// time from socket message to state applied (shell-side suspect gauge).
+// Bounded: sample caps, snapshot drains + resets — the caller emits ONE
+// diag event per minute per scope, never per event.
+function krLagNew(conn) {
+  return { conn: conn | 0, lags: [], applyUs: [], base: null };
+}
+function krLagRec(L, lagMs, applyUs) {
+  if (!L || !Number.isFinite(lagMs)) return;
+  if (L.base == null || lagMs < L.base) L.base = lagMs;
+  if (L.lags.length < 600) L.lags.push(lagMs);
+  if (Number.isFinite(applyUs) && applyUs >= 0 && L.applyUs.length < 600) {
+    L.applyUs.push(applyUs);
+  }
+}
+function krLagPct(sorted, p) {
+  if (!sorted.length) return 0;
+  const i = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[i];
+}
+function krLagSnap(L) {
+  if (!L || !L.lags.length) return null;
+  const s = L.lags.slice().sort((a, b) => a - b);
+  const a = L.applyUs.slice().sort((x, y) => x - y);
+  const out = { conn: L.conn, n: s.length,
+                p50: Math.round(krLagPct(s, 50)), p95: Math.round(krLagPct(s, 95)),
+                max: Math.round(s[s.length - 1]), base: Math.round(L.base),
+                applyP95Us: a.length ? Math.round(krLagPct(a, 95)) : 0 };
+  L.lags = []; L.applyUs = [];
+  return out;
+}
 // #1820 one-shot REST own-trades seed converters: REST rows convert into the
 // SAME raw WS shapes the caches hold, so the ENGINE's WS normalizers parse
 // them and the exec-id dedupe collapses the REST/WS copies of one fill (spot
@@ -4640,6 +4677,39 @@ function createTradeNative(opts) {
   const krWsSessions = {};               // slot → session
   function krWsSleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
 
+  // #1835: connection counter (per-conn diag ids — duplicated subscriptions
+  // or overlapping reconnects show up as interleaved conn ids in kr_ws_lag).
+  let krWsConnSeq = 0;
+  // #1835: main-proc event-loop stall gauge — worst 1s-ticker drift since
+  // the last kr_ws_lag emit. Separates shell-side stalls (OHLC poll bursts,
+  // heavy snapshots) from venue-side delivery lag: a big WS lag with a flat
+  // loopMax is Kraken's side; loopMax spikes matching the lag are ours.
+  const KR_LAG_EMIT_MS = 60000;
+  let krLoopTimer = null, krLoopMax = 0, krLoopLast = 0;
+  function krLoopGaugeStart() {
+    if (krLoopTimer) return;
+    krLoopLast = Date.now();
+    krLoopTimer = setInterval(() => {
+      const now = Date.now();
+      const drift = now - krLoopLast - 1000;
+      if (drift > krLoopMax) krLoopMax = drift;
+      krLoopLast = now;
+    }, 1000);
+    if (krLoopTimer.unref) krLoopTimer.unref();
+  }
+  function krLoopGaugeDrain() { const m = krLoopMax; krLoopMax = 0; return Math.max(0, Math.round(m)); }
+  // Bounded per-minute emitter shared by both scopes.
+  function krLagEmit(S, scopeKey) {
+    const now = Date.now();
+    if (!S.lag || now - (S.lagEmitT || 0) < KR_LAG_EMIT_MS) return;
+    const sn = krLagSnap(S.lag);
+    if (!sn) return;
+    S.lagEmitT = now;
+    sn.k = scopeKey;
+    sn.loopMax = krLoopGaugeDrain();
+    tdiag('trade', 'kr_ws_lag', sn);
+  }
+
   function krWsSessGet(slot) { return krWsSessions[String(slot || 'kraken')] || null; }
 
   function krWsClose(slot) {
@@ -4695,6 +4765,7 @@ function createTradeNative(opts) {
     }
     if (krPairFor(creds, 'spot') && !s.spot.running) krWsSpotLoop(slot, s, creds);
     if (krPairFor(creds, 'futures') && !s.fut.running) krWsFutLoop(slot, s, creds);
+    krLoopGaugeStart();                       // #1835: stall gauge rides sessions
     return s;
   }
 
@@ -4745,6 +4816,9 @@ function createTradeNative(opts) {
       const ws = krWsDial(KRAKEN_SPOT_WS_URL, s.route);
       if (!ws) { reject(new Error('proxy unavailable')); return; }
       const S = s.spot;
+      // #1835: fresh per-connection lag recorder (base rolling-min resets
+      // with the conn — a reconnect must not inherit the old clock baseline)
+      S.lag = krLagNew(++krWsConnSeq);
       let settled = false;
       const done = (err) => {
         if (settled) return; settled = true;
@@ -4801,6 +4875,13 @@ function createTradeNative(opts) {
           return;
         }
         if (msg.channel === 'executions') {
+          // #1835: stamp arrival BEFORE processing; apply time measured over
+          // the whole frame (snapshot frames skip lag samples — bulk historic
+          // timestamps would fake seconds of "lag").
+          const lagArrMs = Date.now();
+          const lagT0 = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : null;
+          const lagSnapFrame = String(msg.type || '') === 'snapshot';
           if (String(msg.type || '') === 'snapshot') {
             // #1822: keep fresh optimistic rows — a snapshot captured before
             // a just-ACKed order must not erase its synthetic badge/hold
@@ -4833,6 +4914,18 @@ function createTradeNative(opts) {
               // by an OpenOrders page fetched moments earlier)
               S.orders[oid]._updTs = Date.now();
             }
+          }
+          // #1835: per-event venue-ts → arrival lag (live frames only) +
+          // frame apply time; bounded per-minute diag emit.
+          if (!lagSnapFrame && S.lag) {
+            const applyUs = lagT0 == null ? NaN
+              : Math.round((performance.now() - lagT0) * 1000);
+            for (const e of (msg.data || [])) {
+              if (!e || !e.timestamp) continue;
+              const vts = Date.parse(e.timestamp);
+              if (Number.isFinite(vts)) krLagRec(S.lag, lagArrMs - vts, applyUs);
+            }
+            krLagEmit(S, 'kraken:spot');
           }
         } else if (msg.channel === 'balances') {
           if (String(msg.type || '') === 'snapshot' || S.totals == null) S.totals = {};
@@ -4909,6 +5002,8 @@ function createTradeNative(opts) {
       const ws = krWsDial(KRAKEN_FUT_WS_URL, s.route);
       if (!ws) { reject(new Error('proxy unavailable')); return; }
       const F = s.fut;
+      // #1835: fresh per-connection lag recorder (see spot twin)
+      F.lag = krLagNew(++krWsConnSeq);
       let settled = false;
       let snapOrders = false, snapPos = false;
       const done = (err) => {
@@ -4999,11 +5094,24 @@ function createTradeNative(opts) {
           // NOT part of ready() (fills never gate trading), but the seeded
           // flag gates fills_read: an empty read before the snapshot lands
           // would advance the panel cursor past the seed window.
+          const lagArrMs = Date.now();          // #1835: stamp before apply
+          const lagT0 = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : null;
           for (const f of (msg.fills || [])) {
             const fr = krWsFutFillRow(f);
             if (fr) krFillsCachePush(F.fills, fr);
           }
           if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
+          // #1835: live fill frames only (snapshot = historic timestamps)
+          if (feed === 'fills' && F.lag) {
+            const applyUs = lagT0 == null ? NaN
+              : Math.round((performance.now() - lagT0) * 1000);
+            for (const f of (msg.fills || [])) {
+              const vts = Number((f || {}).time);
+              if (vts > 0) krLagRec(F.lag, lagArrMs - vts, applyUs);
+            }
+            krLagEmit(F, 'kraken:fut');
+          }
         }
         // heartbeat frames → liveness only
       });
@@ -7826,6 +7934,11 @@ module.exports = {
   krFillsCachePush,
   krFillsWindow,
   krFillsScopeReady,
+  // pure — Kraken private-WS lag recorder (#1835)
+  krLagNew,
+  krLagRec,
+  krLagPct,
+  krLagSnap,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
