@@ -2369,6 +2369,89 @@ function krSynSweepSymbol(orders, symbol, field) {
   return gone;
 }
 
+// --- #1826 Kraken post-trade fast lane (pure) -------------------------------
+// #1822's optimistic echo fixed the badges, but a live diag log showed two
+// gaps remained: (1) the acct_read result memo (acctReadGuard) can serve a
+// PRE-ack snapshot for up to ACCT_READ_MEMO_MS after a trade ack — nothing
+// invalidated it; (2) spot balances stay venue-truth (never fabricated), so
+// the posrow still waited on Kraken's ~3–6s-late WS balance echo. Fix: bust
+// the memoized VALUE on every successful kraken trade ack (single-flight
+// state untouched) + ONE bounded venue-truth REST confirm (BalanceEx +
+// OpenOrders) shortly after the ack, coalesced across ack bursts.
+const KR_CONFIRM_DELAY_MS = 400;      // ack → confirm (venue settle window)
+const KR_CONFIRM_MIN_GAP_MS = 1000;   // confirms never fire closer than this
+// Coalescing gate — pure state machine over an injected clock so the burst /
+// min-gap / rerun-after-in-flight behavior is node-testable. State shape:
+// { timerAt: null|ts, running: bool, again: bool, lastEnd: ts }.
+// kick(): returns the ms to wait before firing, or null when a timer is
+// already pending (burst coalesced) / a run is in flight (rerun latched).
+function krConfirmKick(st, now) {
+  if (st.timerAt != null) return null;               // burst → one timer
+  if (st.running) { st.again = true; return null; }  // rerun after in-flight
+  const at = Math.max(now + KR_CONFIRM_DELAY_MS,
+                      (st.lastEnd || 0) + KR_CONFIRM_MIN_GAP_MS);
+  st.timerAt = at;
+  return at - now;
+}
+// fire(): timer elapsed — true = run the confirm now (never two in flight).
+function krConfirmFire(st) {
+  st.timerAt = null;
+  if (st.running) { st.again = true; return false; }
+  st.running = true;
+  return true;
+}
+// done(): confirm finished — true = an ack landed mid-run, kick once more.
+function krConfirmDone(st, now) {
+  st.running = false;
+  st.lastEnd = now;
+  const again = st.again;
+  st.again = false;
+  return again;
+}
+// REST asset code → WS-v2 asset name (kr_asset_norm engine parity: 4-char
+// X/Z prefix strip FIRST, then staking suffix drop, then XBT/XDG fixes).
+function krAssetWsName(code) {
+  let s = String(code || '');
+  if (s.length === 4 && (s[0] === 'X' || s[0] === 'Z')) s = s.slice(1);
+  s = s.split('.')[0];
+  return ({ XBT: 'BTC', XDG: 'DOGE' })[s] || s;
+}
+// BalanceEx response → WS totals map. Duplicate codes SUM per normalized
+// name (XXBT + XBT.F → one BTC row — engine balances() parity; the panel
+// holding lookup takes the FIRST row, so a dust variant must never mask
+// the real balance). Values stay strings (WS balances shape).
+function krBalanceExTotals(data) {
+  const res = ((data || {}).result) || {};
+  const out = {};
+  for (const code of Object.keys(res)) {
+    const a = krAssetWsName(code);
+    const b = Number(((res[code] || {}).balance));
+    if (!a || !Number.isFinite(b)) continue;
+    out[a] = (out[a] || 0) + b;
+  }
+  for (const a of Object.keys(out)) out[a] = String(out[a]);
+  return out;
+}
+// Post-confirm reconcile: a SYNTHETIC row the venue-truth OpenOrders page
+// does not list is confirmed gone — drop it now instead of waiting out the
+// 15s TTL. Venue-truth rows (no _synTs) are never touched (the WS stream
+// owns them), and fresh synthetics get a grace window: OpenOrders itself
+// lags just-ACKed adds (#1822 lesson), so a just-placed order must not have
+// its badge eaten by the confirm it triggered.
+const KR_CONFIRM_ORDER_GRACE_MS = 2500;
+function krSynReconcile(orders, liveIds, now) {
+  const live = {};
+  for (const id of (liveIds || [])) live[String(id)] = 1;
+  const gone = [];
+  for (const oid of Object.keys(orders || {})) {
+    const ts = (orders[oid] || {})._synTs;
+    if (ts == null) continue;
+    if (now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
+    if (!live[oid]) { delete orders[oid]; gone.push(oid); }
+  }
+  return gone;
+}
+
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
 // PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
 function krPositionRows(data) {
@@ -2461,7 +2544,7 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   const rlUntil = {};    // venue → cool-down end ts
   const inflight = {};   // venue|credSlot → in-flight promise
   const memo = {};       // venue|credSlot → { ts, r }
-  return async function (intent) {
+  const guarded = async function (intent) {
     const venue = String((intent && intent.venue) || '');
     const key = venue + '|' + String((intent && intent.credSlot) || venue);
     const t0 = now();
@@ -2491,6 +2574,14 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
       return r;
     } finally { delete inflight[key]; }
   };
+  // #1826: trade acks invalidate the memoized VALUE for one venue+account so
+  // the next read reflects the optimistic echo instead of a pre-ack snapshot.
+  // Single-flight state is untouched — concurrent reads keep coalescing.
+  guarded.bust = function (venue, credSlot) {
+    delete memo[String(venue || '') + '|' + String(credSlot || venue || '')];
+    emit('bust', { venue: String(venue || '') });
+  };
+  return guarded;
 }
 
 // ---------------------------------------------------------------------------
@@ -6700,6 +6791,61 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // --- #1826 Kraken post-trade fast lane (runtime) --------------------------
+  // Every successful kraken trade ack: (1) bust the acct_read memo for the
+  // slot (next read reflects the optimistic echo, not a pre-ack snapshot);
+  // (2) spot acks additionally schedule ONE bounded venue-truth REST confirm
+  // (BalanceEx + OpenOrders) via the pure krConfirm* gate — coalesced across
+  // ack bursts, min-gapped, at most one in flight — that refreshes S.totals
+  // and drops confirmed-gone synthetics early. Fires independent of panel
+  // polling (updates shell WS session state; the next read, whenever it
+  // comes, is correct). Truth rule kept: REST responses only, never
+  // fabricated numbers. Steady-state REST avoidance kept: the lane runs
+  // ONLY on trade acks (~2 spot-point calls per burst — negligible).
+  const krConfirmLanes = {};   // slot → { st, creds, route }
+  function krTradeAckKick(slot, creds, route, market) {
+    slot = String(slot || 'kraken');
+    try { execAcctRead.bust('kraken', slot); } catch (e) { /* diag-only */ }
+    if (market !== 'spot') return;
+    let L = krConfirmLanes[slot];
+    if (!L) {
+      L = krConfirmLanes[slot] =
+        { st: { timerAt: null, running: false, again: false, lastEnd: 0 } };
+    }
+    L.creds = creds; L.route = route;   // freshest creds/route win
+    krConfirmSchedule(slot, L);
+  }
+  function krConfirmSchedule(slot, L) {
+    const wait = krConfirmKick(L.st, Date.now());
+    if (wait == null) return;
+    const t = setTimeout(() => { krConfirmRun(slot, L); }, wait);
+    if (t && typeof t.unref === 'function') t.unref();
+  }
+  async function krConfirmRun(slot, L) {
+    if (!krConfirmFire(L.st)) return;
+    try {
+      const sess = krWsSessGet(slot);
+      const bal = await krRequest(L.creds, 'POST', 'spot',
+                                  '/0/private/BalanceEx', null, L.route);
+      if (bal.ok && sess) {
+        // venue truth replaces the stale WS totals; later WS deltas keep
+        // merging per-asset on top (both are venue truth, newest wins soon)
+        sess.spot.totals = krBalanceExTotals(bal.data);
+      }
+      const so = await krRequest(L.creds, 'POST', 'spot',
+                                 '/0/private/OpenOrders', null, L.route);
+      if (so.ok && sess) {
+        const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
+        krSynReconcile(sess.spot.orders, ids, Date.now());
+      }
+      // the confirm changed session state — bust again so a read memoized
+      // during the confirm can't serve the pre-confirm view for ~1.2s
+      try { execAcctRead.bust('kraken', slot); } catch (e) { /* diag-only */ }
+      tdiag('acct', 'kr_confirm', { ok: !!(bal.ok && so.ok) });
+    } catch (e) { /* best-effort: the next steady-state read is the truth */ }
+    if (krConfirmDone(L.st, Date.now())) krConfirmSchedule(slot, L);
+  }
+
   // Kraken native fills read (#1814): the private WS sessions above INGEST
   // executions (spot WS-v2 `executions` trade events incl. the snap_trades
   // seed snapshot; futures ws/v1 `fills` feed incl. its last-100 snapshot)
@@ -7080,7 +7226,16 @@ function createTradeNative(opts) {
       if (intent.venue === 'asterdex') return await execAster(creds, intent, route);
       if (intent.venue === 'arcus') return await execArcus(creds, intent, route);
       if (intent.venue === 'lighter') return await execLighter(creds, intent, route);
-      if (intent.venue === 'kraken') return await execKraken(creds, intent, route);
+      if (intent.venue === 'kraken') {
+        const r = await execKraken(creds, intent, route);
+        // #1826: every successful trade ack busts the acct_read memo (all
+        // ops here mutate — reads ride acct_read) + kicks the spot fast lane.
+        if (r && r.ok) {
+          krTradeAckKick(intent.credSlot || 'kraken', creds, route,
+                         intent.market === 'spot' ? 'spot' : 'futures');
+        }
+        return r;
+      }
       if (intent.op === 'close') {
         // Positions lookup → reduce-only market for the full size; ONE retry
         // on a miss (fresh-position REST lag), mirroring the engine.
@@ -7452,6 +7607,16 @@ module.exports = {
   krSynPrune,
   krSynCarry,
   krSynSweepSymbol,
+  // pure — Kraken post-trade fast lane (#1826)
+  KR_CONFIRM_DELAY_MS,
+  KR_CONFIRM_MIN_GAP_MS,
+  KR_CONFIRM_ORDER_GRACE_MS,
+  krConfirmKick,
+  krConfirmFire,
+  krConfirmDone,
+  krAssetWsName,
+  krBalanceExTotals,
+  krSynReconcile,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
   krRestSpotWsRow,
