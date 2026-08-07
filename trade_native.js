@@ -2049,6 +2049,142 @@ function krSpotOrderParams(alt, side, ordType, qty, price, clOrdID) {
   if (cid) p.push(['cl_ord_id', cid]);
   return p;
 }
+// --- Kraken private WebSockets (#1804 — nonce-free private path) ------------
+// One key shared by the server engine and this signer runs TWO strictly-
+// increasing REST nonce streams → permanent EAPI:Invalid nonce. The WS
+// interface has no per-request nonces: spot rides WS-v2 (one
+// GetWebSocketsToken REST call, then executions/balances streams + order
+// entry on the socket); futures rides ws/v1 challenge-signed feeds. The
+// pure converters below re-shape WS frames into the EXACT REST payload
+// shapes execKrakenAcctRead already returns, so the panel parser stays the
+// single source of truth (byte-compatible with the REST path).
+const KRAKEN_SPOT_WS_URL = 'wss://ws-auth.kraken.com/v2';
+const KRAKEN_FUT_WS_URL = 'wss://futures.kraken.com/ws/v1';
+const KR_WS_ENABLE_HINT = 'enable the "WebSocket interface" permission on '
+  + 'your kraken.com API key (Settings \u2192 API), then reconnect';
+// Futures ws/v1 challenge signature: b64(HMAC-SHA512(b64decode(secret),
+// SHA256(challenge))) — kr_fut_ws_sign golden parity.
+function krFutWsSign(secretB64, challenge) {
+  const digest = crypto.createHash('sha256')
+    .update(String(challenge), 'utf8').digest();
+  return crypto.createHmac('sha512', Buffer.from(String(secretB64), 'base64'))
+    .update(digest).digest('base64');
+}
+// GetWebSocketsToken "Permission denied" → the key lacks the WebSocket
+// interface toggle; actionable message (null for every other error).
+function krWsPermMsg(err) {
+  if (String(err || '').toLowerCase().indexOf('permission denied') >= 0) {
+    return 'Kraken WS token refused \u2014 ' + KR_WS_ENABLE_HINT;
+  }
+  return null;
+}
+// Spot WS-v2 executions order_status values that mean the order LEFT the book.
+const KR_WS_SPOT_GONE = { filled: 1, canceled: 1, cancelled: 1, expired: 1 };
+// ws/v1 open_orders order dict → REST openorders row shape (qty=REMAINING;
+// direction 1=sell; type limit/stop/take_profit → lmt/stop/take_profit).
+function krWsFutOrderRest(o) {
+  const t = String((o || {}).type || '').toLowerCase();
+  return {
+    order_id: String((o || {}).order_id || ''),
+    symbol: String((o || {}).instrument || '').toUpperCase(),
+    side: ((o || {}).direction === 1 || (o || {}).direction === '1') ? 'sell' : 'buy',
+    orderType: t === 'limit' ? 'lmt' : t,
+    limitPrice: (o || {}).limit_price,
+    stopPrice: (o || {}).stop_price,
+    unfilledSize: (o || {}).qty,
+    filledSize: (o || {}).filled || 0,
+    reduceOnly: !!(o || {}).reduce_only,
+    cliOrdId: (o || {}).cli_ord_id,
+    receivedTime: (o || {}).time,
+  };
+}
+// ws/v1 open_positions row → REST openpositions row shape (signed balance).
+function krWsFutPosRest(p) {
+  const bal = Number((p || {}).balance);
+  if (!Number.isFinite(bal) || bal === 0) return null;
+  return {
+    side: bal < 0 ? 'short' : 'long',
+    symbol: String((p || {}).instrument || '').toUpperCase(),
+    size: Math.abs(bal),
+    price: (p || {}).entry_price,
+    effectiveLeverage: (p || {}).effective_leverage,
+    initialMargin: (p || {}).initial_margin,
+  };
+}
+// ws/v1 balances flex_futures (snake_case) → REST /accounts payload shape.
+function krWsFlexRest(flex) {
+  const f = flex || {};
+  const cur = {};
+  const c = f.currencies || {};
+  for (const k of Object.keys(c)) {
+    const e = c[k] || {};
+    cur[k] = { quantity: e.quantity, value: e.value,
+               collateral: e.collateral_value, available: e.available };
+  }
+  return { accounts: { flex: {
+    balanceValue: f.balance_value,
+    portfolioValue: f.portfolio_value,
+    initialMargin: f.initial_margin,
+    availableMargin: f.available_margin,
+    currencies: cur,
+  } } };
+}
+// WS-v2 spot open orders (raw element map) → per-asset holds: a resting
+// SELL holds remaining BASE, a resting limit BUY holds remaining×price QUOTE.
+function krWsSpotHolds(orders) {
+  const holds = {};
+  for (const oid of Object.keys(orders || {})) {
+    const e = orders[oid] || {};
+    const sym = String(e.symbol || '');
+    if (sym.indexOf('/') < 0) continue;
+    const parts = sym.split('/');
+    const rem = (Number(e.order_qty) || 0) - (Number(e.cum_qty) || 0);
+    if (!(rem > 0)) continue;
+    if (String(e.side || '').toLowerCase() === 'sell') {
+      holds[parts[0]] = (holds[parts[0]] || 0) + rem;
+    } else if (e.limit_price != null && Number(e.limit_price) > 0) {
+      holds[parts[1]] = (holds[parts[1]] || 0) + rem * Number(e.limit_price);
+    }
+  }
+  return holds;
+}
+// WS-v2 balances totals + derived holds → REST BalanceEx payload shape.
+function krWsSpotBalanceEx(totals, holds) {
+  const result = {};
+  for (const a of Object.keys(totals || {})) {
+    const bal = Number(totals[a]) || 0;
+    let h = Number((holds || {})[a]) || 0;
+    if (h < 0) h = 0;
+    if (h > bal) h = bal;
+    if (bal === 0 && h === 0) continue;
+    result[a] = { balance: String(totals[a]), hold_trade: String(h) };
+  }
+  return { error: [], result: result };
+}
+// WS-v2 spot open orders → REST OpenOrders [{txid, o}] rows (descr.pair =
+// ALTNAME via the symbol→alt map from the public catalog).
+function krWsSpotOpenOrders(orders, altOf) {
+  const rows = [];
+  for (const oid of Object.keys(orders || {})) {
+    const e = orders[oid] || {};
+    const sym = String(e.symbol || '');
+    rows.push({ txid: oid, o: {
+      descr: {
+        pair: (altOf && altOf[sym] && altOf[sym].alt) || sym.replace('/', ''),
+        type: String(e.side || '').toLowerCase() === 'sell' ? 'sell' : 'buy',
+        ordertype: String(e.order_type || 'limit').toLowerCase(),
+        price: e.limit_price == null ? '0' : String(e.limit_price),
+      },
+      vol: e.order_qty == null ? '0' : String(e.order_qty),
+      vol_exec: e.cum_qty == null ? '0' : String(e.cum_qty),
+      status: 'open',
+      cl_ord_id: e.cl_ord_id || undefined,
+      opentm: e.timestamp ? Date.parse(e.timestamp) / 1000 : undefined,
+    } });
+  }
+  return rows;
+}
+
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
 // PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
 function krPositionRows(data) {
@@ -2239,12 +2375,14 @@ function createTradeNative(opts) {
     const tailSrc = key || key2;
     venues[venue] = { b64: b64, tail: tailSrc.length >= 4 ? tailSrc.slice(-4) : tailSrc, ts: Math.floor(Date.now() / 1000) };
     if (!credsSaveAll(venues)) return { ok: false, error: 'persist-failed' };
+    try { krWsCloseAll(venue); } catch (e) { /* no session */ }
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
     const venues = credsLoadAll();
     if (venue) delete venues[venue];
     credsSaveAll(venues);
+    try { if (venue) krWsCloseAll(venue); else for (const k of Object.keys(krWsSessions)) krWsClose(k); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -4095,6 +4233,345 @@ function createTradeNative(opts) {
     return { ok: true, data: data };
   }
 
+  // --- Kraken private WS sessions (#1804) -----------------------------------
+  // One session per cred slot: spot WS-v2 (token, executions+balances,
+  // order entry) + futures ws/v1 (challenge-signed feeds). Started lazily
+  // on the first acct read / order for the slot; reconnects with backoff;
+  // closed on creds change/wipe. Whenever a socket is down, callers fall
+  // back to the existing REST path (fail-visible via wsErr — the nonce
+  // retry still guards that lane).
+  let WSC = null;
+  try { WSC = require('ws'); } catch (e) { /* fall back to REST-only */ }
+  const KR_WS_ORDER_TIMEOUT_MS = 8000;
+  const KR_WS_STALE_MS = 30000;          // no frame in 30s → treat as down
+  const krWsSessions = {};               // slot → session
+  function krWsSleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
+
+  function krWsSessGet(slot) { return krWsSessions[String(slot || 'kraken')] || null; }
+
+  function krWsClose(slot) {
+    const s = krWsSessions[String(slot || 'kraken')];
+    if (!s) return;
+    s.closed = true;
+    for (const side of ['spot', 'fut']) {
+      const S = s[side];
+      if (S && S.ws) { try { S.ws.terminate(); } catch (e) { /* gone */ } }
+    }
+    delete krWsSessions[String(slot || 'kraken')];
+  }
+  function krWsCloseAll(venue) {
+    for (const k of Object.keys(krWsSessions)) {
+      if (k === venue || k.indexOf(String(venue) + '#') === 0) krWsClose(k);
+    }
+  }
+
+  function krWsFailPending(S, msg) {
+    for (const rid of Object.keys(S.pending || {})) {
+      const fut = S.pending[rid];
+      delete S.pending[rid];
+      try { fut.reject(new Error(msg || 'Kraken spot WS closed')); } catch (e) { /* raced */ }
+    }
+  }
+
+  // Live = subscribed AND a frame within the stale window (heartbeats
+  // arrive ~1s on both sockets, so a quiet account still ticks).
+  function krWsLive(S) {
+    return !!(S && S.up && S.ws && Date.now() - (S.lastMsg || 0) < KR_WS_STALE_MS);
+  }
+
+  function krWsEnsure(slot, creds, route) {
+    slot = String(slot || 'kraken');
+    let s = krWsSessions[slot];
+    if (!WSC) return null;
+    // change-detection tail from the RESOLVED pairs (signing discipline:
+    // never touch raw creds fields — krPairFor owns dual-pair routing)
+    const ps = krPairFor(creds, 'spot');
+    const pf = krPairFor(creds, 'futures');
+    const tail = ((ps && ps.key) || '') + '|' + ((pf && pf.key) || '');
+    if (s && s.tail !== tail) { krWsClose(slot); s = null; }
+    if (!s) {
+      s = krWsSessions[slot] = {
+        tail: tail, closed: false, route: routeNorm(route),
+        spot: { running: false, up: false, ws: null, err: null, lastMsg: 0,
+                orders: {}, totals: null, reqId: 0, pending: {} },
+        fut: { running: false, up: false, ws: null, err: null, lastMsg: 0,
+               orders: {}, positions: null, flex: null },
+      };
+    }
+    if (krPairFor(creds, 'spot') && !s.spot.running) krWsSpotLoop(slot, s, creds);
+    if (krPairFor(creds, 'futures') && !s.fut.running) krWsFutLoop(slot, s, creds);
+    return s;
+  }
+
+  function krWsDial(url, route) {
+    const ag = agentFor(route);
+    if (ag.refuse) return null;
+    const opts = { handshakeTimeout: 15000 };
+    if (ag.agent !== undefined) opts.agent = ag.agent;
+    return new WSC(url, opts);
+  }
+
+  function krWsSpotLoop(slot, s, creds) {
+    s.spot.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (krWsSessions[slot] === s && !s.closed) {
+        const tok = await krRequest(creds, 'POST', 'spot',
+                                    '/0/private/GetWebSocketsToken', null, s.route);
+        if (s.closed || krWsSessions[slot] !== s) break;
+        let token = null;
+        if (tok.ok) token = ((((tok.data || {}).result) || {}).token) || null;
+        if (!token) {
+          const perm = krWsPermMsg(tok.message || '');
+          s.spot.err = perm || ('Kraken WS token fetch failed: '
+                                + (tok.message || 'no token'));
+          await krWsSleep(perm ? 300000 : backoff);
+          backoff = Math.min(backoff * 2, 60000);
+          continue;
+        }
+        try {
+          await krWsSpotConn(slot, s, token);
+          backoff = 2000;
+        } catch (e) {
+          s.spot.err = 'Kraken spot WS: ' + ((e && e.message) || 'error');
+        }
+        s.spot.up = false; s.spot.ws = null;
+        krWsFailPending(s.spot);
+        if (s.closed || krWsSessions[slot] !== s) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      s.spot.running = false;
+    })().catch(() => { s.spot.running = false; });
+  }
+
+  function krWsSpotConn(slot, s, token) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(KRAKEN_SPOT_WS_URL, s.route);
+      if (!ws) { reject(new Error('proxy unavailable')); return; }
+      const S = s.spot;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return; settled = true;
+        clearInterval(idleT);
+        try { ws.terminate(); } catch (e) { /* gone */ }
+        if (S.ws === ws) { S.ws = null; S.up = false; }
+        if (err) reject(err); else resolve();
+      };
+      const subs = {};
+      const idleT = setInterval(() => {
+        const idle = Date.now() - (S.lastMsg || 0);
+        if (idle > KR_WS_STALE_MS * 2) done(new Error('stream stalled'));
+        else if (idle > 15000) { try { ws.ping(); } catch (e) { /* dying */ } }
+      }, 5000);
+      ws.on('open', () => {
+        S.lastMsg = Date.now();
+        try {
+          ws.send(JSON.stringify({ method: 'subscribe', params: {
+            channel: 'executions', token: token,
+            snap_orders: true, snap_trades: false } }));
+          ws.send(JSON.stringify({ method: 'subscribe', params: {
+            channel: 'balances', token: token } }));
+        } catch (e) { done(e); }
+      });
+      ws.on('pong', () => { S.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        S.lastMsg = Date.now();
+        let msg;
+        try { msg = JSON.parse(String(buf)); } catch (e) { return; }
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.method === 'subscribe') {
+          if (!msg.success) {
+            done(new Error('subscribe failed: '
+                           + String(msg.error || 'rejected')));
+            return;
+          }
+          subs[String(((msg.result || {}).channel) || '')] = 1;
+          if (subs.executions && subs.balances && !S.up) {
+            S.ws = ws; S.up = true; S.err = null; S.token = token;
+          }
+          return;
+        }
+        if (msg.req_id != null && S.pending[msg.req_id]) {
+          const fut = S.pending[msg.req_id];
+          delete S.pending[msg.req_id];
+          fut.resolve(msg);
+          return;
+        }
+        if (msg.channel === 'executions') {
+          if (String(msg.type || '') === 'snapshot') S.orders = {};
+          for (const e of (msg.data || [])) {
+            if (!e || typeof e !== 'object') continue;
+            const oid = String(e.order_id || '');
+            if (!oid) continue;
+            if (KR_WS_SPOT_GONE[String(e.order_status || '').toLowerCase()]) {
+              delete S.orders[oid];
+            } else {
+              // delta frames carry partial fields — merge onto the row
+              S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
+            }
+          }
+        } else if (msg.channel === 'balances') {
+          if (String(msg.type || '') === 'snapshot' || S.totals == null) S.totals = {};
+          for (const r of (msg.data || [])) {
+            if (!r || typeof r !== 'object') continue;
+            const a = String(r.asset || '').toUpperCase();
+            if (a && r.balance != null) S.totals[a] = r.balance;
+          }
+        }
+        // status / heartbeat / pong frames → lastMsg bump only
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('stream closed')));
+    });
+  }
+
+  // One spot WS-v2 request/reply (add_order / cancel_order). Errors carry
+  // .krWsDown=true when NOTHING was sent (safe REST fallback); post-send
+  // failures don't (caller must not blind-resend an order).
+  function krWsSpotCall(s, method, params) {
+    const S = s && s.spot;
+    return new Promise((resolve, reject) => {
+      if (!krWsLive(S)) {
+        const e = new Error('Kraken spot WS not connected');
+        e.krWsDown = true; reject(e); return;
+      }
+      S.reqId += 1;
+      const rid = S.reqId;
+      const p = Object.assign({}, params || {}, { token: S.token });
+      const t = setTimeout(() => {
+        if (S.pending[rid]) {
+          delete S.pending[rid];
+          reject(new Error('Kraken spot WS timed out'));
+        }
+      }, KR_WS_ORDER_TIMEOUT_MS);
+      S.pending[rid] = {
+        resolve: (m) => { clearTimeout(t); resolve(m); },
+        reject: (err) => { clearTimeout(t); reject(err); },
+      };
+      try {
+        S.ws.send(JSON.stringify({ method: method, params: p, req_id: rid }));
+      } catch (e2) {
+        delete S.pending[rid];
+        clearTimeout(t);
+        const e = new Error('Kraken spot WS send failed');
+        e.krWsDown = true; reject(e);
+      }
+    });
+  }
+
+  function krWsFutLoop(slot, s, creds) {
+    s.fut.running = true;
+    const pair = krPairFor(creds, 'futures');
+    (async () => {
+      let backoff = 2000;
+      while (krWsSessions[slot] === s && !s.closed) {
+        try {
+          await krWsFutConn(s, pair);
+          backoff = 2000;
+        } catch (e) {
+          s.fut.err = 'Kraken futures WS: ' + ((e && e.message) || 'error');
+        }
+        s.fut.up = false; s.fut.ws = null;
+        if (s.closed || krWsSessions[slot] !== s) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      s.fut.running = false;
+    })().catch(() => { s.fut.running = false; });
+  }
+
+  function krWsFutConn(s, pair) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(KRAKEN_FUT_WS_URL, s.route);
+      if (!ws) { reject(new Error('proxy unavailable')); return; }
+      const F = s.fut;
+      let settled = false;
+      let snapOrders = false, snapPos = false;
+      const done = (err) => {
+        if (settled) return; settled = true;
+        clearInterval(idleT);
+        try { ws.terminate(); } catch (e) { /* gone */ }
+        if (F.ws === ws) { F.ws = null; F.up = false; }
+        if (err) reject(err); else resolve();
+      };
+      const idleT = setInterval(() => {
+        if (Date.now() - (F.lastMsg || 0) > KR_WS_STALE_MS * 2) {
+          done(new Error('stream stalled'));
+        }
+      }, 5000);
+      const ready = () => {
+        // serve the futures scope only once ALL THREE surfaces exist —
+        // a partial WS view must never spoof an empty account
+        if (snapOrders && snapPos && F.flex != null && !F.up) {
+          F.ws = ws; F.up = true; F.err = null;
+        }
+      };
+      ws.on('open', () => {
+        F.lastMsg = Date.now();
+        try { ws.send(JSON.stringify({ event: 'challenge', api_key: pair.key })); }
+        catch (e) { done(e); }
+      });
+      ws.on('message', (buf) => {
+        F.lastMsg = Date.now();
+        let msg;
+        try { msg = JSON.parse(String(buf)); } catch (e) { return; }
+        if (!msg || typeof msg !== 'object') return;
+        const ev = String(msg.event || '');
+        if (ev === 'challenge' && msg.message) {
+          let signed;
+          try { signed = krFutWsSign(pair.secret, msg.message); }
+          catch (e) { done(new Error('invalid futures secret')); return; }
+          try {
+            for (const feed of ['open_orders', 'open_positions', 'balances']) {
+              ws.send(JSON.stringify({ event: 'subscribe', feed: feed,
+                                       api_key: pair.key,
+                                       original_challenge: msg.message,
+                                       signed_challenge: signed }));
+            }
+            ws.send(JSON.stringify({ event: 'subscribe', feed: 'heartbeat' }));
+          } catch (e) { done(e); }
+          return;
+        }
+        if (ev === 'error' || ev === 'alert') {
+          done(new Error(String(msg.message || 'futures ws error')));
+          return;
+        }
+        const feed = String(msg.feed || '');
+        if (feed === 'open_orders_snapshot') {
+          F.orders = {};
+          for (const o of (msg.orders || [])) {
+            const oid = String((o || {}).order_id || '');
+            if (oid) F.orders[oid] = o;
+          }
+          snapOrders = true; ready();
+        } else if (feed === 'open_orders') {
+          const o = msg.order;
+          if (o && typeof o === 'object') {
+            const oid = String(o.order_id || '');
+            if (oid) {
+              if (msg.is_cancel) delete F.orders[oid];
+              else F.orders[oid] = o;
+            }
+          } else if (msg.order_id) {
+            delete F.orders[String(msg.order_id)];
+          }
+        } else if (feed === 'open_positions') {
+          F.positions = msg.positions || [];
+          snapPos = true; ready();
+        } else if (feed === 'balances_snapshot' || feed === 'balances') {
+          if (msg.flex_futures && typeof msg.flex_futures === 'object') {
+            F.flex = msg.flex_futures;
+            ready();
+          }
+        }
+        // fills / heartbeat frames → liveness only (device keeps fills [])
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('stream closed')));
+    });
+  }
+
   // Public product specs (TTL): futures PF_ steps + spot altname/lot steps.
   // Full-catalog GETs — pass a raised response cap (shell httpJson defaults
   // to 256 KB; AssetPairs/instruments exceed it → masked "unknown symbol").
@@ -4137,6 +4614,9 @@ function createTradeNative(opts) {
 
   async function execKraken(creds, intent, route) {
     const market = intent.market === 'spot' ? 'spot' : 'futures';
+    // Warm the private WS for this slot (first order may still ride REST;
+    // subsequent ones go nonce-free over the socket).
+    try { krWsEnsure(intent.credSlot || 'kraken', creds, route); } catch (e) { /* REST path */ }
     const fetchPos = async () => {
       const r = await krRequest(creds, 'GET', 'futures',
                                 '/derivatives/api/v3/openpositions', null, route);
@@ -4175,6 +4655,33 @@ function createTradeNative(opts) {
         const q = krQtyFloor(qv, spec.qty_step);
         if (q == null || !(Number(q) > 0)) {
           return { ok: false, message: 'Quantity below the step for ' + symbol };
+        }
+        // #1804: WS-first order entry (nonce-free + lower latency). KrWsDown
+        // (nothing sent) → REST fallback; post-send timeout → surface
+        // "state unknown", NEVER a blind REST re-send.
+        const sessO = krWsSessGet(intent.credSlot || 'kraken');
+        if (sessO && krWsLive(sessO.spot)) {
+          const wp = { symbol: symbol,
+                       side: String(side).toLowerCase() === 'buy' ? 'buy' : 'sell',
+                       order_type: t === 'limit' ? 'limit' : 'market',
+                       order_qty: Number(q) };
+          if (t === 'limit') wp.limit_price = Number(price);
+          const cid = krClOrdId(clOrdID);
+          if (cid) wp.cl_ord_id = cid;
+          let m;
+          try { m = await krWsSpotCall(sessO, 'add_order', wp); }
+          catch (e) {
+            if (e && e.krWsDown) { m = null; }        // fall through to REST
+            else return { ok: false, message: 'Kraken WS order state unknown — check open orders before retrying' };
+          }
+          if (m) {
+            if (!m.success) {
+              return { ok: false, message: String(m.error || 'Kraken rejected the order') };
+            }
+            const oid = String(((m.result || {}).order_id) || '');
+            if (!oid) return { ok: false, message: 'Kraken returned no order id' };
+            return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+          }
         }
         const params = krSpotOrderParams(spec.alt, side, t, q, price, clOrdID);
         const r = await krRequest(creds, 'POST', 'spot', '/0/private/AddOrder', params, route);
@@ -4220,6 +4727,16 @@ function createTradeNative(opts) {
         const st = String(cs.status || '');
         if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
         return { ok: true, cancelled: intent.orderID };
+      }
+      // #1804: WS cancel first — cancels are idempotent, so ANY WS failure
+      // safely falls back to REST.
+      const sessC = krWsSessGet(intent.credSlot || 'kraken');
+      if (sessC && krWsLive(sessC.spot)) {
+        try {
+          const m = await krWsSpotCall(sessC, 'cancel_order',
+                                       { order_id: [String(intent.orderID)] });
+          if (m && m.success) return { ok: true, cancelled: intent.orderID };
+        } catch (e) { /* REST fallback below */ }
       }
       const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                 [['txid', String(intent.orderID)]], route);
@@ -5850,29 +6367,62 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'kraken');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
-    const flex = await krRequest(creds, 'GET', 'futures',
-                                 '/derivatives/api/v3/accounts', null, route);
-    if (!flex.ok) return flex;
-    const pos = await krRequest(creds, 'GET', 'futures',
-                                '/derivatives/api/v3/openpositions', null, route);
-    if (!pos.ok) return pos;
-    const fo = await krRequest(creds, 'GET', 'futures',
-                               '/derivatives/api/v3/openorders', null, route);
-    if (!fo.ok) return fo;
-    const bal = await krRequest(creds, 'POST', 'spot', '/0/private/BalanceEx', null, route);
-    if (!bal.ok) return bal;
-    const so = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
-    if (!so.ok) return so;
-    // Flatten the spot OpenOrders map to [{txid, o}] preserving the ids.
-    const spotOrders = [];
-    const openMap = (((so.data || {}).result) || {}).open || {};
-    for (const txid of Object.keys(openMap)) spotOrders.push({ txid: txid, o: openMap[txid] });
-    return { ok: true,
-             flexAccount: flex.data || null,
-             spotBalances: bal.data || null,
-             positions: ((pos.data || {}).openPositions) || [],
-             futOrders: ((fo.data || {}).openOrders) || [],
-             spotOrders: spotOrders };
+    // #1804: private WS first — per SCOPE all-WS-or-all-REST (a partial WS
+    // view never mixes with REST rows). REST fallback keeps the nonce
+    // retry; the only steady-state REST nonce user is the rare token fetch.
+    const sess = krWsEnsure(intent.credSlot || 'kraken', creds, route);
+    const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
+    const wsFut = !!(sess && krWsLive(sess.fut));
+    const out = { ok: true, wsSpot: wsSpot, wsFut: wsFut };
+    if (sess && (sess.spot.err || sess.fut.err)) {
+      out.wsErr = sess.spot.err || sess.fut.err;
+    }
+    if (wsFut) {
+      const F = sess.fut;
+      out.flexAccount = krWsFlexRest(F.flex);
+      const positions = [];
+      for (const p of (F.positions || [])) {
+        const row = krWsFutPosRest(p);
+        if (row) positions.push(row);
+      }
+      out.positions = positions;
+      const futOrders = [];
+      for (const oid of Object.keys(F.orders)) futOrders.push(krWsFutOrderRest(F.orders[oid]));
+      out.futOrders = futOrders;
+    } else {
+      const flex = await krRequest(creds, 'GET', 'futures',
+                                   '/derivatives/api/v3/accounts', null, route);
+      if (!flex.ok) return flex;
+      const pos = await krRequest(creds, 'GET', 'futures',
+                                  '/derivatives/api/v3/openpositions', null, route);
+      if (!pos.ok) return pos;
+      const fo = await krRequest(creds, 'GET', 'futures',
+                                 '/derivatives/api/v3/openorders', null, route);
+      if (!fo.ok) return fo;
+      out.flexAccount = flex.data || null;
+      out.positions = ((pos.data || {}).openPositions) || [];
+      out.futOrders = ((fo.data || {}).openOrders) || [];
+    }
+    if (wsSpot) {
+      const S = sess.spot;
+      out.spotBalances = krWsSpotBalanceEx(S.totals, krWsSpotHolds(S.orders));
+      // altname map from the public catalog (cached; public GET, no nonce)
+      let prods = null;
+      try { prods = await krProducts(route); } catch (e) { prods = null; }
+      out.spotOrders = krWsSpotOpenOrders(S.orders, (prods || {}).spot || {});
+    } else {
+      const bal = await krRequest(creds, 'POST', 'spot', '/0/private/BalanceEx', null, route);
+      if (!bal.ok) return bal;
+      const so = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
+      if (!so.ok) return so;
+      // Flatten the spot OpenOrders map to [{txid, o}] preserving the ids.
+      const spotOrders = [];
+      const openMap = (((so.data || {}).result) || {}).open || {};
+      for (const txid of Object.keys(openMap)) spotOrders.push({ txid: txid, o: openMap[txid] });
+      out.spotBalances = bal.data || null;
+      out.spotOrders = spotOrders;
+    }
+    return out;
   }
 
   // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
@@ -6488,6 +7038,19 @@ module.exports = {
   krFutOrderParams,
   krSpotOrderParams,
   krPositionRows,
+  // pure — Kraken private WS (#1804)
+  KRAKEN_SPOT_WS_URL,
+  KRAKEN_FUT_WS_URL,
+  KR_WS_ENABLE_HINT,
+  krFutWsSign,
+  krWsPermMsg,
+  KR_WS_SPOT_GONE,
+  krWsFutOrderRest,
+  krWsFutPosRest,
+  krWsFlexRest,
+  krWsSpotHolds,
+  krWsSpotBalanceEx,
+  krWsSpotOpenOrders,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
