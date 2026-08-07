@@ -2556,6 +2556,65 @@ function krLedgerPts(L, now) {
 }
 function krIsRateLimited(msg) { return /rate ?limit/i.test(String(msg || '')); }
 
+// --- #1839 Kraken spot TRADING rate counter (pure) --------------------------
+// SECOND, independent limiter (live diag proof, v1.5.47 REPPO scalp): the
+// #1832 query ledger held (68 kr_budget events, zero query failures) yet 2
+// cancel_alls STILL failed "rate limit persisted ~5s". Kraken spot has a
+// separate TRADING counter with AGE PENALTIES on cancels: cancelling an
+// order only seconds old costs up to +8 points (schedule below), decay is
+// tier-dependent (~1/s starter … ~3.75/s pro). 15 sweeps × per-order
+// CancelOrder on young orders exhausted it regardless of query points —
+// hence the ONE-call bulk sweep + this mirror. Semantics: cancels are NEVER
+// blocked (they spend, clamped at 0 — priority, exactly like the query
+// ledger); order ADDS are softly gated (bounded pace wait, then send anyway
+// flagged `paced`) so a Space sweep always has penalty headroom.
+const KR_TRADE_MAX = 60;            // starter-tier trading counter
+const KR_TRADE_DECAY = 0.33;        // pts/s decay (cautious worst case; pro ~2.33)
+const KR_TRADE_FLOOR = 10;          // headroom reserved for a sweep penalty
+const KR_ORDER_PACE_MAX_MS = 1500;  // adds soft-defer at most this, then send
+// Cancel age-penalty schedule (Kraken docs, seconds since the order was
+// placed → extra points). Unknown age = worst case (cautious mirror).
+function krCancelPenalty(ageS) {
+  const a = Number(ageS);
+  if (!(a >= 0)) return 8;
+  if (a < 5) return 8;
+  if (a < 10) return 6;
+  if (a < 15) return 5;
+  if (a < 45) return 4;
+  if (a < 90) return 2;
+  if (a < 300) return 1;
+  return 0;
+}
+function krTradeLedgerNew(now) { return { pts: KR_TRADE_MAX, ts: Number(now) || 0 }; }
+function krTradeRefill(L, now) {
+  const dt = Math.max(0, (Number(now) || 0) - L.ts) / 1000;
+  L.pts = Math.min(KR_TRADE_MAX, L.pts + dt * KR_TRADE_DECAY);
+  L.ts = Number(now) || 0;
+}
+// Spend unconditionally (cancels/sweeps ride this — never blocked; mirror
+// clamps at 0 like the query ledger). Returns pts AFTER the spend.
+function krTradeSpend(L, cost, now) {
+  krTradeRefill(L, now);
+  L.pts = Math.max(0, L.pts - (Number(cost) || 0));
+  return L.pts;
+}
+// Soft gate for order ADDS: below the reserved floor the add waits a bounded
+// beat (never longer than KR_ORDER_PACE_MAX_MS) and then sends ANYWAY,
+// flagged paced — an order is never refused by the mirror, cancels just
+// always keep headroom. { send:true } or { send:true, waitMs, paced:true }.
+function krTradeGate(L, cost, now) {
+  krTradeRefill(L, now);
+  if (L.pts - cost >= KR_TRADE_FLOOR) return { send: true };
+  const need = (KR_TRADE_FLOOR + cost) - L.pts;
+  const waitMs = Math.min(KR_ORDER_PACE_MAX_MS,
+                          Math.ceil((need / KR_TRADE_DECAY) * 1000));
+  return { send: true, waitMs: waitMs, paced: true };
+}
+function krTradePts(L, now) {
+  const dt = Math.max(0, (Number(now) || 0) - L.ts) / 1000;
+  return Math.min(KR_TRADE_MAX, L.pts + dt * KR_TRADE_DECAY);
+}
+
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
 // PF_ contractSize 1 — kr_row_from_fut_pos parity; no mark on Kraken rows).
 function krPositionRows(data) {
@@ -4549,6 +4608,36 @@ function createTradeNative(opts) {
   function krLedgerFor(key) {
     return krLedgers[key] || (krLedgers[key] = krLedgerNew(Date.now()));
   }
+  // #1839 per-spot-key TRADING counters + order birth stamps (cancel age
+  // penalties key on how old the order is at cancel time). Bounded map —
+  // oldest stamps drop past 500 entries; a missing stamp = worst-case
+  // penalty (cautious mirror).
+  const krTradeLedgers = {};   // spot api key → { pts, ts }
+  function krTradeLedgerFor(key) {
+    return krTradeLedgers[key] || (krTradeLedgers[key] = krTradeLedgerNew(Date.now()));
+  }
+  const krOrderBirth = {};     // spot txid → placed-at ms
+  function krOrderBirthRec(oid) {
+    if (!oid) return;
+    krOrderBirth[String(oid)] = Date.now();
+    const ks = Object.keys(krOrderBirth);
+    if (ks.length > 500) { for (let i = 0; i < ks.length - 400; i++) delete krOrderBirth[ks[i]]; }
+  }
+  function krOrderAgeS(oid) {
+    const t = krOrderBirth[String(oid || '')];
+    return t > 0 ? (Date.now() - t) / 1000 : null;   // null = unknown → worst case
+  }
+  // Spend on the trading mirror + one bounded diag row when it runs low
+  // (the panel's amber pacing note keys off `paced` on the order ack).
+  function krTradeSpendFor(key, cost, what) {
+    const L = krTradeLedgerFor(key);
+    const pts = krTradeSpend(L, cost, Date.now());
+    if (pts < KR_TRADE_FLOOR) {
+      tdiag('trade', 'kr_budget', { k: 'kraken', p: what, act: 'trade_low',
+        cost: cost, tpts: Math.round(pts * 10) / 10 });
+    }
+    return pts;
+  }
   // _pri: caller-declared priority — a query REQUIRED by a cancel flow (spot
   // cancel_all's OpenOrders id-discovery) rides the reserved lane: it never
   // defers/skips at the floor, and a body-level rate limit retries on the
@@ -5208,6 +5297,26 @@ function createTradeNative(opts) {
         if (q == null || !(Number(q) > 0)) {
           return { ok: false, message: 'Quantity below the step for ' + symbol };
         }
+        // #1839: TRADING-counter soft gate (add cost 1) — below the reserved
+        // floor the add waits a bounded beat then sends ANYWAY, flagged
+        // `paced` on the ack (panel shows the amber pacing note). Gated
+        // HERE (op level) because WS order entry bypasses krRequest but
+        // counts against the same venue trading limiter.
+        let krPaced = false;
+        {
+          const krTP = krPairFor(creds, 'spot');
+          if (krTP) {
+            const tg = krTradeGate(krTradeLedgerFor(krTP.key), 1, Date.now());
+            if (tg.paced) {
+              krPaced = true;
+              tdiag('trade', 'kr_budget', { k: 'kraken', p: 'AddOrder',
+                act: 'trade_pace', waitMs: tg.waitMs,
+                tpts: Math.round(krTradePts(krTradeLedgerFor(krTP.key), Date.now()) * 10) / 10 });
+              await krWsSleep(tg.waitMs);
+            }
+            krTradeSpendFor(krTP.key, 1, 'AddOrder');
+          }
+        }
         // #1804: WS-first order entry (nonce-free + lower latency). KrWsDown
         // (nothing sent) → REST fallback; post-send timeout → surface
         // "state unknown", NEVER a blind REST re-send.
@@ -5239,7 +5348,10 @@ function createTradeNative(opts) {
               sessO.spot.orders[oid] =
                 krSynSpotOrder(oid, symbol, side, q, price, cid, Date.now());
             }
-            return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+            krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
+            const okW = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+            if (krPaced) okW.paced = true;
+            return okW;
           }
         }
         const params = krSpotOrderParams(spec.alt, side, t, q, price, clOrdID);
@@ -5252,7 +5364,10 @@ function createTradeNative(opts) {
           sessO.spot.orders[oid] = krSynSpotOrder(oid, symbol, side, q, price,
                                                   krClOrdId(clOrdID), Date.now());
         }
-        return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+        krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
+        const okR = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
+        if (krPaced) okR.paced = true;
+        return okR;
       }
       const spec = prods.futures[symbol];
       const q = krQtyFloor(qty, (spec || {}).qty_step);
@@ -5303,6 +5418,16 @@ function createTradeNative(opts) {
         if (sessF) delete sessF.fut.orders[String(intent.orderID)];
         return { ok: true, cancelled: intent.orderID };
       }
+      // #1839: TRADING-counter spend — cancel age penalty (young orders cost
+      // up to +8 pts). Never gated: cancels are the priority, the mirror
+      // just records the cost so order adds keep headroom for them.
+      {
+        const krTP = krPairFor(creds, 'spot');
+        if (krTP) {
+          krTradeSpendFor(krTP.key, krCancelPenalty(krOrderAgeS(intent.orderID)),
+                          'CancelOrder');
+        }
+      }
       // #1804: WS cancel first — cancels are idempotent, so ANY WS failure
       // safely falls back to REST.
       const sessC = krWsSessGet(intent.credSlot || 'kraken');
@@ -5334,38 +5459,63 @@ function createTradeNative(opts) {
         if (sessF) krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument');
         return { ok: true, cancelled: 'all' };
       }
-      // Spot has NO per-pair sweep (CancelAll nukes every pair) → list the
-      // pair's open orders and cancel one by one (altname match).
-      const prods = await krProducts(route);
-      const spec = prods.spot[intent.symbol];
-      if (!spec || !spec.alt) return { ok: false, message: 'Unknown spot symbol ' + intent.symbol };
-      // #1832: this OpenOrders is REQUIRED by the cancel — it rides the
-      // priority lane (never deferred/skipped at the floor, rate-limit
-      // retried on the cancel deadline). A cancel_all must never come back
-      // "kr_budget" with live orders still resting.
-      const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders',
-                                 null, route, null, null, true);
-      if (!lo.ok) return lo;
-      const open = ((((lo.data || {}).result) || {}).open) || {};
-      let n = 0; let firstErr = null;
+      // #1839: Space = ONE bulk sweep. The old loop of per-txid cancels
+      // (OpenOrders discovery + N calls) charged N age penalties on the
+      // TRADING counter — 15 sweeps of young orders exhausted it and Kraken
+      // rejected the sweeps themselves ("rate limit persisted ~5s" with live
+      // orders resting). Kraken's bulk endpoints are ONE round trip and ONE
+      // penalty charge: WS-v2 `cancel_all` when the private socket is live
+      // (nonce-free), REST /0/private/CancelAll otherwise. Both are
+      // ACCOUNT-WIDE (spot has no per-pair sweep) — acceptable: the flow
+      // this exists for scalps a single pair.
       const sessA = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-      for (const txid of Object.keys(open)) {
-        const pair = String((((open[txid] || {}).descr) || {}).pair || '');
-        if (pair !== spec.alt) continue;
-        const rc = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
-                                   [['txid', txid]], route);
-        if (rc.ok) {
-          n += 1;
-          if (sessA) delete sessA.spot.orders[txid];   // #1822 per-txid ack
-        }
-        else if (!firstErr) firstErr = rc.message;
+      {
+        const krTP = krPairFor(creds, 'spot');
+        if (krTP) krTradeSpendFor(krTP.key, 8, 'CancelAll');   // one worst-case penalty
       }
-      if (firstErr && !n) return { ok: false, message: firstErr };
-      // #1822: the REST OpenOrders list itself lags the just-ACKed adds —
-      // sweep any remaining rows on the pair (incl. synthetics the list
-      // missed) so holds/badges reflect the cancel_all immediately.
-      if (sessA && !firstErr) krSynSweepSymbol(sessA.spot.orders, intent.symbol, 'symbol');
-      return { ok: true, cancelled: 'all' };
+      const sweepOk = (count) => {
+        // account-wide sweep → drop EVERY optimistic/echoed spot row (all
+        // pairs), so holds/badges reflect the sweep immediately.
+        if (sessA) {
+          for (const k of Object.keys(sessA.spot.orders || {})) delete sessA.spot.orders[k];
+        }
+        const out = { ok: true, cancelled: 'all' };
+        if (count != null) out.count = count;
+        return out;
+      };
+      if (sessA && krWsLive(sessA.spot)) {
+        try {
+          const m = await krWsSpotCall(sessA, 'cancel_all', {});
+          if (m && m.success) {
+            return sweepOk(Number(((m.result || {}).count)) || 0);
+          }
+          // explicit WS reject → keep going: cancels are idempotent, the
+          // REST bulk sweep below is the loud-or-clean authority.
+        } catch (e) { /* WS down/timeout → REST bulk sweep below */ }
+      }
+      // Priority lane + bounded rate-limit retry (krCallCost class 'cancel')
+      // — the loud "CANCEL FAILED" path is unchanged.
+      const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelAll',
+                                null, route);
+      if (!r.ok) {
+        // #1839 stale-state knock-on guard: a REJECTED sweep leaves the
+        // local mirror wrong (rows Kraken already dropped / rows still
+        // live) and the very next gestures cascade ("EOrder:Unknown order"
+        // cancels, "EOrder:Insufficient funds" re-sells against phantom
+        // holds). Force ONE immediate OpenOrders reconcile on the priority
+        // lane so truth lands before the user's next action. Best-effort —
+        // the sweep failure itself stays the loud error.
+        try {
+          const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders',
+                                     null, route, null, null, true);
+          if (lo.ok && sessA) {
+            const ids = Object.keys(((((lo.data || {}).result) || {}).open) || {});
+            krOrdersReconcile(sessA.spot.orders, ids, Date.now());
+          }
+        } catch (e) { /* best-effort */ }
+        return r;
+      }
+      return sweepOk(Number((((r.data || {}).result) || {}).count) || 0);
     }
     const pr = await findPosRetry(fetchPos, intent.symbol);
     if (!pr.ok) return pr;
@@ -7924,6 +8074,16 @@ module.exports = {
   krLedgerDrain,
   krLedgerPts,
   krIsRateLimited,
+  // pure — Kraken spot TRADING rate counter (#1839)
+  KR_TRADE_MAX,
+  KR_TRADE_DECAY,
+  KR_TRADE_FLOOR,
+  KR_ORDER_PACE_MAX_MS,
+  krCancelPenalty,
+  krTradeLedgerNew,
+  krTradeSpend,
+  krTradeGate,
+  krTradePts,
   // pure — Kraken native fills cache (#1814)
   krWsSpotFillRow,
   krRestSpotWsRow,
