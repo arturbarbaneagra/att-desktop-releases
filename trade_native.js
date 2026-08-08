@@ -2360,7 +2360,8 @@ function krSynSpotOrder(oid, symbol, side, qty, price, cid, now) {
                 side: String(side).toLowerCase() === 'sell' ? 'sell' : 'buy',
                 order_type: 'limit', order_qty: Number(qty), cum_qty: 0,
                 limit_price: Number(price),
-                timestamp: new Date(now).toISOString(), _synTs: now };
+                timestamp: new Date(now).toISOString(), _synTs: now,
+                _bornTs: now };   // #1874 audit-omission birth stamp
   if (cid) row.cl_ord_id = String(cid);
   return row;
 }
@@ -2370,7 +2371,8 @@ function krSynFutOrder(oid, symbol, side, qty, price, cid, reduceOnly, now) {
                 instrument: String(symbol).toUpperCase(),
                 direction: String(side).toLowerCase() === 'sell' ? 1 : 0,
                 type: 'limit', limit_price: Number(price), qty: Number(qty),
-                filled: 0, reduce_only: !!reduceOnly, time: now, _synTs: now };
+                filled: 0, reduce_only: !!reduceOnly, time: now, _synTs: now,
+                _bornTs: now };   // #1874 audit-omission birth stamp
   if (cid) row.cli_ord_id = String(cid);
   return row;
 }
@@ -2487,18 +2489,44 @@ function krBalanceExTotals(data) {
 // just-placed order must not have its badge eaten by the confirm it
 // triggered — _synTs (optimistic add) or _updTs (last WS write) both count.
 const KR_CONFIRM_ORDER_GRACE_MS = 2500;
-function krOrdersReconcile(orders, liveIds, now) {
+// #1874 audit omission grace: a Kraken REST OpenOrders snapshot can itself
+// lag and OMIT just-placed orders (observed: 4 live resting badges wiped by
+// an audit whose fill-seq guard passed — the ledger hadn't moved, but the
+// venue page was stale). Omission from a snapshot may only remove a row
+// when the order is older than the birth grace AND missing from TWO
+// consecutive snapshots FETCHED AFTER its birth; otherwise the omission is
+// withheld (caller diag-logs kr_audit_omit) and the badge stays. WS-gone /
+// cancel deletes never ride this path — they delete directly. Birth =
+// _bornTs (stamped at first WS/synthetic insertion), falling back to
+// _synTs/_updTs; rows with no stamp at all (pre-upgrade REST-seeded) are
+// treated as old but still need the double omission. `fetchTs` = when the
+// snapshot request STARTED (defaults to `now` for legacy callers).
+// Returns { gone: [oid...], omit: [oid...] }.
+const KR_AUDIT_BIRTH_GRACE_MS = 60000;
+function krOrdersReconcile(orders, liveIds, now, fetchTs) {
   const live = {};
   for (const id of (liveIds || [])) live[String(id)] = 1;
-  const gone = [];
+  const ft = (fetchTs != null) ? +fetchTs : +now;
+  const gone = [], omit = [];
   for (const oid of Object.keys(orders || {})) {
     const o = orders[oid] || {};
+    if (live[oid]) { if (o._omitTs != null) delete o._omitTs; continue; }
     const ts = (o._synTs != null) ? o._synTs
              : (o._updTs != null) ? o._updTs : null;
     if (ts != null && now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
-    if (!live[oid]) { delete orders[oid]; gone.push(oid); }
+    const born = (o._bornTs != null) ? +o._bornTs : (ts != null ? +ts : 0);
+    // young order, or the snapshot was fetched before the order existed —
+    // the page cannot testify about it; withhold (never resets omit state)
+    if (born > 0 && (now - born < KR_AUDIT_BIRTH_GRACE_MS || ft <= born)) {
+      omit.push(oid); continue;
+    }
+    // first qualifying omission → arm; a SECOND snapshot (fetched strictly
+    // later than the armed one) must also omit it before the row drops
+    if (!(o._omitTs > 0)) { o._omitTs = ft; omit.push(oid); continue; }
+    if (ft <= o._omitTs) { omit.push(oid); continue; }
+    delete orders[oid]; gone.push(oid);
   }
-  return gone;
+  return { gone: gone, omit: omit };
 }
 
 // --- #1860 local-first ledger (pure) ----------------------------------------
@@ -2529,14 +2557,28 @@ const KR_PUSH_COALESCE_MS = 25;
 // waiting out the fills-read cycle. Bounded + deduped (a pathological frame
 // can't balloon the IPC payload; the panel latches ids anyway).
 const KR_PUSH_FIDS_CAP = 24;
+// #1874: 'ordgone' marks a REMOVED order row (fill-consumed / cancel-
+// confirmed / WS-gone / audit-confirmed). The drained event ships the gone
+// oids (ev.goids) so every panel window tombstones + drops the badge in the
+// SAME push apply pass — never waiting out an acct read that may be busy or
+// racing a stale in-flight snapshot (observed 1.5-5.7s badge-del lag).
+// 'ordgone' folds into the 'order' kind on the wire (consumers key on it).
 function krPushMark(P, key, kind, id) {
   if (!P[key]) P[key] = { kinds: {} };
-  P[key].kinds[String(kind || 'ledger')] = 1;
-  if (id != null && String(kind) === 'fill') {
+  const k = String(kind || 'ledger');
+  P[key].kinds[k === 'ordgone' ? 'order' : k] = 1;
+  if (id != null && k === 'fill') {
     if (!P[key].fids) P[key].fids = [];
     const s = String(id);
     if (P[key].fids.length < KR_PUSH_FIDS_CAP && P[key].fids.indexOf(s) < 0) {
       P[key].fids.push(s);
+    }
+  }
+  if (id != null && k === 'ordgone') {
+    if (!P[key].goids) P[key].goids = [];
+    const g = String(id);
+    if (P[key].goids.length < KR_PUSH_FIDS_CAP && P[key].goids.indexOf(g) < 0) {
+      P[key].goids.push(g);
     }
   }
 }
@@ -2548,6 +2590,7 @@ function krPushDrain(P, seqOf, nowMs) {
                  kinds: Object.keys(P[key].kinds).sort(),
                  seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs };
     if (P[key].fids && P[key].fids.length) ev.fids = P[key].fids.slice();
+    if (P[key].goids && P[key].goids.length) ev.goids = P[key].goids.slice();
     out.push(ev);
     delete P[key];
   }
@@ -5073,9 +5116,9 @@ function createTradeNative(opts) {
       tdiag('acct', 'kr_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
   }
-  function krPushSc(scope, kind) {
+  function krPushSc(scope, kind, id) {
     if (!pushLedgerCb || !scope || !scope._pk) return;
-    krPushMark(krPushPend, scope._pk, kind);
+    krPushMark(krPushPend, scope._pk, kind, id);
     if (!krPushTimer) {
       krPushTimer = setTimeout(krPushFlush, KR_PUSH_COALESCE_MS);
       if (krPushTimer && typeof krPushTimer.unref === 'function') krPushTimer.unref();
@@ -5306,16 +5349,26 @@ function createTradeNative(opts) {
               // returns null for status-less unknown rows; lagSnapFrame rows
               // only ever confirm/consume an EXISTING row).
               const eff = krFillOrderApply(S.orders, e, Date.now());
-              if (eff) { krLseq(S); krPushSc(S, 'order'); }   // #1860/#1867
+              // #1874: fill-consumed rows push the gone oid — every panel
+              // window tombstones the badge in the same push apply pass
+              if (eff) { krLseq(S); krPushSc(S, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(e.order_id || '') : null); }   // #1860/#1867/#1874
               continue;
             }
             const oid = String(e.order_id || '');
             if (!oid) continue;
             if (KR_WS_SPOT_GONE[String(e.order_status || '').toLowerCase()]) {
               delete S.orders[oid];
+              krLseq(S); krPushSc(S, 'ordgone', oid);   // #1874 WS-gone badge fast path
+              continue;
             } else {
               // delta frames carry partial fields — merge onto the row
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
+              // #1874: birth stamp (WS add seq/time) — the audit-omission
+              // grace keys on it; live frames only (snapshot rows carry
+              // historic orders whose birth predates this session)
+              if (!lagSnapFrame && S.orders[oid]._bornTs == null) {
+                S.orders[oid]._bornTs = Date.now();
+              }
               // #1822: a real venue echo confirms the optimistic synthetic row
               delete S.orders[oid]._synTs;
               // #1828: last-WS-write stamp — the post-confirm reconcile's
@@ -5488,7 +5541,13 @@ function createTradeNative(opts) {
           }
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
-            if (oid) F.orders[oid] = o;
+            if (oid) {
+              // #1874: keep the birth stamp across snapshot re-delivery
+              if (F.orders[oid] && F.orders[oid]._bornTs != null) {
+                o._bornTs = F.orders[oid]._bornTs;
+              }
+              F.orders[oid] = o;
+            }
           }
           krLseq(F); krPushSc(F, 'order');   // #1860 ledger mutation seq / #1867 push
           snapOrders = true; ready();
@@ -5497,20 +5556,26 @@ function createTradeNative(opts) {
           if (o && typeof o === 'object') {
             const oid = String(o.order_id || '');
             if (oid) {
-              if (msg.is_cancel) delete F.orders[oid];
-              else {
+              if (msg.is_cancel) {
+                delete F.orders[oid];
+                krLseq(F); krPushSc(F, 'ordgone', oid);   // #1874 WS-gone badge fast path
+              } else {
+                // #1874: birth stamp on first WS add (kept across updates)
+                if (F.orders[oid] && F.orders[oid]._bornTs != null) {
+                  o._bornTs = F.orders[oid]._bornTs;
+                } else if (o._bornTs == null) o._bornTs = Date.now();
                 F.orders[oid] = o;
                 // #1860 (mirrors spot): a venue echo confirms the optimistic
                 // synthetic and stamps last-WS-write so the reconcile grace /
                 // REST-fallback overlay treat the row as WS-confirmed fresh.
                 delete F.orders[oid]._synTs;
                 F.orders[oid]._updTs = Date.now();
+                krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
               }
-              krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
             }
           } else if (msg.order_id) {
             delete F.orders[String(msg.order_id)];
-            krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
+            krLseq(F); krPushSc(F, 'ordgone', String(msg.order_id));   // #1860 / #1867 / #1874
           }
         } else if (feed === 'open_positions') {
           F.positions = msg.positions || [];
@@ -5546,7 +5611,8 @@ function createTradeNative(opts) {
             // that used to drive it lags seconds); remaining>0 updates qty.
             if (feed === 'fills' && fr) {
               const eff = krFutFillOrderApply(F.orders, f, Date.now());
-              if (eff) { krLseq(F); krPushSc(F, 'order'); }   // #1860/#1867
+              // #1874: fill-consumed rows push the gone oid (badge fast path)
+              if (eff) { krLseq(F); krPushSc(F, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(f.order_id || '') : null); }   // #1860/#1867/#1874
               // per-fill push id (#1870): each live fill rides the event so
               // the panel chime plays per fill at push time
               krLseq(F); krPushSc(F, 'fill', fr.id);   // seq advances per live fill (snapshot rows never bump)
@@ -5780,7 +5846,7 @@ function createTradeNative(opts) {
         const st = String(cs.status || '');
         if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) { delete sessF.fut.orders[String(intent.orderID)]; krLseq(sessF.fut); krPushSc(sessF.fut, 'order'); }   // #1860/#1867
+        if (sessF) { delete sessF.fut.orders[String(intent.orderID)]; krLseq(sessF.fut); krPushSc(sessF.fut, 'ordgone', String(intent.orderID)); }   // #1860/#1867/#1874
         return { ok: true, cancelled: intent.orderID };
       }
       // #1839: TRADING-counter spend — cancel age penalty (young orders cost
@@ -5802,7 +5868,7 @@ function createTradeNative(opts) {
                                        { order_id: [String(intent.orderID)] });
           if (m && m.success) {
             delete sessC.spot.orders[String(intent.orderID)];   // #1822
-            krLseq(sessC.spot); krPushSc(sessC.spot, 'order');   // #1860/#1867
+            krLseq(sessC.spot); krPushSc(sessC.spot, 'ordgone', String(intent.orderID));   // #1860/#1867/#1874
             return { ok: true, cancelled: intent.orderID };
           }
         } catch (e) { /* REST fallback below */ }
@@ -5810,7 +5876,7 @@ function createTradeNative(opts) {
       const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                 [['txid', String(intent.orderID)]], route);
       if (!r.ok) return r;
-      if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); krPushSc(sessC.spot, 'order'); }   // #1822/#1860/#1867
+      if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); krPushSc(sessC.spot, 'ordgone', String(intent.orderID)); }   // #1822/#1860/#1867/#1874
       return { ok: true, cancelled: intent.orderID };
     }
     if (intent.op === 'amend') {
@@ -5927,6 +5993,7 @@ function createTradeNative(opts) {
         // the sweep failure itself stays the loud error.
         try {
           const loSeq0 = sessA ? (sessA.spot.lseq | 0) : 0;   // #1870 stale guard
+          const loT0 = Date.now();   // #1874 snapshot fetch-start stamp
           const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders',
                                      null, route, null, null, true);
           const loMap = ((((lo.data || {}).result) || {}).open);
@@ -5936,8 +6003,14 @@ function createTradeNative(opts) {
             const ids = Object.keys(loMap);
             // #1860: this auditor correction deletes displayed rows — the
             // ledger seq must advance with them
-            if (krOrdersReconcile(sessA.spot.orders, ids, Date.now()).length) {
-              krLseq(sessA.spot); krPushSc(sessA.spot, 'order');   // #1867
+            const rec = krOrdersReconcile(sessA.spot.orders, ids, Date.now(), loT0);
+            if (rec.omit.length) {   // #1874 withheld snapshot omissions
+              tdiag('acct', 'kr_audit_omit', { k: 'kraken', w: 'sweep',
+                n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
+            }
+            if (rec.gone.length) {
+              krLseq(sessA.spot);
+              for (const g of rec.gone) krPushSc(sessA.spot, 'ordgone', g);   // #1867/#1874
             }
           }
         } catch (e) { /* best-effort */ }
@@ -7722,6 +7795,7 @@ function createTradeNative(opts) {
       let so = { ok: true, skipped: true };
       if (!sess || Object.keys(sess.spot.orders || {}).length) {
         const soSeq0 = sess ? (sess.spot.lseq | 0) : 0;   // #1870 pre-fetch stamp
+        const soT0 = Date.now();   // #1874 snapshot fetch-start stamp
         so = await krRequest(L.creds, 'POST', 'spot',
                              '/0/private/OpenOrders', null, L.route);
         if (so.ok && sess) {
@@ -7738,8 +7812,19 @@ function createTradeNative(opts) {
                                               seq: sess.spot.lseq | 0 });
           } else if (soGate === 'apply') {
             const ids = Object.keys(openMap);
-            const gone = krOrdersReconcile(sess.spot.orders, ids, Date.now());
-            if (gone.length) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); goneN = gone.length; }   // #1867
+            // #1874 omission grace: snapshot omission may only remove rows
+            // older than the birth grace, missing from TWO consecutive
+            // post-birth snapshots; withheld omissions diag as kr_audit_omit
+            const rec = krOrdersReconcile(sess.spot.orders, ids, Date.now(), soT0);
+            if (rec.omit.length) {
+              tdiag('acct', 'kr_audit_omit', { k: slot, w: 'ord',
+                n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
+            }
+            if (rec.gone.length) {
+              krLseq(sess.spot);
+              for (const g of rec.gone) krPushSc(sess.spot, 'ordgone', g);   // #1867/#1874
+              goneN = rec.gone.length;
+            }
           }
         }
       }
@@ -8733,6 +8818,7 @@ module.exports = {
   KR_CONFIRM_DELAY_MS,
   KR_CONFIRM_MIN_GAP_MS,
   KR_CONFIRM_ORDER_GRACE_MS,
+  KR_AUDIT_BIRTH_GRACE_MS,
   krLseq,
   krPushMark,
   krPushDrain,
