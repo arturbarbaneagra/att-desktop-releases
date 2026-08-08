@@ -7450,7 +7450,7 @@ function createTradeNative(opts) {
           [['start', String(w.frm / 1000)], ['end', String(w.to / 1000)],
            // #1829: per-execution rows only — never the consolidated synthetic.
            ['ofs', String(ofs)], ['consolidate_taker', 'false']], route);
-        if (!th.ok) return th;
+        if (!th.ok) return th;   // fail-visible: never a partial snapshot
         const res = ((th.data || {}).result) || {};
         const trades = res.trades || {};
         const tids = Object.keys(trades);
@@ -7476,6 +7476,7 @@ function createTradeNative(opts) {
         cursor = krSeedFutNext(fills, w.frm);
         if (!cursor) break;
       }
+      if (cursor) return { ok: false, message: 'Window too large — futures history exceeds the page cap; narrow the date range' };
     }
     return out;
   }
@@ -7511,6 +7512,11 @@ function createTradeNative(opts) {
           body: null }, route);
         if (!r.ok) return r;
         const rows = (r.data && r.data.rows) || (Array.isArray(r.data) ? r.data : []);
+        // A full page = possibly TRUNCATED chunk — reject rather than let an
+        // incomplete snapshot become authoritative venue truth.
+        if (rows.length >= 200) {
+          return { ok: false, message: sym + ': too many trades in one chunk — narrow the date range' };
+        }
         for (const row of rows) dst[sym].push(row);
       }
       return { ok: true };
