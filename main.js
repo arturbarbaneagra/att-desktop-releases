@@ -1430,6 +1430,16 @@ createTradeNative({
   // only ever passes pre-shaped, secret-free summaries (host/path/status/ms —
   // never headers, bodies, queries or creds); diag.log sanitizes again anyway.
   diag: (cat, ev, data) => dlog('main', cat, ev, data),
+  // #1867 Kraken push channel: every ledger mutation event is broadcast to
+  // ALL panel windows (main + feature pop-outs) the moment the shell applies
+  // it — the panel's badges/posrow/fill-sound react to the push while the
+  // /state poll stays a background auditor.
+  pushLedger: (ev) => {
+    for (const w of [mainWindow, ...featureWindows.values()]) {
+      if (!w || w.isDestroyed()) continue;
+      try { w.webContents.send('att:ledger-push', ev); } catch (e) { /* window closing */ }
+    }
+  },
 });
 
 // ---------------------------------------------------------------------------

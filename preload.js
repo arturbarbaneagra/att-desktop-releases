@@ -161,6 +161,11 @@ try {
     wipeCreds: (venue) => ipcRenderer.invoke('att:trade-creds-wipe', String(venue || '')),
     status: () => ipcRenderer.invoke('att:trade-creds-status'),
     exec: (intent) => ipcRenderer.invoke('att:trade-exec', intent),
+    // #1867 Kraken push channel: the shell broadcasts every ledger mutation
+    // ('att:ledger-push') the moment its WS session applies it. Presence of
+    // this method is the panel's capability probe — old shells simply lack
+    // it and the panel stays on the polled display path.
+    onLedgerPush: (cb) => ipcRenderer.on('att:ledger-push', (e, p) => { try { cb(p); } catch (err) { /* page handler */ } }),
     // Capability list (#1713): the panel probes this to decide which NEW
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe

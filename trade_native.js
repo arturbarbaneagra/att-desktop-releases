@@ -2516,6 +2516,43 @@ function krOrdersReconcile(orders, liveIds, now) {
 //              top so a badge/hold never vanishes to a stale page. Stale
 //              ledger rows are NOT overlaid — the auditor wins for those.
 function krLseq(scope) { if (scope) scope.lseq = (scope.lseq | 0) + 1; }
+// --- #1867 push channel (pure) --------------------------------------------
+// The shell pushes every Kraken ledger mutation to the panel windows the
+// moment it lands (badges/posrow/sound react to the push; the /state poll
+// stays a background auditor). Mutations coalesce per scope key
+// ('slot|scope') inside one flush window — a cancel_all burst becomes ONE
+// event per scope with the kinds union and the LATEST lseq (seq is read at
+// drain time, so a window comparing seqs can detect it already applied it).
+const KR_PUSH_COALESCE_MS = 25;
+function krPushMark(P, key, kind) {
+  if (!P[key]) P[key] = { kinds: {} };
+  P[key].kinds[String(kind || 'ledger')] = 1;
+}
+function krPushDrain(P, seqOf, nowMs) {
+  const out = [];
+  for (const key of Object.keys(P)) {
+    const ix = key.indexOf('|');
+    out.push({ venue: 'kraken', slot: key.slice(0, ix), scope: key.slice(ix + 1),
+               kinds: Object.keys(P[key].kinds).sort(),
+               seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs });
+    delete P[key];
+  }
+  return out;
+}
+// Futures open_positions frames can re-deliver PnL-only refreshes — the push
+// (and the lseq bump) must fire only when the PORTFOLIO changed (instrument /
+// size / entry), never on a mark-price repaint, or scalp sessions would push
+// continuously. Signature over identity fields only, order-insensitive.
+function krFutPosSig(positions) {
+  const rows = [];
+  for (const p of (positions || [])) {
+    if (!p || typeof p !== 'object') continue;
+    rows.push(String(p.instrument || '') + '|' + String(p.balance != null ? p.balance : '') +
+              '|' + String(p.entry_price != null ? p.entry_price : ''));
+  }
+  rows.sort();
+  return rows.join(';');
+}
 function krLedgerFreshIds(orders, presentIds, now) {
   const present = {};
   for (const id of (presentIds || [])) present[String(id)] = 1;
@@ -2889,6 +2926,9 @@ function createTradeNative(opts) {
   // (host/path/method/status/ms/row counts) — NEVER headers, query strings
   // (they carry signatures), bodies, or creds. The logger sanitizes again.
   const diagTap = typeof opts.diag === 'function' ? opts.diag : null;
+  // #1867 push channel sink — main.js broadcasts each event to every panel
+  // window ('att:ledger-push'). Absent (old wiring) → the channel is inert.
+  const pushLedgerCb = typeof opts.pushLedger === 'function' ? opts.pushLedger : null;
   function tdiag(cat, ev, data) {
     if (!diagTap) return;
     try { diagTap(cat, ev, data); } catch (e) { /* diagnostics never break trading */ }
@@ -4928,6 +4968,39 @@ function createTradeNative(opts) {
 
   function krWsSessGet(slot) { return krWsSessions[String(slot || 'kraken')] || null; }
 
+  // --- #1867 push channel (runtime) ---------------------------------------
+  // Every ledger mutation site below calls krPushSc(scope, kind) right after
+  // its krLseq bump. Marks coalesce KR_PUSH_COALESCE_MS, then ONE event per
+  // scope goes out through opts.pushLedger (main.js broadcasts it to every
+  // panel window) with the scope's CURRENT lseq. The flush also busts the
+  // acct_read memo so the push-triggered panel re-read can't be served a
+  // pre-mutation snapshot. No pushLedger callback (old shell wiring / web) →
+  // everything stays a no-op and the poll remains the only display trigger.
+  const krPushPend = {};
+  let krPushTimer = null;
+  function krPushFlush() {
+    krPushTimer = null;
+    const evs = krPushDrain(krPushPend, (key) => {
+      const ix = key.indexOf('|');
+      const sess = krWsSessGet(key.slice(0, ix));
+      const sc = sess && (key.slice(ix + 1) === 'fut' ? sess.fut : sess.spot);
+      return sc ? sc.lseq : 0;
+    }, Date.now());
+    for (const ev of evs) {
+      try { execAcctRead.bust('kraken', ev.slot); } catch (e) { /* pre-init */ }
+      try { pushLedgerCb(ev); } catch (e) { /* window gone mid-send */ }
+      tdiag('acct', 'kr_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+  }
+  function krPushSc(scope, kind) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(krPushPend, scope._pk, kind);
+    if (!krPushTimer) {
+      krPushTimer = setTimeout(krPushFlush, KR_PUSH_COALESCE_MS);
+      if (krPushTimer && typeof krPushTimer.unref === 'function') krPushTimer.unref();
+    }
+  }
+
   function krWsClose(slot) {
     const s = krWsSessions[String(slot || 'kraken')];
     if (!s) return;
@@ -4978,6 +5051,10 @@ function createTradeNative(opts) {
                orders: {}, positions: null, flex: null,
                fills: { rows: [], seen: {} } },
       };
+      // #1867: push-channel scope tags — mutation sites push via the scope
+      // object itself (WS handlers don't all carry the slot).
+      s.spot._pk = slot + '|spot';
+      s.fut._pk = slot + '|fut';
     }
     if (krPairFor(creds, 'spot') && !s.spot.running) krWsSpotLoop(slot, s, creds);
     if (krPairFor(creds, 'futures') && !s.fut.running) krWsFutLoop(slot, s, creds);
@@ -5107,7 +5184,7 @@ function createTradeNative(opts) {
             {
               const preN = Object.keys(S.orders).length;
               S.orders = krSynCarry(S.orders, Date.now());
-              if (Object.keys(S.orders).length !== preN) krLseq(S);
+              if (Object.keys(S.orders).length !== preN) { krLseq(S); krPushSc(S, 'order'); }   // #1867
             }
             // #1814: the snap_trades snapshot IS the fills seed — until it
             // lands, fills_read must NOT report this scope (an empty read
@@ -5135,9 +5212,10 @@ function createTradeNative(opts) {
                 const tnow = Date.now();
                 for (const a of touched) S.fillTouch[a] = tnow;
                 krFillTouchPrune(S.fillTouch, tnow);
-                krLseq(S);
+                krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
+            if (fr && !lagSnapFrame) krPushSc(S, 'fill');   // #1867 push-driven chime
             if (fr && e.order_status == null) continue;
             const oid = String(e.order_id || '');
             if (!oid) continue;
@@ -5153,7 +5231,7 @@ function createTradeNative(opts) {
               // by an OpenOrders page fetched moments earlier)
               S.orders[oid]._updTs = Date.now();
             }
-            krLseq(S);   // #1860 ledger mutation seq
+            krLseq(S); krPushSc(S, 'order');   // #1860 ledger mutation seq / #1867 push
           }
           // #1835: per-event venue-ts → arrival lag (live frames only) +
           // frame apply time; bounded per-minute diag emit.
@@ -5181,7 +5259,7 @@ function createTradeNative(opts) {
                 Date.now() - S.fillTouch[a] <= KR_FILL_TOUCH_GRACE_MS) continue;
             S.totals[a] = r.balance;
           }
-          krLseq(S);   // #1860 ledger mutation seq
+          krLseq(S); krPushSc(S, 'bal');   // #1860 ledger mutation seq / #1867 push
         }
         // status / heartbeat / pong frames → lastMsg bump only
       });
@@ -5314,13 +5392,13 @@ function createTradeNative(opts) {
           {   // #1860: snapshot reset deletions bump too (same as spot)
             const preN = Object.keys(F.orders).length;
             F.orders = krSynCarry(F.orders, Date.now());
-            if (Object.keys(F.orders).length !== preN) krLseq(F);
+            if (Object.keys(F.orders).length !== preN) { krLseq(F); krPushSc(F, 'order'); }   // #1867
           }
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
             if (oid) F.orders[oid] = o;
           }
-          krLseq(F);   // #1860 ledger mutation seq
+          krLseq(F); krPushSc(F, 'order');   // #1860 ledger mutation seq / #1867 push
           snapOrders = true; ready();
         } else if (feed === 'open_orders') {
           const o = msg.order;
@@ -5336,14 +5414,23 @@ function createTradeNative(opts) {
                 delete F.orders[oid]._synTs;
                 F.orders[oid]._updTs = Date.now();
               }
-              krLseq(F);   // #1860
+              krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
             }
           } else if (msg.order_id) {
             delete F.orders[String(msg.order_id)];
-            krLseq(F);   // #1860
+            krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
           }
         } else if (feed === 'open_positions') {
           F.positions = msg.positions || [];
+          // #1867: position DELTA push — identity signature only (instrument/
+          // size/entry), so PnL-only re-deliveries never spam the channel.
+          {
+            const sig = krFutPosSig(F.positions);
+            if (F._posSig !== sig) {
+              F._posSig = sig;
+              krLseq(F); krPushSc(F, 'pos');
+            }
+          }
           snapPos = true; ready();
         } else if (feed === 'balances_snapshot' || feed === 'balances') {
           if (msg.flex_futures && typeof msg.flex_futures === 'object') {
@@ -5363,6 +5450,9 @@ function createTradeNative(opts) {
             const fr = krWsFutFillRow(f);
             if (fr) krFillsCachePush(F.fills, fr);
           }
+          // #1867: live fill frames push (snapshot rows are historic — the
+          // panel's id-keyed chime must never re-ring the seed window)
+          if (feed === 'fills' && (msg.fills || []).length) krPushSc(F, 'fill');
           if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
           // #1835: live fill frames only (snapshot = historic timestamps)
           if (feed === 'fills' && F.lag) {
@@ -5520,7 +5610,7 @@ function createTradeNative(opts) {
             if (t === 'limit') {
               sessO.spot.orders[oid] =
                 krSynSpotOrder(oid, symbol, side, q, price, cid, Date.now());
-              krLseq(sessO.spot);   // #1860
+              krLseq(sessO.spot); krPushSc(sessO.spot, 'order');   // #1860/#1867
             }
             krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
             const okW = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5537,7 +5627,7 @@ function createTradeNative(opts) {
         if (t === 'limit' && sessO) {   // #1822 optimistic echo (REST ack)
           sessO.spot.orders[oid] = krSynSpotOrder(oid, symbol, side, q, price,
                                                   krClOrdId(clOrdID), Date.now());
-          krLseq(sessO.spot);   // #1860
+          krLseq(sessO.spot); krPushSc(sessO.spot, 'order');   // #1860/#1867
         }
         krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
         const okR = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5571,7 +5661,7 @@ function createTradeNative(opts) {
           sessF.fut.orders[oid] = krSynFutOrder(oid, symbol, side, q, price,
                                                 krClOrdId(clOrdID),
                                                 !!f.reduceOnly, Date.now());
-          krLseq(sessF.fut);   // #1860
+          krLseq(sessF.fut); krPushSc(sessF.fut, 'order');   // #1860/#1867
         }
       }
       return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5591,7 +5681,7 @@ function createTradeNative(opts) {
         const st = String(cs.status || '');
         if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) { delete sessF.fut.orders[String(intent.orderID)]; krLseq(sessF.fut); }   // #1860
+        if (sessF) { delete sessF.fut.orders[String(intent.orderID)]; krLseq(sessF.fut); krPushSc(sessF.fut, 'order'); }   // #1860/#1867
         return { ok: true, cancelled: intent.orderID };
       }
       // #1839: TRADING-counter spend — cancel age penalty (young orders cost
@@ -5613,7 +5703,7 @@ function createTradeNative(opts) {
                                        { order_id: [String(intent.orderID)] });
           if (m && m.success) {
             delete sessC.spot.orders[String(intent.orderID)];   // #1822
-            krLseq(sessC.spot);   // #1860
+            krLseq(sessC.spot); krPushSc(sessC.spot, 'order');   // #1860/#1867
             return { ok: true, cancelled: intent.orderID };
           }
         } catch (e) { /* REST fallback below */ }
@@ -5621,7 +5711,7 @@ function createTradeNative(opts) {
       const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                 [['txid', String(intent.orderID)]], route);
       if (!r.ok) return r;
-      if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); }   // #1822/#1860
+      if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); krPushSc(sessC.spot, 'order'); }   // #1822/#1860/#1867
       return { ok: true, cancelled: intent.orderID };
     }
     if (intent.op === 'amend') {
@@ -5672,7 +5762,7 @@ function createTradeNative(opts) {
       if (sessM.spot.orders[oidA]) {
         sessM.spot.orders[oidA] = Object.assign({}, sessM.spot.orders[oidA],
           { limit_price: px, _updTs: Date.now() });
-        krLseq(sessM.spot);   // #1860
+        krLseq(sessM.spot); krPushSc(sessM.spot, 'order');   // #1860/#1867
       }
       tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'ws', ok: 1 });
       return { ok: true, orderID: oidA, amended: true };
@@ -5686,7 +5776,7 @@ function createTradeNative(opts) {
                                   [['symbol', String(intent.symbol)]], route);
         if (!r.ok) return r;
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) { krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument'); krLseq(sessF.fut); }
+        if (sessF) { krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument'); krLseq(sessF.fut); krPushSc(sessF.fut, 'order'); }   // #1867
         return { ok: true, cancelled: 'all' };
       }
       // #1839: Space = ONE bulk sweep. The old loop of per-txid cancels
@@ -5708,7 +5798,7 @@ function createTradeNative(opts) {
         // pairs), so holds/badges reflect the sweep immediately.
         if (sessA) {
           for (const k of Object.keys(sessA.spot.orders || {})) delete sessA.spot.orders[k];
-          krLseq(sessA.spot);   // #1860
+          krLseq(sessA.spot); krPushSc(sessA.spot, 'order');   // #1860/#1867
         }
         const out = { ok: true, cancelled: 'all' };
         if (count != null) out.count = count;
@@ -5744,7 +5834,7 @@ function createTradeNative(opts) {
             // #1860: this auditor correction deletes displayed rows — the
             // ledger seq must advance with them
             if (krOrdersReconcile(sessA.spot.orders, ids, Date.now()).length) {
-              krLseq(sessA.spot);
+              krLseq(sessA.spot); krPushSc(sessA.spot, 'order');   // #1867
             }
           }
         } catch (e) { /* best-effort */ }
@@ -7355,8 +7445,8 @@ function createTradeNative(opts) {
       // (fail-visible TTL — venue truth replaces confirmed ones in place).
       const nowP = Date.now();
       // #1860: expiry deletes ARE ledger writes — bump the scope seq
-      if (krSynPrune(sess.spot.orders, nowP)) krLseq(sess.spot);
-      if (krSynPrune(sess.fut.orders, nowP)) krLseq(sess.fut);
+      if (krSynPrune(sess.spot.orders, nowP)) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); }   // #1867
+      if (krSynPrune(sess.fut.orders, nowP)) { krLseq(sess.fut); krPushSc(sess.fut, 'order'); }   // #1867
     }
     const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
     const wsFut = !!(sess && krWsLive(sess.fut));
@@ -7511,7 +7601,7 @@ function createTradeNative(opts) {
           tdiag('acct', 'kr_audit_div', { k: slot, n: aud.div.length,
                                           a: divA.join(',').slice(0, 80) });
         }
-        krLseq(sess.spot);   // #1860
+        krLseq(sess.spot); krPushSc(sess.spot, 'bal');   // #1860/#1867 auditor correction
       }
       // #1832 trim: OpenOrders exists to reconcile confirmed-gone rows — an
       // EMPTY local map has nothing to reconcile, skip the point entirely.
@@ -7522,7 +7612,7 @@ function createTradeNative(opts) {
         if (so.ok && sess) {
           const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
           const gone = krOrdersReconcile(sess.spot.orders, ids, Date.now());
-          if (gone.length) { krLseq(sess.spot); goneN = gone.length; }
+          if (gone.length) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); goneN = gone.length; }   // #1867
         }
       }
       // #1828 fast venue-truth fills: one recent-window TradesHistory page
@@ -8516,6 +8606,9 @@ module.exports = {
   KR_CONFIRM_MIN_GAP_MS,
   KR_CONFIRM_ORDER_GRACE_MS,
   krLseq,
+  krPushMark,
+  krPushDrain,
+  krFutPosSig,
   krLedgerFreshIds,
   krConfirmKick,
   krConfirmFire,
