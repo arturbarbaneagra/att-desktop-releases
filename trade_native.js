@@ -2378,11 +2378,20 @@ function krSynFutOrder(oid, symbol, side, qty, price, cid, reduceOnly, now) {
 }
 // Expire never-confirmed synthetic rows (fail-visible: after the TTL the
 // badge honestly drops instead of fabricating a permanent order). In place.
+// #1876: expiry additionally requires SNAPSHOT TESTIMONY — a post-birth
+// venue snapshot must have omitted the row (_omitTs armed by
+// krOrdersReconcile). The bare TTL wiped 5 real resting orders whose WS
+// echo never came while every snapshot LISTED them (listed rows now get
+// _synTs cleared in the reconcile, but a budget-deferred audit left rows
+// unconfirmed → the TTL alone deleted venue-ACKed orders). A row no
+// snapshot ever testified against keeps its badge; the reconcile's double
+// omission remains the honest removal path.
 function krSynPrune(orders, now) {
   let n = 0;
   for (const oid of Object.keys(orders || {})) {
-    const ts = (orders[oid] || {})._synTs;
-    if (ts != null && now - ts > KR_SYN_TTL_MS) { delete orders[oid]; n += 1; }
+    const o = orders[oid] || {};
+    const ts = o._synTs;
+    if (ts != null && now - ts > KR_SYN_TTL_MS && o._omitTs > 0) { delete orders[oid]; n += 1; }
   }
   return n;
 }
@@ -2510,7 +2519,15 @@ function krOrdersReconcile(orders, liveIds, now, fetchTs) {
   const gone = [], omit = [];
   for (const oid of Object.keys(orders || {})) {
     const o = orders[oid] || {};
-    if (live[oid]) { if (o._omitTs != null) delete o._omitTs; continue; }
+    if (live[oid]) {
+      if (o._omitTs != null) delete o._omitTs;
+      // #1876: a venue snapshot LISTING the row IS venue truth — confirm the
+      // optimistic synthetic so the fail-visible TTL (krSynPrune) can't wipe
+      // a live resting order the WS echo never confirmed (observed: 5 badges
+      // gone ~15-20s after birth with a quiet WS but green audits).
+      if (o._synTs != null) { delete o._synTs; o._updTs = +now; }
+      continue;
+    }
     const ts = (o._synTs != null) ? o._synTs
              : (o._updTs != null) ? o._updTs : null;
     if (ts != null && now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
@@ -2690,6 +2707,45 @@ function krAuditGate(seq0, seqNow, hasData) {
   if (!hasData) return 'nodata';
   if ((seq0 | 0) !== (seqNow | 0)) return 'stale';
   return 'apply';
+}
+
+// --- #1876 gone-order tombstones (pure) -------------------------------------
+// A fill-consumed / cancelled / WS-gone order deletes its ledger row in the
+// push beat — but a LAGGING source (late WS delta echo, stale REST OpenOrders
+// page, reconnect snapshot) that still lists the order as open used to
+// RE-ADD the row (observed: badge del → re-add 10-11s later, stuck until the
+// next cancel gesture). Every 'ordgone' removal now writes a tombstone in
+// the scope (sc.tombs[oid] = removal ts); every re-add path consults it and
+// drops the resurrection. TTL-bounded (same class as the panel's 12s cancel
+// tombstones), and a snapshot FETCHED AFTER the removal that omits the id
+// confirms it gone → the tombstone clears early (krTombConfirm).
+const KR_TOMB_TTL_MS = 12000;
+function krTombAdd(tombs, oid, now) {
+  const t = (tombs && typeof tombs === 'object') ? tombs : {};
+  if (oid != null && oid !== '') t[String(oid)] = +now;
+  return t;
+}
+function krTombHit(tombs, oid, now) {
+  const ts = tombs && tombs[String(oid)];
+  return ts != null && (+now - ts) <= KR_TOMB_TTL_MS;
+}
+function krTombSweep(tombs, now) {
+  const t = (tombs && typeof tombs === 'object') ? tombs : {};
+  for (const k of Object.keys(t)) {
+    if (+now - t[k] > KR_TOMB_TTL_MS) delete t[k];
+  }
+  return t;
+}
+// Snapshot fetched at fetchTs that OMITS a tombstoned id and postdates its
+// removal = venue confirms the order gone → the tombstone has done its job.
+function krTombConfirm(tombs, liveIds, fetchTs) {
+  if (!tombs || typeof tombs !== 'object') return tombs;
+  const live = {};
+  for (const id of (liveIds || [])) live[String(id)] = 1;
+  for (const k of Object.keys(tombs)) {
+    if (!live[k] && +fetchTs > tombs[k]) delete tombs[k];
+  }
+  return tombs;
 }
 
 // --- #1832 Kraken spot private-REST points ledger (pure) --------------------
@@ -5092,6 +5148,18 @@ function createTradeNative(opts) {
 
   function krWsSessGet(slot) { return krWsSessions[String(slot || 'kraken')] || null; }
 
+  // #1876 tombstone re-add guard: true = the id was just removed (fill /
+  // cancel / gone) and this re-add source must drop it. Diag rate-capped.
+  function krTombBlock(sc, oid, w) {
+    if (!sc || !krTombHit(sc.tombs, oid, Date.now())) return false;
+    const now = Date.now();
+    if (now - (sc._tombDiagT || 0) > 5000) {
+      sc._tombDiagT = now;
+      try { tdiag('acct', 'kr_tomb_block', { w: w, oid: String(oid).slice(0, 24) }); } catch (e) { /* diag-only */ }
+    }
+    return true;
+  }
+
   // --- #1867 push channel (runtime) ---------------------------------------
   // Every ledger mutation site below calls krPushSc(scope, kind) right after
   // its krLseq bump. Marks coalesce KR_PUSH_COALESCE_MS, then ONE event per
@@ -5117,6 +5185,13 @@ function createTradeNative(opts) {
     }
   }
   function krPushSc(scope, kind, id) {
+    // #1876: EVERY gone-order removal tombstones here (single choke point —
+    // fill-consumed, cancel-ACKed, WS-gone and audit-confirmed deletes all
+    // push 'ordgone'), so lagging snapshots/echoes can't resurrect the row.
+    // Runs BEFORE the push-wiring guard: web/no-push shells tombstone too.
+    if (scope && String(kind) === 'ordgone' && id != null && id !== '') {
+      scope.tombs = krTombAdd(scope.tombs, String(id), Date.now());
+    }
     if (!pushLedgerCb || !scope || !scope._pk) return;
     krPushMark(krPushPend, scope._pk, kind, id);
     if (!krPushTimer) {
@@ -5300,15 +5375,32 @@ function createTradeNative(opts) {
             ? performance.now() : null;
           const lagSnapFrame = String(msg.type || '') === 'snapshot';
           if (String(msg.type || '') === 'snapshot') {
-            // #1822: keep fresh optimistic rows — a snapshot captured before
-            // a just-ACKed order must not erase its synthetic badge/hold
-            // #1860: the reset itself deletes rows (carried ⊆ previous) — an
-            // EMPTY snapshot frame runs no per-event bumps, so stamp the
-            // deletion here or the read seq goes stale vs the displayed map.
+            // #1876: snapshot-sourced removals ride the SAME omission grace
+            // as the REST auditor — never a blind reset (the old krSynCarry
+            // reset wiped every confirmed row a lagging snapshot omitted;
+            // observed: resting badges gone with ZERO kr_audit_omit).
+            // Snapshot ids = rows the frame lists as open; young rows and
+            // first omissions are withheld (diag kr_audit_omit w:'snap');
+            // tombstoned ids the snapshot omits are confirmed gone.
             {
-              const preN = Object.keys(S.orders).length;
-              S.orders = krSynCarry(S.orders, Date.now());
-              if (Object.keys(S.orders).length !== preN) { krLseq(S); krPushSc(S, 'order'); }   // #1867
+              const snapT0 = Date.now();
+              const snapIds = [];
+              for (const e0 of (msg.data || [])) {
+                if (!e0 || typeof e0 !== 'object') continue;
+                const oid0 = String(e0.order_id || '');
+                const st0 = String(e0.order_status || '').toLowerCase();
+                if (oid0 && st0 && !KR_WS_SPOT_GONE[st0]) snapIds.push(oid0);
+              }
+              const rec = krOrdersReconcile(S.orders, snapIds, snapT0, snapT0);
+              if (rec.omit.length) {
+                tdiag('acct', 'kr_audit_omit', { w: 'snap',
+                  n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
+              }
+              if (rec.gone.length) {
+                krLseq(S);
+                for (const g of rec.gone) krPushSc(S, 'ordgone', g);   // #1867/#1874
+              }
+              S.tombs = krTombConfirm(S.tombs, snapIds, snapT0);
             }
             // #1814: the snap_trades snapshot IS the fills seed — until it
             // lands, fills_read must NOT report this scope (an empty read
@@ -5348,7 +5440,10 @@ function createTradeNative(opts) {
               // Snapshot rows stay barred from the open-orders map (helper
               // returns null for status-less unknown rows; lagSnapFrame rows
               // only ever confirm/consume an EXISTING row).
-              const eff = krFillOrderApply(S.orders, e, Date.now());
+              // #1876: a trade echo on a just-removed order must not
+              // recreate its row (late partial-fill updates resurrect)
+              const eff = krTombBlock(S, String(e.order_id || ''), 'sfill')
+                ? null : krFillOrderApply(S.orders, e, Date.now());
               // #1874: fill-consumed rows push the gone oid — every panel
               // window tombstones the badge in the same push apply pass
               if (eff) { krLseq(S); krPushSc(S, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(e.order_id || '') : null); }   // #1860/#1867/#1874
@@ -5361,6 +5456,9 @@ function createTradeNative(opts) {
               krLseq(S); krPushSc(S, 'ordgone', oid);   // #1874 WS-gone badge fast path
               continue;
             } else {
+              // #1876: lagging echo/snapshot row for a just-removed order —
+              // the tombstone wins, never a badge resurrection
+              if (krTombBlock(S, oid, 'sord')) continue;
               // delta frames carry partial fields — merge onto the row
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
               // #1874: birth stamp (WS add seq/time) — the audit-omission
@@ -5531,17 +5629,31 @@ function createTradeNative(opts) {
         }
         const feed = String(msg.feed || '');
         if (feed === 'open_orders_snapshot') {
-          // #1822: same snapshot race as spot — REST order acks are
-          // WS-independent, so a reconnect snapshot older than a just-ACKed
-          // order must not erase its fresh synthetic row
-          {   // #1860: snapshot reset deletions bump too (same as spot)
-            const preN = Object.keys(F.orders).length;
-            F.orders = krSynCarry(F.orders, Date.now());
-            if (Object.keys(F.orders).length !== preN) { krLseq(F); krPushSc(F, 'order'); }   // #1867
+          // #1876: same omission-grace rule as the spot snapshot — removals
+          // ride krOrdersReconcile (birth grace + double omission, withheld
+          // omissions diag kr_audit_omit w:'fsnap'), never a blind reset.
+          {
+            const snapT0 = Date.now();
+            const snapIds = [];
+            for (const o0 of (msg.orders || [])) {
+              const oid0 = String((o0 || {}).order_id || '');
+              if (oid0) snapIds.push(oid0);
+            }
+            const rec = krOrdersReconcile(F.orders, snapIds, snapT0, snapT0);
+            if (rec.omit.length) {
+              tdiag('acct', 'kr_audit_omit', { w: 'fsnap',
+                n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
+            }
+            if (rec.gone.length) {
+              krLseq(F);
+              for (const g of rec.gone) krPushSc(F, 'ordgone', g);   // #1867/#1874
+            }
+            F.tombs = krTombConfirm(F.tombs, snapIds, snapT0);
           }
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
             if (oid) {
+              if (krTombBlock(F, oid, 'fsnap')) continue;   // #1876 just-removed — no resurrection
               // #1874: keep the birth stamp across snapshot re-delivery
               if (F.orders[oid] && F.orders[oid]._bornTs != null) {
                 o._bornTs = F.orders[oid]._bornTs;
@@ -5559,6 +5671,8 @@ function createTradeNative(opts) {
               if (msg.is_cancel) {
                 delete F.orders[oid];
                 krLseq(F); krPushSc(F, 'ordgone', oid);   // #1874 WS-gone badge fast path
+              } else if (krTombBlock(F, oid, 'ford')) {
+                // #1876: lagging delta for a just-removed order — no resurrection
               } else {
                 // #1874: birth stamp on first WS add (kept across updates)
                 if (F.orders[oid] && F.orders[oid]._bornTs != null) {
@@ -5610,7 +5724,9 @@ function createTradeNative(opts) {
             // deletes the badge in this push beat (the open_orders echo
             // that used to drive it lags seconds); remaining>0 updates qty.
             if (feed === 'fills' && fr) {
-              const eff = krFutFillOrderApply(F.orders, f, Date.now());
+              // #1876: no order-row writes for a just-removed order
+              const eff = krTombBlock(F, String((f || {}).order_id || ''), 'ffill')
+                ? null : krFutFillOrderApply(F.orders, f, Date.now());
               // #1874: fill-consumed rows push the gone oid (badge fast path)
               if (eff) { krLseq(F); krPushSc(F, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(f.order_id || '') : null); }   // #1860/#1867/#1874
               // per-fill push id (#1870): each live fill rides the event so
@@ -7621,8 +7737,15 @@ function createTradeNative(opts) {
       // (fail-visible TTL — venue truth replaces confirmed ones in place).
       const nowP = Date.now();
       // #1860: expiry deletes ARE ledger writes — bump the scope seq
-      if (krSynPrune(sess.spot.orders, nowP)) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); }   // #1867
-      if (krSynPrune(sess.fut.orders, nowP)) { krLseq(sess.fut); krPushSc(sess.fut, 'order'); }   // #1867
+      {   // #1876: expiry deletions are diag-visible (kr_syn_expire)
+        const nS = krSynPrune(sess.spot.orders, nowP);
+        if (nS) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); tdiag('acct', 'kr_syn_expire', { w: 'spot', n: nS }); }   // #1867
+        const nF = krSynPrune(sess.fut.orders, nowP);
+        if (nF) { krLseq(sess.fut); krPushSc(sess.fut, 'order'); tdiag('acct', 'kr_syn_expire', { w: 'fut', n: nF }); }   // #1867
+      }
+      // #1876: expired gone-order tombstones sweep on the same beat
+      sess.spot.tombs = krTombSweep(sess.spot.tombs, nowP);
+      sess.fut.tombs = krTombSweep(sess.fut.tombs, nowP);
     }
     const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
     const wsFut = !!(sess && krWsLive(sess.fut));
@@ -7670,6 +7793,13 @@ function createTradeNative(opts) {
       out.flexAccount = flex.data || null;
       out.positions = ((pos.data || {}).openPositions) || [];
       out.futOrders = ((fo.data || {}).openOrders) || [];
+      // #1876: a stale REST page that still lists a just-removed order must
+      // not resurrect its badge — tombstoned ids drop from the read result
+      if (sess) {
+        const tnowF = Date.now();
+        out.futOrders = out.futOrders.filter(
+          (o) => !krTombHit(sess.fut.tombs, String((o || {}).order_id || ''), tnowF));
+      }
       // #1860 ledger overlay: the REST page may predate just-ACKed orders —
       // fresh ledger rows absent from it are appended so badges never
       // vanish to a stale snapshot (stale ledger rows are NOT overlaid).
@@ -7699,7 +7829,11 @@ function createTradeNative(opts) {
       // Flatten the spot OpenOrders map to [{txid, o}] preserving the ids.
       const spotOrders = [];
       const openMap = (((so.data || {}).result) || {}).open || {};
-      for (const txid of Object.keys(openMap)) spotOrders.push({ txid: txid, o: openMap[txid] });
+      for (const txid of Object.keys(openMap)) {
+        // #1876: tombstoned (just-removed) ids never resurrect off a stale page
+        if (sess && krTombHit(sess.spot.tombs, txid, Date.now())) continue;
+        spotOrders.push({ txid: txid, o: openMap[txid] });
+      }
       // #1860 ledger overlay (same rule as futures above): fresh optimistic /
       // just-echoed spot rows missing from the REST page are appended in the
       // same [{txid, o}] shape via the WS→REST mapper.
@@ -7816,6 +7950,9 @@ function createTradeNative(opts) {
             // older than the birth grace, missing from TWO consecutive
             // post-birth snapshots; withheld omissions diag as kr_audit_omit
             const rec = krOrdersReconcile(sess.spot.orders, ids, Date.now(), soT0);
+            // #1876: a page fetched after a removal that omits the id
+            // confirms it gone — its tombstone has done its job
+            sess.spot.tombs = krTombConfirm(sess.spot.tombs, ids, soT0);
             if (rec.omit.length) {
               tdiag('acct', 'kr_audit_omit', { k: slot, w: 'ord',
                 n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
@@ -8834,6 +8971,12 @@ module.exports = {
   krFillOrderApply,
   krFutFillOrderApply,
   krAuditGate,
+  // pure — #1876 gone-order tombstones (no badge resurrection)
+  KR_TOMB_TTL_MS,
+  krTombAdd,
+  krTombHit,
+  krTombSweep,
+  krTombConfirm,
   // pure — Kraken private-REST points ledger (#1832)
   KR_LEDGER_MAX,
   KR_LEDGER_DECAY,
