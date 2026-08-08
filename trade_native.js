@@ -2102,6 +2102,24 @@ function krWsSpotFillRow(e) {
   return { id: String(e.exec_id || e.trade_id),
            ts: Number.isFinite(ts) ? ts : Date.now(), raw: e };
 }
+// #1878: bounded push copy of a spot WS execution trade row — exactly the
+// fields the panel's fills-lane parser (krFillsStateRows) reads, so a pushed
+// row and the later poll/read copy of the SAME fill produce identical merged
+// rows (eid 's:<exec_id>') and dedupe to a no-op. Null for non-trade rows.
+function krPushFillRow(e) {
+  if (!e || typeof e !== 'object') return null;
+  if (String(e.exec_type || '') !== 'trade') return null;
+  if (!String(e.exec_id || e.trade_id || '')) return null;
+  if (!(Number(e.last_qty) > 0) || !e.symbol) return null;
+  const r = { exec_type: 'trade', symbol: String(e.symbol),
+              side: String(e.side || ''), last_qty: e.last_qty,
+              last_price: e.last_price == null ? '0' : e.last_price };
+  if (e.exec_id != null) r.exec_id = String(e.exec_id);
+  if (e.trade_id != null) r.trade_id = String(e.trade_id);
+  if (e.order_id != null) r.order_id = String(e.order_id);
+  if (e.timestamp != null) r.timestamp = e.timestamp;
+  return r;
+}
 // Futures ws/v1 `fills` feed row → cache row. fill_id keys the dedupe — the
 // SAME id REST /derivatives/api/v3/fills publishes, so engine-side dedupe
 // keys stay identical to engine-fetched copies.
@@ -2581,7 +2599,7 @@ const KR_PUSH_FIDS_CAP = 24;
 // SAME push apply pass — never waiting out an acct read that may be busy or
 // racing a stale in-flight snapshot (observed 1.5-5.7s badge-del lag).
 // 'ordgone' folds into the 'order' kind on the wire (consumers key on it).
-function krPushMark(P, key, kind, id) {
+function krPushMark(P, key, kind, id, row) {
   if (!P[key]) P[key] = { kinds: {} };
   const k = String(kind || 'ledger');
   P[key].kinds[k === 'ordgone' ? 'order' : k] = 1;
@@ -2590,6 +2608,15 @@ function krPushMark(P, key, kind, id) {
     const s = String(id);
     if (P[key].fids.length < KR_PUSH_FIDS_CAP && P[key].fids.indexOf(s) < 0) {
       P[key].fids.push(s);
+    }
+    // #1878: the pushed fill's price/qty row rides the event — the panel
+    // seeds the posrow cost-basis replay from it the SAME push beat instead
+    // of waiting out the rate-budget-deferred fills read (observed 4-6s "—"
+    // on close→instant-reopen). Bounded like fids; rows dedupe panel-side
+    // by exec id (same 's:<exec_id>' namespace as the poll lane).
+    if (row && typeof row === 'object') {
+      if (!P[key].frows) P[key].frows = [];
+      if (P[key].frows.length < KR_PUSH_FIDS_CAP) P[key].frows.push(row);
     }
   }
   if (id != null && k === 'ordgone') {
@@ -2608,6 +2635,7 @@ function krPushDrain(P, seqOf, nowMs) {
                  kinds: Object.keys(P[key].kinds).sort(),
                  seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs };
     if (P[key].fids && P[key].fids.length) ev.fids = P[key].fids.slice();
+    if (P[key].frows && P[key].frows.length) ev.frows = P[key].frows.slice();   // #1878 posrow seed rows
     if (P[key].goids && P[key].goids.length) ev.goids = P[key].goids.slice();
     out.push(ev);
     delete P[key];
@@ -2721,19 +2749,29 @@ function krAuditGate(seq0, seqNow, hasData) {
 // tombstones), and a snapshot FETCHED AFTER the removal that omits the id
 // confirms it gone → the tombstone clears early (krTombConfirm).
 const KR_TOMB_TTL_MS = 12000;
+// #1878: SNAPSHOT-sourced adds get a LONGER shield. Audits/snapshots land
+// 10-20s late under rate budget (kr_budget deferral + WS frame queueing), so
+// the 12s TTL let a stale OpenOrders page re-add orders removed 10.9-11.3s
+// earlier once the apply slipped past the TTL (observed v1.5.63: ghost
+// badges 10-30s until the next cancel_all). Removal wins for the snap TTL —
+// only a page still asserting the order PAST it re-shows honestly. Live
+// delta echoes keep the tight 12s window.
+const KR_TOMB_SNAP_TTL_MS = 30000;
 function krTombAdd(tombs, oid, now) {
   const t = (tombs && typeof tombs === 'object') ? tombs : {};
   if (oid != null && oid !== '') t[String(oid)] = +now;
   return t;
 }
-function krTombHit(tombs, oid, now) {
+function krTombHit(tombs, oid, now, ttl) {
   const ts = tombs && tombs[String(oid)];
-  return ts != null && (+now - ts) <= KR_TOMB_TTL_MS;
+  return ts != null && (+now - ts) <= (ttl == null ? KR_TOMB_TTL_MS : +ttl);
 }
 function krTombSweep(tombs, now) {
+  // sweep at the LONGEST gate (snap TTL) — snapshot-add checks must still
+  // see a tombstone the 12s delta window already released
   const t = (tombs && typeof tombs === 'object') ? tombs : {};
   for (const k of Object.keys(t)) {
-    if (+now - t[k] > KR_TOMB_TTL_MS) delete t[k];
+    if (+now - t[k] > KR_TOMB_SNAP_TTL_MS) delete t[k];
   }
   return t;
 }
@@ -5151,8 +5189,8 @@ function createTradeNative(opts) {
 
   // #1876 tombstone re-add guard: true = the id was just removed (fill /
   // cancel / gone) and this re-add source must drop it. Diag rate-capped.
-  function krTombBlock(sc, oid, w) {
-    if (!sc || !krTombHit(sc.tombs, oid, Date.now())) return false;
+  function krTombBlock(sc, oid, w, ttl) {
+    if (!sc || !krTombHit(sc.tombs, oid, Date.now(), ttl)) return false;
     const now = Date.now();
     if (now - (sc._tombDiagT || 0) > 5000) {
       sc._tombDiagT = now;
@@ -5185,7 +5223,7 @@ function createTradeNative(opts) {
       tdiag('acct', 'kr_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
   }
-  function krPushSc(scope, kind, id) {
+  function krPushSc(scope, kind, id, row) {
     // #1876: EVERY gone-order removal tombstones here (single choke point —
     // fill-consumed, cancel-ACKed, WS-gone and audit-confirmed deletes all
     // push 'ordgone'), so lagging snapshots/echoes can't resurrect the row.
@@ -5194,7 +5232,7 @@ function createTradeNative(opts) {
       scope.tombs = krTombAdd(scope.tombs, String(id), Date.now());
     }
     if (!pushLedgerCb || !scope || !scope._pk) return;
-    krPushMark(krPushPend, scope._pk, kind, id);
+    krPushMark(krPushPend, scope._pk, kind, id, row);
     if (!krPushTimer) {
       krPushTimer = setTimeout(krPushFlush, KR_PUSH_COALESCE_MS);
       if (krPushTimer && typeof krPushTimer.unref === 'function') krPushTimer.unref();
@@ -5401,7 +5439,12 @@ function createTradeNative(opts) {
                 krLseq(S);
                 for (const g of rec.gone) krPushSc(S, 'ordgone', g);   // #1867/#1874
               }
-              S.tombs = krTombConfirm(S.tombs, snapIds, snapT0);
+              // #1878: a snapshot that OMITS known-live rows (withheld
+              // above) has proven itself Kraken-side stale — it must not
+              // clear removal tombstones (its omission of a removed id
+              // confirms nothing) and its adds stay tombstone-gated below.
+              if (!rec.omit.length) S.tombs = krTombConfirm(S.tombs, snapIds, snapT0);
+              else tdiag('acct', 'kr_snap_stale', { w: 'snap', n: rec.omit.length });
             }
             // #1814: the snap_trades snapshot IS the fills seed — until it
             // lands, fills_read must NOT report this scope (an empty read
@@ -5432,7 +5475,7 @@ function createTradeNative(opts) {
                 krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
-            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id); }   // #1867 push-driven chime (+#1870 per-fill id) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
+            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id, krPushFillRow(e)); }   // #1867 push-driven chime (+#1870 per-fill id, +#1878 posrow-seed row) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
             if (fr) {
               // #1870 fill-consumption badge removal: a trade execution that
               // fully consumes its order deletes the ledger row in the SAME
@@ -5458,8 +5501,11 @@ function createTradeNative(opts) {
               continue;
             } else {
               // #1876: lagging echo/snapshot row for a just-removed order —
-              // the tombstone wins, never a badge resurrection
-              if (krTombBlock(S, oid, 'sord')) continue;
+              // the tombstone wins, never a badge resurrection. #1878:
+              // snapshot rows are gated at the LONG snap TTL (stale pages
+              // apply 10-20s late under budget); live deltas keep 12s.
+              if (krTombBlock(S, oid, lagSnapFrame ? 'ssnap' : 'sord',
+                              lagSnapFrame ? KR_TOMB_SNAP_TTL_MS : null)) continue;
               // delta frames carry partial fields — merge onto the row
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
               // #1874: birth stamp (WS add seq/time) — the audit-omission
@@ -5649,12 +5695,15 @@ function createTradeNative(opts) {
               krLseq(F);
               for (const g of rec.gone) krPushSc(F, 'ordgone', g);   // #1867/#1874
             }
-            F.tombs = krTombConfirm(F.tombs, snapIds, snapT0);
+            // #1878: an omitting (proven-stale) snapshot never clears
+            // removal tombstones; its adds stay gated below at the snap TTL
+            if (!rec.omit.length) F.tombs = krTombConfirm(F.tombs, snapIds, snapT0);
+            else tdiag('acct', 'kr_snap_stale', { w: 'fsnap', n: rec.omit.length });
           }
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
             if (oid) {
-              if (krTombBlock(F, oid, 'fsnap')) continue;   // #1876 just-removed — no resurrection
+              if (krTombBlock(F, oid, 'fsnap', KR_TOMB_SNAP_TTL_MS)) continue;   // #1876 just-removed — no resurrection (#1878 snap TTL)
               // #1874: keep the birth stamp across snapshot re-delivery
               if (F.orders[oid] && F.orders[oid]._bornTs != null) {
                 o._bornTs = F.orders[oid]._bornTs;
@@ -7808,7 +7857,8 @@ function createTradeNative(opts) {
       if (sess) {
         const tnowF = Date.now();
         out.futOrders = out.futOrders.filter(
-          (o) => !krTombHit(sess.fut.tombs, String((o || {}).order_id || ''), tnowF));
+          (o) => !krTombHit(sess.fut.tombs, String((o || {}).order_id || ''), tnowF,
+                            KR_TOMB_SNAP_TTL_MS));   // #1878 snapshot-sourced → snap TTL
       }
       // #1860 ledger overlay: the REST page may predate just-ACKed orders —
       // fresh ledger rows absent from it are appended so badges never
@@ -7841,7 +7891,7 @@ function createTradeNative(opts) {
       const openMap = (((so.data || {}).result) || {}).open || {};
       for (const txid of Object.keys(openMap)) {
         // #1876: tombstoned (just-removed) ids never resurrect off a stale page
-        if (sess && krTombHit(sess.spot.tombs, txid, Date.now())) continue;
+        if (sess && krTombHit(sess.spot.tombs, txid, Date.now(), KR_TOMB_SNAP_TTL_MS)) continue;   // #1878 snapshot-sourced → snap TTL
         spotOrders.push({ txid: txid, o: openMap[txid] });
       }
       // #1860 ledger overlay (same rule as futures above): fresh optimistic /
@@ -7961,8 +8011,11 @@ function createTradeNative(opts) {
             // post-birth snapshots; withheld omissions diag as kr_audit_omit
             const rec = krOrdersReconcile(sess.spot.orders, ids, Date.now(), soT0);
             // #1876: a page fetched after a removal that omits the id
-            // confirms it gone — its tombstone has done its job
-            sess.spot.tombs = krTombConfirm(sess.spot.tombs, ids, soT0);
+            // confirms it gone — its tombstone has done its job. #1878: an
+            // omitting (proven-stale) page confirms nothing — tombstones
+            // survive so its adds stay blocked at the snap TTL.
+            if (!rec.omit.length) sess.spot.tombs = krTombConfirm(sess.spot.tombs, ids, soT0);
+            else tdiag('acct', 'kr_snap_stale', { k: slot, w: 'ord', n: rec.omit.length });
             if (rec.omit.length) {
               tdiag('acct', 'kr_audit_omit', { k: slot, w: 'ord',
                 n: rec.omit.length, ids: rec.omit.slice(0, 6).join(',').slice(0, 80) });
@@ -8983,6 +9036,8 @@ module.exports = {
   krAuditGate,
   // pure — #1876 gone-order tombstones (no badge resurrection)
   KR_TOMB_TTL_MS,
+  KR_TOMB_SNAP_TTL_MS,
+  krPushFillRow,
   krTombAdd,
   krTombHit,
   krTombSweep,
