@@ -7946,6 +7946,23 @@ function createTradeNative(opts) {
             .catch(() => { /* warm-up is best-effort; real action will surface errors */ });
         }
       }
+      // #1857: Kraken trade-connection pre-warm — the first order's real cold
+      // cost is the private WS order-entry session (token dance + connect),
+      // not just the REST socket. Kick krWsEnsure for every armed kraken slot
+      // so the session loop is already live before the first click; the loop
+      // self-maintains (reconnect/backoff), so this is a one-time kick per
+      // slot — NO recurring token spend, and a no-op while the loop runs.
+      if (venue === 'kraken') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'kraken') continue;
+            const c = credsGet(k);
+            if (c) { try { krWsEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
     } catch (e) { /* non-fatal */ }
   }
 
