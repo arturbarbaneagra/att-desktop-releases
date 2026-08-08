@@ -5014,7 +5014,14 @@ function createTradeNative(opts) {
           if (String(msg.type || '') === 'snapshot') {
             // #1822: keep fresh optimistic rows — a snapshot captured before
             // a just-ACKed order must not erase its synthetic badge/hold
-            S.orders = krSynCarry(S.orders, Date.now());
+            // #1860: the reset itself deletes rows (carried ⊆ previous) — an
+            // EMPTY snapshot frame runs no per-event bumps, so stamp the
+            // deletion here or the read seq goes stale vs the displayed map.
+            {
+              const preN = Object.keys(S.orders).length;
+              S.orders = krSynCarry(S.orders, Date.now());
+              if (Object.keys(S.orders).length !== preN) krLseq(S);
+            }
             // #1814: the snap_trades snapshot IS the fills seed — until it
             // lands, fills_read must NOT report this scope (an empty read
             // would advance the panel cursor past the seed window).
@@ -5194,7 +5201,11 @@ function createTradeNative(opts) {
           // #1822: same snapshot race as spot — REST order acks are
           // WS-independent, so a reconnect snapshot older than a just-ACKed
           // order must not erase its fresh synthetic row
-          F.orders = krSynCarry(F.orders, Date.now());
+          {   // #1860: snapshot reset deletions bump too (same as spot)
+            const preN = Object.keys(F.orders).length;
+            F.orders = krSynCarry(F.orders, Date.now());
+            if (Object.keys(F.orders).length !== preN) krLseq(F);
+          }
           for (const o of (msg.orders || [])) {
             const oid = String((o || {}).order_id || '');
             if (oid) F.orders[oid] = o;
