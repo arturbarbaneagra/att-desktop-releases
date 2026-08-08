@@ -2387,13 +2387,14 @@ function krSynFutOrder(oid, symbol, side, qty, price, cid, reduceOnly, now) {
 // snapshot ever testified against keeps its badge; the reconcile's double
 // omission remains the honest removal path.
 function krSynPrune(orders, now) {
-  let n = 0;
-  for (const oid of Object.keys(orders || {})) {
-    const o = orders[oid] || {};
-    const ts = o._synTs;
-    if (ts != null && now - ts > KR_SYN_TTL_MS && o._omitTs > 0) { delete orders[oid]; n += 1; }
-  }
-  return n;
+  // Removal is owned by krOrdersReconcile (birth grace + double omission):
+  // a snapshot listing the row confirms it, and only a SECOND later-fetched
+  // snapshot that also omits it may delete. A time-based prune here could
+  // delete on a single armed omission — exactly the false badge wipe the
+  // double-omission rule prevents — so this sweep deletes nothing. Kept as
+  // a call-site-stable no-op (seq/diag behavior unchanged: it never fires).
+  void orders; void now;
+  return 0;
 }
 // Snapshot-race carry: the spot session goes live on the subscribe ACKs,
 // BEFORE its executions snapshot is applied — an order ACKed in that gap
