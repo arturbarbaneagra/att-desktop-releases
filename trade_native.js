@@ -6057,7 +6057,11 @@ function createTradeNative(opts) {
                                   [['symbol', String(intent.symbol)]], route);
         if (!r.ok) return r;
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) { krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument'); krLseq(sessF.fut); krPushSc(sessF.fut, 'order'); }   // #1867
+        if (sessF) {
+          // #1876: swept ids ride the ordgone choke point (tombstones)
+          for (const g of krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument')) krPushSc(sessF.fut, 'ordgone', g);
+          krLseq(sessF.fut); krPushSc(sessF.fut, 'order');   // #1867
+        }
         return { ok: true, cancelled: 'all' };
       }
       // #1839: Space = ONE bulk sweep. The old loop of per-txid cancels
@@ -6078,7 +6082,12 @@ function createTradeNative(opts) {
         // account-wide sweep → drop EVERY optimistic/echoed spot row (all
         // pairs), so holds/badges reflect the sweep immediately.
         if (sessA) {
-          for (const k of Object.keys(sessA.spot.orders || {})) delete sessA.spot.orders[k];
+          // #1876: per-oid ordgone (tombstones) — a lagging snapshot/REST
+          // page must not resurrect swept badges
+          for (const k of Object.keys(sessA.spot.orders || {})) {
+            delete sessA.spot.orders[k];
+            krPushSc(sessA.spot, 'ordgone', k);
+          }
           krLseq(sessA.spot); krPushSc(sessA.spot, 'order');   // #1860/#1867
         }
         const out = { ok: true, cancelled: 'all' };
