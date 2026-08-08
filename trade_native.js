@@ -5492,6 +5492,7 @@ function createTradeNative(opts) {
                                        { order_id: [String(intent.orderID)] });
           if (m && m.success) {
             delete sessC.spot.orders[String(intent.orderID)];   // #1822
+            krLseq(sessC.spot);   // #1860
             return { ok: true, cancelled: intent.orderID };
           }
         } catch (e) { /* REST fallback below */ }
@@ -7175,8 +7176,9 @@ function createTradeNative(opts) {
       // #1822: expire never-confirmed optimistic rows before serving reads
       // (fail-visible TTL — venue truth replaces confirmed ones in place).
       const nowP = Date.now();
-      krSynPrune(sess.spot.orders, nowP);
-      krSynPrune(sess.fut.orders, nowP);
+      // #1860: expiry deletes ARE ledger writes — bump the scope seq
+      if (krSynPrune(sess.spot.orders, nowP)) krLseq(sess.spot);
+      if (krSynPrune(sess.fut.orders, nowP)) krLseq(sess.fut);
     }
     const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
     const wsFut = !!(sess && krWsLive(sess.fut));
