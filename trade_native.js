@@ -2833,6 +2833,75 @@ function krConsumedTake(map, oid, row, now) {
                (oq > 0 && r.cq >= oq * (1 - 1e-9));
   return { eff: gone ? 'gone' : 'upd', cq: r.cq, rq: r.rq, execs: r.execs };
 }
+// --- #1887 permanent per-session closed-order set (pure) --------------------
+// TTL tombstones (#1876/#1878) stop SHORT-lag resurrections, but an
+// instant-fill in-spread limit can have its GONE processed before its
+// registration, and the late registration then reopens the id — a routine
+// /state render re-adds the badge right past the panel tombstone TTL
+// (observed: badge re-added ~29s after deletion, living another 29s).
+// The closed set is PERMANENT for the scope's session: once an id pushed
+// 'ordgone' (WS-gone, cancel ACK, fill-consumed, audit-confirmed — every
+// gone rides the krPushSc choke point) NO later registration, snapshot,
+// synthetic ack echo or /state-served map may reopen it. Bounded FIFO —
+// a scalp session cannot grow it unbounded.
+const KR_CLOSED_MAX = 5000;
+function krClosedAdd(c, oid) {
+  if (!oid) return c;
+  const cc = c || { m: {}, q: [] };
+  if (cc.m[oid]) return cc;
+  cc.m[oid] = 1; cc.q.push(oid);
+  while (cc.q.length > KR_CLOSED_MAX) delete cc.m[cc.q.shift()];
+  return cc;
+}
+function krClosedHas(c, oid) { return !!(c && oid && c.m && c.m[oid]); }
+// --- #1887 oid→symbol memory (pure) -----------------------------------------
+// Spot WS-v2 trade exec rows may omit `symbol`; the old backfill read the
+// ledger's order row — absent for an instant-fill limit whose registration
+// lags the fill. Symbol-less fills then starve EVERYTHING downstream: the
+// totals math no-ops (posrow qty rides lagging balance echoes → false-flat
+// window), the pushed seed row drops (krPushFillRow null), and the poll
+// copy is unparseable (fills-lane rows require symbol) — the lot
+// accumulator never ingests a single fill (observed: 45 fills, zero avg
+// renders). This map remembers oid→symbol from EVERY authoritative source
+// (own order ACKs — we placed it, the symbol is the intent's —, WS
+// registrations, symbol-carrying exec rows) so a fill can be backfilled
+// regardless of registration state; bounded FIFO.
+const KR_OIDSYM_MAX = 4000;
+function krOidSymNote(map, oid, sym) {
+  if (!oid || !sym) return map;
+  const m = map || { m: {}, q: [] };
+  if (m.m[oid] == null) {
+    m.q.push(oid);
+    while (m.q.length > KR_OIDSYM_MAX) delete m.m[m.q.shift()];
+  }
+  m.m[oid] = String(sym);
+  return m;
+}
+function krOidSymGet(map, oid) {
+  return (map && oid && map.m && map.m[oid] != null) ? map.m[oid] : null;
+}
+// Retro-fix cached raw exec rows that were stored symbol-less before the
+// oid→symbol mapping was learned (fill beat the ACK/registration). Stamps
+// `symbol` in place (the fills_read path serves these same raw objects, so
+// the poll copy heals too) and returns the fixed rows so the caller can
+// catch up the totals math + re-push symbol-complete seed rows. Bounded
+// newest-first scan — symbol-less rows are always recent by construction.
+const KR_SYMFIX_SCAN_MAX = 400;
+function krFillsSymBackfill(rows, oid, sym, scanMax) {
+  const out = [];
+  if (!rows || !oid || !sym) return out;
+  const cap = (scanMax == null) ? KR_SYMFIX_SCAN_MAX : scanMax;
+  const n = rows.length;
+  for (let i = n - 1, seen = 0; i >= 0 && seen < cap; i--, seen++) {
+    const raw = (rows[i] || {}).raw;
+    if (!raw || typeof raw !== 'object') continue;
+    if (String(raw.order_id || '') !== String(oid)) continue;
+    if (raw.symbol != null && raw.symbol !== '') continue;
+    raw.symbol = String(sym);
+    out.push(raw);
+  }
+  return out;
+}
 // --- #1870 stale-snapshot auditor gate (pure) -------------------------------
 // A REST auditor snapshot may only mutate the ledger when (a) the response
 // actually carries its data section — a budget-deferred / failed / body-error
@@ -5329,13 +5398,60 @@ function createTradeNative(opts) {
   // #1876 tombstone re-add guard: true = the id was just removed (fill /
   // cancel / gone) and this re-add source must drop it. Diag rate-capped.
   function krTombBlock(sc, oid, w, ttl) {
-    if (!sc || !krTombHit(sc.tombs, oid, Date.now(), ttl)) return false;
+    if (!sc || !oid) return false;
+    // #1887: permanently-closed ids block every re-add source forever —
+    // the TTL tombstone below only covers short-lag echoes.
+    if (krClosedHas(sc.closed, oid)) {
+      const nowC = Date.now();
+      if (nowC - (sc._tombDiagT || 0) > 5000) {
+        sc._tombDiagT = nowC;
+        try { tdiag('acct', 'kr_closed_block', { w: w, oid: String(oid).slice(0, 24) }); } catch (e) { /* diag-only */ }
+      }
+      return true;
+    }
+    if (!krTombHit(sc.tombs, oid, Date.now(), ttl)) return false;
     const now = Date.now();
     if (now - (sc._tombDiagT || 0) > 5000) {
       sc._tombDiagT = now;
       try { tdiag('acct', 'kr_tomb_block', { w: w, oid: String(oid).slice(0, 24) }); } catch (e) { /* diag-only */ }
     }
     return true;
+  }
+
+  // #1887 oid→symbol learn + symbol-less fill catch-up (spot scope). Called
+  // from every authoritative symbol source (own ACKs, WS registrations,
+  // symbol-carrying exec rows). When cached symbol-less fills exist for the
+  // oid (S._symless counter — fill beat the ACK/registration), they are
+  // stamped in place (fills_read serves the same raw objects), their totals
+  // delta is applied exactly once (_totApplied latch — the original fill
+  // site no-ops without a symbol and only IT or this drain may apply), and
+  // a symbol-complete seed row re-pushes so the panel's lot accumulator
+  // seeds this beat (fid re-push dedupes as sound-seen; lane merge dedupes
+  // by eid — the fixed row simply lands where the null one never did).
+  function krOidSymLearn(S, oid, sym) {
+    if (!S || !oid || !sym) return;
+    S.oidSym = krOidSymNote(S.oidSym, String(oid), sym);
+    if (!((S._symless | 0) > 0)) return;
+    const fixed = krFillsSymBackfill(S.fills && S.fills.rows, String(oid), sym);
+    if (!fixed.length) return;
+    S._symless = Math.max(0, (S._symless | 0) - fixed.length);
+    for (const raw of fixed) {
+      if (!raw._totApplied && S.totals) {
+        const tn = Date.now();
+        if (!S.fillDirs) S.fillDirs = {};
+        const touched = krFillTotalsApply(S.totals, raw, S.fillDirs, tn);
+        if (touched.length) {
+          raw._totApplied = true;
+          if (!S.fillTouch) S.fillTouch = {};
+          for (const a of touched) S.fillTouch[a] = tn;
+          krFillTouchPrune(S.fillTouch, tn);
+          krFillDirsPrune(S.fillDirs, tn);
+          krLseq(S); krPushSc(S, 'bal');
+        }
+      }
+      const fr = krWsSpotFillRow(raw);
+      if (fr) { krLseq(S); krPushSc(S, 'fill', fr.id, krPushFillRow(raw, null)); }
+    }
   }
 
   // --- #1867 push channel (runtime) ---------------------------------------
@@ -5369,6 +5485,10 @@ function createTradeNative(opts) {
     // Runs BEFORE the push-wiring guard: web/no-push shells tombstone too.
     if (scope && String(kind) === 'ordgone' && id != null && id !== '') {
       scope.tombs = krTombAdd(scope.tombs, String(id), Date.now());
+      // #1887: gone is PERMANENT for the session — the closed set outlives
+      // every tombstone TTL, so a late registration / stale snapshot /
+      // /state render can never reopen the id (gone-before-registration).
+      scope.closed = krClosedAdd(scope.closed, String(id));
     }
     if (!pushLedgerCb || !scope || !scope._pk) return;
     krPushMark(krPushPend, scope._pk, kind, id, row);
@@ -5599,8 +5719,31 @@ function createTradeNative(opts) {
             // by exec_id — snapshot + live overlap is a no-op). Snapshot
             // trade rows may carry NO order_status: never let one land in
             // the open-orders map as a phantom row.
+            // #1887: symbol backfill BEFORE anything consumes the row —
+            // instant-fill limits deliver trade rows whose order was never
+            // registered, so the old order-row-only backfill starved the
+            // totals math, the pushed seed row AND the poll copy at once.
+            // Sources: ledger order row → oid→symbol memory (own ACKs /
+            // earlier registrations). Symbol-carrying rows LEARN instead.
+            if (String(e.exec_type || '') === 'trade') {
+              const soid = String(e.order_id || '');
+              if (e.symbol == null || e.symbol === '') {
+                const bs = (soid && S.orders[soid] && S.orders[soid].symbol != null)
+                  ? S.orders[soid].symbol : krOidSymGet(S.oidSym, soid);
+                if (bs) e.symbol = bs;
+              } else if (soid) {
+                S.oidSym = krOidSymNote(S.oidSym, soid, e.symbol);
+              }
+            }
             const fr = krWsSpotFillRow(e);
-            if (fr) krFillsCachePush(S.fills, fr);
+            if (fr) {
+              const frNew = krFillsCachePush(S.fills, fr);
+              // #1887: count cached symbol-less rows — the ACK/registration
+              // learn path drains them (bounded backfill scan gated on >0)
+              if (frNew && (e.symbol == null || e.symbol === '')) {
+                S._symless = (S._symless | 0) + 1;
+              }
+            }
             // #1864 fills-first posrow: a LIVE trade execution applies its
             // balance delta to the totals map synchronously (buy +base/-cost,
             // sell -base/+cost, fees off their own asset) — the posrow moves
@@ -5612,6 +5755,7 @@ function createTradeNative(opts) {
               if (!S.fillDirs) S.fillDirs = {};   // #1884 auditor regression clamp
               const touched = krFillTotalsApply(S.totals, e, S.fillDirs, tnow0);
               if (touched.length) {
+                e._totApplied = true;   // #1887: the learn-drain must not re-apply
                 if (!S.fillTouch) S.fillTouch = {};
                 const tnow = tnow0;
                 for (const a of touched) S.fillTouch[a] = tnow;
@@ -5654,6 +5798,12 @@ function createTradeNative(opts) {
             }
             const oid = String(e.order_id || '');
             if (!oid) continue;
+            // #1887: EVERY registration/status row carrying a symbol teaches
+            // the oid→symbol map and drains cached symbol-less fills for the
+            // id — BEFORE the closed/tombstone gate, so a gone-before-
+            // registration order still ships its symbol-complete fills to
+            // the panel's lot accumulator (external orders have no own ACK).
+            if (e.symbol != null && e.symbol !== '') krOidSymLearn(S, oid, e.symbol);
             if (KR_WS_SPOT_GONE[String(e.order_status || '').toLowerCase()]) {
               delete S.orders[oid];
               krLseq(S); krPushSc(S, 'ordgone', oid);   // #1874 WS-gone badge fast path
@@ -6148,7 +6298,14 @@ function createTradeNative(opts) {
             // #1822: the ACK precedes the executions echo by seconds over
             // proxied routes — echo the resting order into S.orders NOW so
             // badges/holds don't wait on the venue echo.
-            if (t === 'limit') {
+            // #1887: the ACK is the earliest oid→symbol authority (the
+            // symbol is the intent's) — learn + drain any symbol-less fills
+            // the WS echo delivered BEFORE this ACK returned (instant fill).
+            krOidSymLearn(sessO.spot, oid, symbol);
+            // #1887: an instant-fill limit can be CLOSED (fill + gone
+            // processed) before the ACK returns — the optimistic echo must
+            // never reopen a closed/tombstoned id (badge resurrection).
+            if (t === 'limit' && !krTombBlock(sessO.spot, oid, 'ack')) {
               sessO.spot.orders[oid] =
                 krSynSpotOrder(oid, symbol, side, q, price, cid, Date.now());
               krLseq(sessO.spot); krPushSc(sessO.spot, 'order');   // #1860/#1867
@@ -6165,7 +6322,8 @@ function createTradeNative(opts) {
         const txids = (((r.data || {}).result) || {}).txid || [];
         const oid = txids.length ? String(txids[0]) : '';
         if (!oid) return { ok: false, message: 'Kraken returned no order id' };
-        if (t === 'limit' && sessO) {   // #1822 optimistic echo (REST ack)
+        if (sessO) krOidSymLearn(sessO.spot, oid, symbol);   // #1887 ACK symbol authority
+        if (t === 'limit' && sessO && !krTombBlock(sessO.spot, oid, 'ack')) {   // #1822 optimistic echo (REST ack); #1887 closed ids never reopen
           sessO.spot.orders[oid] = krSynSpotOrder(oid, symbol, side, q, price,
                                                   krClOrdId(clOrdID), Date.now());
           krLseq(sessO.spot); krPushSc(sessO.spot, 'order');   // #1860/#1867
@@ -6198,7 +6356,9 @@ function createTradeNative(opts) {
       // trigger feed, market orders never rest); positions stay venue-truth.
       if (t === 'limit' && !isStop && !f.trigger) {
         const sessF = krWsSessGet(intent.credSlot || 'kraken');
-        if (sessF) {
+        // #1887: instant-fill limit closed before the ACK returned — the
+        // optimistic echo must never reopen a closed/tombstoned id.
+        if (sessF && !krTombBlock(sessF.fut, oid, 'ack')) {
           sessF.fut.orders[oid] = krSynFutOrder(oid, symbol, side, q, price,
                                                 krClOrdId(clOrdID),
                                                 !!f.reduceOnly, Date.now());
@@ -9257,6 +9417,15 @@ module.exports = {
   krConsumedTake,
   krConsumedPrune,
   KR_CONSUMED_TTL_MS,
+  // pure — #1887 permanent closed-order set + oid→symbol memory
+  KR_CLOSED_MAX,
+  krClosedAdd,
+  krClosedHas,
+  KR_OIDSYM_MAX,
+  krOidSymNote,
+  krOidSymGet,
+  KR_SYMFIX_SCAN_MAX,
+  krFillsSymBackfill,
   krFillDirsPrune,
   KR_FILL_CLAMP_GRACE_MS,
   krFillTotalsApply,
