@@ -147,6 +147,10 @@ function diagRotate(dir, keepFiles, totalCap) {
 // Key = cat|ev|k (k is an optional caller-chosen sub-key, e.g. a conn key or
 // host). Allows DIAG_RL_MAX per rolling window; the first suppressed event
 // emits ONE marker ({e:'rl', key, n}) when the window rolls over.
+// #1864: events exempt from the rate limiter — each must be provably
+// self-bounded where it is emitted (kr_ws_lag: one per minute per scope).
+const DIAG_RL_EXEMPT = { kr_ws_lag: 1 };
+
 function diagRateLimiter(maxPerWindow, windowMs) {
   const max = maxPerWindow > 0 ? maxPerWindow : DIAG_RL_MAX;
   const win = windowMs > 0 ? windowMs : DIAG_RL_WINDOW_MS;
@@ -229,6 +233,11 @@ function createDiagLogger(opts) {
     log: function (win, cat, ev, data) {
       if (!stream || capped) return;
       const t = now();
+      // #1864: limiter-exempt events (already self-bounded at the source —
+      // e.g. kr_ws_lag emits at most once per minute per scope). A burst of
+      // OTHER events on the same cat can otherwise consume the shared window
+      // and drop the one lag sample the session forensics need.
+      if (DIAG_RL_EXEMPT[ev]) { writeLine(diagLine(t, win, cat, ev, data)); return; }
       const key = cat + '|' + ev + '|' + String((data && data.k) || '');
       const a = allow(key, t);
       if (!a.ok) return;
@@ -256,4 +265,5 @@ module.exports = {
   DIAG_FILE_CAP,
   DIAG_RL_MAX,
   DIAG_RL_WINDOW_MS,
+  DIAG_RL_EXEMPT,
 };

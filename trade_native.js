@@ -492,7 +492,7 @@ function validateIntent(it) {
     const sn = tnSlotNorm(it.credSlot);
     if (!sn || sn.base !== it.venue) return 'bad credSlot';
   }
-  if (['order', 'cancel', 'cancel_all', 'close', 'sltp'].indexOf(it.op) < 0) return 'unknown op';
+  if (['order', 'cancel', 'cancel_all', 'close', 'sltp', 'amend'].indexOf(it.op) < 0) return 'unknown op';
   const market = it.market;
   if (it.op !== 'close' && it.op !== 'sltp' && market !== 'spot' && market !== 'futures') {
     return 'market must be spot or futures';
@@ -521,6 +521,13 @@ function validateIntent(it) {
   }
   if (it.op === 'close') {
     if (typeof it.clOrdID !== 'string' || !it.clOrdID || it.clOrdID.length > 64) return 'bad clOrdID';
+  }
+  if (it.op === 'amend') {
+    // #1864 replace gesture: kraken-only for now (spot WS-v2 amend_order)
+    if (it.venue !== 'kraken') return 'amend not supported on this venue';
+    if (typeof it.orderID !== 'string' || !it.orderID || it.orderID.length > 64
+        || !/^[A-Za-z0-9:_-]+$/.test(it.orderID)) return 'bad orderID';
+    if (!posDecOk(it.price)) return 'bad price';
   }
   if (it.op === 'sltp') {
     if (it.kind !== 'sl' && it.kind !== 'tp') return 'bad kind';
@@ -2599,9 +2606,18 @@ function krIsRateLimited(msg) { return /rate ?limit/i.test(String(msg || '')); }
 // ledger); order ADDS are softly gated (bounded pace wait, then send anyway
 // flagged `paced`) so a Space sweep always has penalty headroom.
 const KR_TRADE_MAX = 60;            // starter-tier trading counter
-const KR_TRADE_DECAY = 0.33;        // pts/s decay (cautious worst case; pro ~2.33)
+// #1864 re-audit: the TRADING counter decays 1 pt/s at starter tier (Kraken
+// docs — the 0.33 figure belongs to the QUERY counter only; live sessions
+// showed the 0.33 mirror draining ~3× faster than the venue and pacing adds
+// to ~1.9s while Kraken itself never rejected). Amend rides the same counter
+// at cost 1 with NO cancel age penalty — the replace gesture no longer pays
+// the +8 young-cancel toll, which is where burst headroom went.
+const KR_TRADE_DECAY = 1.0;         // pts/s decay (starter trading counter)
 const KR_TRADE_FLOOR = 10;          // headroom reserved for a sweep penalty
-const KR_ORDER_PACE_MAX_MS = 1500;  // adds soft-defer at most this, then send
+// #1864: bound the soft pace so a burst ack stays sub-500ms — the mirror may
+// still be pessimistic vs the venue; past this we send anyway (flagged
+// paced) and let the venue's own limiter be the truth.
+const KR_ORDER_PACE_MAX_MS = 400;   // adds soft-defer at most this, then send
 // Cancel age-penalty schedule (Kraken docs, seconds since the order was
 // placed → extra points). Unknown age = worst case (cautious mirror).
 function krCancelPenalty(ageS) {
@@ -2643,6 +2659,77 @@ function krTradeGate(L, cost, now) {
 function krTradePts(L, now) {
   const dt = Math.max(0, (Number(now) || 0) - L.ts) / 1000;
   return Math.min(KR_TRADE_MAX, L.pts + dt * KR_TRADE_DECAY);
+}
+
+// --- #1864 fills-first local position math (pure) ----------------------------
+// The posrow must move the instant an execution lands — not when Kraken's
+// balances echo (~3-6s late) or the REST auditor catches up. Every live
+// executions `trade` row applies its balance delta to the WS totals map
+// synchronously: buy = +base / -(cost+fee), sell = -base / +(cost-fee); fees
+// subtract from their own asset rows. Values stay strings (WS balances
+// shape). Returns the list of touched asset names ([] = row not applicable)
+// so the caller can stamp per-asset touch times for the auditor grace.
+function krFillTotalsApply(totals, e) {
+  if (!totals || !e || typeof e !== 'object') return [];
+  if (String(e.exec_type || '') !== 'trade') return [];
+  const sym = String(e.symbol || '');
+  const base = sym.split('/')[0], quote = sym.split('/')[1] || '';
+  const qty = Number(e.last_qty), px = Number(e.last_price);
+  if (!base || !quote || !(qty > 0)) return [];
+  const cost = (e.cost != null && Number.isFinite(Number(e.cost)))
+    ? Number(e.cost) : (px > 0 ? qty * px : NaN);
+  if (!Number.isFinite(cost)) return [];
+  const buy = String(e.side || '').toLowerCase() === 'buy';
+  const touched = {};
+  const add = (asset, d) => {
+    if (!asset || !Number.isFinite(d)) return;
+    const cur = Number(totals[asset]);
+    totals[asset] = String((Number.isFinite(cur) ? cur : 0) + d);
+    touched[asset] = 1;
+  };
+  add(base, buy ? qty : -qty);
+  add(quote, buy ? -cost : cost);
+  for (const f of (Array.isArray(e.fees) ? e.fees : [])) {
+    if (f && f.asset != null) add(String(f.asset), -Number(f.qty));
+  }
+  return Object.keys(touched);
+}
+// Background auditor (BalanceEx / WS balances vs the local fill-applied
+// totals): venue snapshots may PREDATE a just-applied fill, so assets whose
+// local row was fill-touched within graceMs keep the LOCAL value; everything
+// else takes the audit value, and any real divergence (relative diff beyond
+// eps on a non-grace asset) is reported so the override is diag-visible —
+// "corrects on true divergence", never a silent stale clobber.
+const KR_FILL_TOUCH_GRACE_MS = 2500;
+const KR_AUDIT_REL_EPS = 1e-9;
+function krTotalsAudit(local, audit, touch, now, graceMs, eps) {
+  const g = (graceMs == null) ? KR_FILL_TOUCH_GRACE_MS : graceMs;
+  const e = (eps == null) ? KR_AUDIT_REL_EPS : eps;
+  const out = {}, div = [];
+  const keys = {};
+  for (const k of Object.keys(audit || {})) keys[k] = 1;
+  for (const k of Object.keys(local || {})) keys[k] = 1;
+  for (const a of Object.keys(keys)) {
+    const fresh = touch && touch[a] != null && (now - touch[a]) <= g;
+    const lv = local && local[a] != null ? Number(local[a]) : null;
+    const av = audit && audit[a] != null ? Number(audit[a]) : null;
+    if (fresh && lv != null) { out[a] = String(local[a]); continue; }
+    if (av == null) {         // local-only asset past grace: auditor wins (drop)
+      if (lv != null && Math.abs(lv) > e) div.push(a);
+      continue;
+    }
+    out[a] = String(audit[a]);
+    if (lv == null || Math.abs(lv - av) > e * Math.max(1, Math.abs(av))) div.push(a);
+  }
+  return { totals: out, div: div };
+}
+// Bounded prune for the per-asset fill-touch map (entries expire with the
+// grace window; the map only ever holds a scalp session's active assets).
+function krFillTouchPrune(touch, now, graceMs) {
+  const g = (graceMs == null) ? KR_FILL_TOUCH_GRACE_MS : graceMs;
+  for (const a of Object.keys(touch || {})) {
+    if (!(now - touch[a] <= g)) delete touch[a];
+  }
 }
 
 // GET /derivatives/api/v3/openpositions → common position rows (sizes BASE,
@@ -5035,6 +5122,22 @@ function createTradeNative(opts) {
             // the open-orders map as a phantom row.
             const fr = krWsSpotFillRow(e);
             if (fr) krFillsCachePush(S.fills, fr);
+            // #1864 fills-first posrow: a LIVE trade execution applies its
+            // balance delta to the totals map synchronously (buy +base/-cost,
+            // sell -base/+cost, fees off their own asset) — the posrow moves
+            // NOW, the ~3-6s-late balances echo / REST auditor only confirms.
+            // Touched assets stamp a grace window so a venue snapshot taken
+            // BEFORE this fill can't clobber the local value right back.
+            if (fr && !lagSnapFrame && S.totals) {
+              const touched = krFillTotalsApply(S.totals, e);
+              if (touched.length) {
+                if (!S.fillTouch) S.fillTouch = {};
+                const tnow = Date.now();
+                for (const a of touched) S.fillTouch[a] = tnow;
+                krFillTouchPrune(S.fillTouch, tnow);
+                krLseq(S);
+              }
+            }
             if (fr && e.order_status == null) continue;
             const oid = String(e.order_id || '');
             if (!oid) continue;
@@ -5065,11 +5168,18 @@ function createTradeNative(opts) {
             krLagEmit(S, 'kraken:spot');
           }
         } else if (msg.channel === 'balances') {
-          if (String(msg.type || '') === 'snapshot' || S.totals == null) S.totals = {};
+          const balSnap = String(msg.type || '') === 'snapshot';
+          if (balSnap || S.totals == null) S.totals = {};
           for (const r of (msg.data || [])) {
             if (!r || typeof r !== 'object') continue;
             const a = String(r.asset || '').toUpperCase();
-            if (a && r.balance != null) S.totals[a] = r.balance;
+            if (!a || r.balance == null) continue;
+            // #1864: delta echoes lag fills by seconds — an asset the local
+            // fill math touched within the grace keeps the LOCAL value
+            // (snapshot frames reset the map, so they always apply).
+            if (!balSnap && S.fillTouch && S.fillTouch[a] != null &&
+                Date.now() - S.fillTouch[a] <= KR_FILL_TOUCH_GRACE_MS) continue;
+            S.totals[a] = r.balance;
           }
           krLseq(S);   // #1860 ledger mutation seq
         }
@@ -5513,6 +5623,59 @@ function createTradeNative(opts) {
       if (!r.ok) return r;
       if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); }   // #1822/#1860
       return { ok: true, cancelled: intent.orderID };
+    }
+    if (intent.op === 'amend') {
+      // #1864 replace gesture: spot WS-v2 amend_order moves a working limit
+      // in ONE call — the order id (and queue priority at the new price
+      // level) survives, the trading counter pays cost 1 and NO cancel age
+      // penalty (+8 on young orders is where burst headroom used to go).
+      // Eligibility is strict: spot + live private WS; anything else returns
+      // fallback:true so the panel degrades to cancel+add. Every decision is
+      // diag-logged (kr_amend) with the mode taken.
+      const px = Number(intent.price);
+      if (!(px > 0)) return { ok: false, message: 'Amend needs a price' };
+      if (market === 'futures') {
+        tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'fallback', why: 'futures' });
+        return { ok: false, fallback: true, message: 'Amend is spot-only on Kraken' };
+      }
+      const sessM = krWsSessGet(intent.credSlot || 'kraken');
+      if (!(sessM && krWsLive(sessM.spot))) {
+        tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'fallback', why: 'ws_down' });
+        return { ok: false, fallback: true, message: 'Kraken spot WS not connected' };
+      }
+      {
+        const krTP = krPairFor(creds, 'spot');
+        if (krTP) krTradeSpendFor(krTP.key, 1, 'AmendOrder');
+      }
+      let m;
+      try {
+        m = await krWsSpotCall(sessM, 'amend_order',
+                               { order_id: String(intent.orderID), limit_price: px });
+      } catch (e) {
+        if (e && e.krWsDown) {
+          tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'fallback', why: 'ws_down' });
+          return { ok: false, fallback: true, message: 'Kraken spot WS not connected' };
+        }
+        // post-send timeout: the amend MAY have applied — never blind
+        // cancel+add on top (a doubled order is worse than a stale price).
+        tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'unknown' });
+        return { ok: false, message: 'Kraken WS amend state unknown — check the order before retrying' };
+      }
+      if (!m || !m.success) {
+        // explicit venue reject (filled/canceled/unsupported): surface it —
+        // the caller decides; a gone-family order needs no move anyway.
+        tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'reject',
+          err: String((m && m.error) || '').slice(0, 80) });
+        return { ok: false, message: String((m && m.error) || 'Kraken rejected the amend') };
+      }
+      const oidA = String(intent.orderID);
+      if (sessM.spot.orders[oidA]) {
+        sessM.spot.orders[oidA] = Object.assign({}, sessM.spot.orders[oidA],
+          { limit_price: px, _updTs: Date.now() });
+        krLseq(sessM.spot);   // #1860
+      }
+      tdiag('trade', 'kr_amend', { k: 'kraken', mode: 'ws', ok: 1 });
+      return { ok: true, orderID: oidA, amended: true };
     }
     if (intent.op === 'cancel_all') {
       if (market === 'futures') {
@@ -7327,14 +7490,27 @@ function createTradeNative(opts) {
   async function krConfirmRun(slot, L) {
     if (!krConfirmFire(L.st)) return;
     let goneN = 0;   // #1860 auditor disagreement count (rows venue said gone)
+    let divA = null; // #1864 local-vs-audit totals divergence (asset names)
     try {
       const sess = krWsSessGet(slot);
       const bal = await krRequest(L.creds, 'POST', 'spot',
                                   '/0/private/BalanceEx', null, L.route);
       if (bal.ok && sess) {
-        // venue truth replaces the stale WS totals; later WS deltas keep
-        // merging per-asset on top (both are venue truth, newest wins soon)
-        sess.spot.totals = krBalanceExTotals(bal.data);
+        // #1864: BalanceEx is a background AUDITOR now, not the display path
+        // — the local fill math (krFillTotalsApply) already moved the posrow.
+        // Fill-touched assets inside the grace keep the LOCAL value (the REST
+        // page may predate the fill); everything else takes venue truth, and
+        // any REAL divergence on a settled asset is diag-logged before the
+        // override (kr_audit_div) so a broken local ledger is visible.
+        const aud = krTotalsAudit(sess.spot.totals || {},
+                                  krBalanceExTotals(bal.data),
+                                  sess.spot.fillTouch || null, Date.now());
+        sess.spot.totals = aud.totals;
+        if (aud.div.length) {
+          divA = aud.div.slice(0, 6);
+          tdiag('acct', 'kr_audit_div', { k: slot, n: aud.div.length,
+                                          a: divA.join(',').slice(0, 80) });
+        }
         krLseq(sess.spot);   // #1860
       }
       // #1832 trim: OpenOrders exists to reconcile confirmed-gone rows — an
@@ -7397,6 +7573,7 @@ function createTradeNative(opts) {
       // body-level errors under HTTP 200 are otherwise invisible in the log.
       const kcd = { ok: !!(bal.ok && so.ok) };
       if (goneN) kcd.gone = goneN;   // #1860 auditor corrected the ledger
+      if (divA) kcd.div = divA.length;   // #1864 totals divergence count
       if (bal.skipped || so.skipped) kcd.skipped = true;
       if (!kcd.ok) {
         kcd.err = String((!bal.ok && bal.message) || (!so.ok && so.message)
@@ -8148,7 +8325,8 @@ function createTradeNative(opts) {
                      paced: !!(r && r.rateLimited), ms: Date.now() - diagT0,
                      rows: diagRowCounts(r && r.data ? r.data : r) };
         tdiag('acct', op, dd);
-      } else if (op === 'order' || op === 'cancel' || op === 'cancel_all' || op === 'close_pos') {
+      } else if (op === 'order' || op === 'cancel' || op === 'cancel_all' ||
+                 op === 'close_pos' || op === 'amend') {
         const dd = { k: String(intent.venue || ''), venue: intent.venue,
                      market: intent.market, symbol: intent.symbol,
                      side: intent.side, qty: intent.qty,
