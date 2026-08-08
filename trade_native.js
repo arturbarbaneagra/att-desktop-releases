@@ -2854,6 +2854,49 @@ function krClosedAdd(c, oid) {
   return cc;
 }
 function krClosedHas(c, oid) { return !!(c && oid && c.m && c.m[oid]); }
+// --- #1890 exactly-once fill ingest (pure) ----------------------------------
+// The posrow qty accumulator double-counted a lot-opening fill when the
+// balances DELTA for the trade beat its executions echo: the absolute
+// balance already included the fill, then krFillTotalsApply added the same
+// delta again (observed: posrow = exactly 2× the opening buy; sell-all
+// rejected EOrder:Insufficient funds three times). Every totals ingest path
+// (live exec row, learn-drain) now consults ONE shared gate before applying:
+// (a) a bounded applied-id set keyed on the trade id — the spot exec_id IS
+//     the ledger ref_id Kraken's balances rows carry, so a delta-first echo
+//     notes the id and the exec row skips exactly; duplicate WS deliveries
+//     of the same exec row skip too;
+// (b) a venue-timestamp cover check — an APPLIED balances row for the BASE
+//     asset stamped at/after the fill's venue ts proves the absolute
+//     balance already includes the fill (works even when ref ids don't
+//     match). Skipping is safe: the balance is venue truth.
+function krFillIngestGate(applied, balTs, sym, fid, fts) {
+  if (fid && krClosedHas(applied, fid)) return false;
+  const base = String(sym || '').split('/')[0];
+  if (base && balTs && balTs[base] != null && fts && balTs[base] >= fts) return false;
+  return true;
+}
+// Balances update row → its ledger trade refs + newest venue ts. Kraken
+// ships per-row ledger metadata either flat (ledger_id/ref_id/type/
+// timestamp) or nested under `ledger`; a type:"trade" entry's ref_id is the
+// SAME txid the executions channel ships as exec_id — exact echo dedupe.
+// Rows without any ledger metadata return empty (guards stay inert).
+function krBalRowRefs(r) {
+  const out = { refs: [], ts: 0 };
+  if (!r || typeof r !== 'object') return out;
+  const rows = [];
+  if (Array.isArray(r.ledger)) { for (const L of r.ledger) rows.push(L); }
+  rows.push(r);
+  for (const L of rows) {
+    if (!L || typeof L !== 'object') continue;
+    if (L.ledger_id == null && L.ref_id == null && L.type == null) continue;
+    const ts = L.timestamp ? Date.parse(L.timestamp) : NaN;
+    if (Number.isFinite(ts) && ts > out.ts) out.ts = ts;
+    if (String(L.type || '').toLowerCase() !== 'trade') continue;
+    const ref = String(L.ref_id || L.ledger_id || '');
+    if (ref && out.refs.indexOf(ref) < 0) out.refs.push(ref);
+  }
+  return out;
+}
 // --- #1887 oid→symbol memory (pure) -----------------------------------------
 // Spot WS-v2 trade exec rows may omit `symbol`; the old backfill read the
 // ledger's order row — absent for an instant-fill limit whose registration
@@ -3167,10 +3210,19 @@ function krTotalsAudit(local, audit, touch, now, graceMs, eps, dirs, clampMs) {
     if (dr && lv != null && (now - dr.ts) <= cg &&
         ((dr.d > 0 && (av == null || av < lv - e * Math.max(1, Math.abs(lv)))) ||
          (dr.d < 0 && av != null && av > lv + e * Math.max(1, Math.abs(lv))))) {
-      out[a] = String(local[a]);
-      clamp.push(a);
-      continue;
-    }
+      // #1890 clamp-once: the FIRST disagreement inside the window keeps the
+      // local value (a REST page fetched pre-fill is genuinely stale). A
+      // SECOND consecutive audit disagreeing in the same direction means the
+      // venue is telling the truth — a double-ingested fill looks exactly
+      // like a "regression", and the old unconditional clamp latched the
+      // inflated qty until the window expired (sell-all kept failing).
+      if (!((dr.c | 0) >= 1)) {
+        dr.c = (dr.c | 0) + 1;
+        out[a] = String(local[a]);
+        clamp.push(a);
+        continue;
+      }
+    } else if (dr) dr.c = 0;   // #1890: agreement/in-direction move resets the tie counter
     if (av == null) {         // local-only asset past grace: auditor wins (drop)
       if (lv != null && Math.abs(lv) > e) div.push(a);
       continue;
@@ -5436,12 +5488,24 @@ function createTradeNative(opts) {
     if (!fixed.length) return;
     S._symless = Math.max(0, (S._symless | 0) - fixed.length);
     for (const raw of fixed) {
+      // #1890: the drain rides the SAME exactly-once gate as the live exec
+      // path — a balances delta that already named/covered this trade must
+      // not be re-added on top of the venue-true absolute balance.
+      const rid = String(raw.exec_id || raw.trade_id || '');
+      const rts = raw.timestamp ? Date.parse(raw.timestamp) : 0;
+      if (!raw._totApplied && S.totals &&
+          !krFillIngestGate(S.applied, S.balTs, raw.symbol, rid,
+                            Number.isFinite(rts) ? rts : 0)) {
+        raw._totApplied = true;
+        if (rid) S.applied = krClosedAdd(S.applied || { m: {}, q: [] }, rid);
+      }
       if (!raw._totApplied && S.totals) {
         const tn = Date.now();
         if (!S.fillDirs) S.fillDirs = {};
         const touched = krFillTotalsApply(S.totals, raw, S.fillDirs, tn);
         if (touched.length) {
           raw._totApplied = true;
+          if (rid) S.applied = krClosedAdd(S.applied || { m: {}, q: [] }, rid);   // #1890 shared ingest ledger
           if (!S.fillTouch) S.fillTouch = {};
           for (const a of touched) S.fillTouch[a] = tn;
           krFillTouchPrune(S.fillTouch, tn);
@@ -5753,15 +5817,28 @@ function createTradeNative(opts) {
             if (fr && !lagSnapFrame && S.totals) {
               const tnow0 = Date.now();
               if (!S.fillDirs) S.fillDirs = {};   // #1884 auditor regression clamp
-              const touched = krFillTotalsApply(S.totals, e, S.fillDirs, tnow0);
-              if (touched.length) {
-                e._totApplied = true;   // #1887: the learn-drain must not re-apply
-                if (!S.fillTouch) S.fillTouch = {};
-                const tnow = tnow0;
-                for (const a of touched) S.fillTouch[a] = tnow;
-                krFillTouchPrune(S.fillTouch, tnow);
-                krFillDirsPrune(S.fillDirs, tnow);
-                krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
+              // #1890 exactly-once gate: skip when this trade id already
+              // ingested via ANY path (duplicate delivery, learn-drain, or a
+              // balances delta whose ledger ref named it) or when an APPLIED
+              // balances row for the base asset covers the fill's venue ts
+              // (the absolute balance includes it — adding the delta again
+              // doubled the posrow qty and got sell-all rejected).
+              if (!krFillIngestGate(S.applied, S.balTs, e.symbol, fr.id, fr.ts)) {
+                e._totApplied = true;   // the learn-drain must not re-apply either
+                if (!S.applied) S.applied = { m: {}, q: [] };
+                S.applied = krClosedAdd(S.applied, fr.id);
+              } else {
+                const touched = krFillTotalsApply(S.totals, e, S.fillDirs, tnow0);
+                if (touched.length) {
+                  e._totApplied = true;   // #1887: the learn-drain must not re-apply
+                  S.applied = krClosedAdd(S.applied || { m: {}, q: [] }, fr.id);   // #1890 shared ingest ledger
+                  if (!S.fillTouch) S.fillTouch = {};
+                  const tnow = tnow0;
+                  for (const a of touched) S.fillTouch[a] = tnow;
+                  krFillTouchPrune(S.fillTouch, tnow);
+                  krFillDirsPrune(S.fillDirs, tnow);
+                  krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
+                }
               }
             }
             if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id, krPushFillRow(e, S.orders[String(e.order_id || '')])); }   // #1867 push-driven chime (+#1870 per-fill id, +#1878 posrow-seed row) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
@@ -5875,12 +5952,38 @@ function createTradeNative(opts) {
             if (!r || typeof r !== 'object') continue;
             const a = String(r.asset || '').toUpperCase();
             if (!a || r.balance == null) continue;
+            // #1890 exactly-once fill ingest: a delta whose ledger refs name
+            // a trade the local fill math has NOT applied is NEW venue truth
+            // (the balances delta beat the executions echo — the old skip-
+            // then-add path double-counted the lot-opening fill). Note the
+            // refs into the shared applied-set (the exec row skips its
+            // apply) and let the row THROUGH the fill-touch grace; refs
+            // already applied = the ordinary lagging echo → grace unchanged.
+            let freshRef = false, refTs = 0;
+            if (!balSnap) {
+              const br = krBalRowRefs(r);
+              refTs = br.ts;
+              if (br.refs.length && !S.applied) S.applied = { m: {}, q: [] };
+              for (const ref of br.refs) {
+                if (!krClosedHas(S.applied, ref)) {
+                  S.applied = krClosedAdd(S.applied, ref);
+                  freshRef = true;
+                }
+              }
+            }
             // #1864: delta echoes lag fills by seconds — an asset the local
             // fill math touched within the grace keeps the LOCAL value
             // (snapshot frames reset the map, so they always apply).
-            if (!balSnap && S.fillTouch && S.fillTouch[a] != null &&
+            if (!balSnap && !freshRef && S.fillTouch && S.fillTouch[a] != null &&
                 Date.now() - S.fillTouch[a] <= KR_FILL_TOUCH_GRACE_MS) continue;
             S.totals[a] = r.balance;
+            // #1890: venue-ts cover stamp — only rows that ACTUALLY applied
+            // may claim the balance covers fills up to refTs (a grace-
+            // skipped row proved nothing about the stored value).
+            if (refTs) {
+              if (!S.balTs) S.balTs = {};
+              if (!(S.balTs[a] >= refTs)) S.balTs[a] = refTs;
+            }
           }
           krLseq(S); krPushSc(S, 'bal');   // #1860 ledger mutation seq / #1867 push
         }
@@ -8359,6 +8462,12 @@ function createTradeNative(opts) {
         if (aud.clamp && aud.clamp.length) {
           tdiag('acct', 'kr_audit_clamp', { k: slot, n: aud.clamp.length,
             a: aud.clamp.slice(0, 6).join(',').slice(0, 80) });
+          // #1890: a clamp is a TIE (local vs venue) — schedule ONE paced
+          // follow-up confirm so venue truth wins within seconds when the
+          // local value was wrong (krTotalsAudit yields on the second
+          // disagreement); previously the next confirm waited on the next
+          // trade ACK, which never came while sell-all kept getting rejected.
+          krConfirmSchedule(slot, L);
         }
         krLseq(sess.spot); krPushSc(sess.spot, 'bal');   // #1860/#1867 auditor correction
       }
@@ -8996,6 +9105,13 @@ function createTradeNative(opts) {
         if (r && r.ok) {
           krTradeAckKick(intent.credSlot || 'kraken', creds, route,
                          intent.market === 'spot' ? 'spot' : 'futures');
+        } else if (r && intent.market === 'spot' &&
+                   /insufficient funds/i.test(String(r.message || ''))) {
+          // #1890: the venue rejecting a spot order for funds proves the
+          // LOCAL balance view is wrong (an inflated qty prefilled sell-all)
+          // — force ONE paced venue-truth confirm now instead of waiting on
+          // the next successful ACK (which never comes while sells bounce).
+          krTradeAckKick(intent.credSlot || 'kraken', creds, route, 'spot');
         }
         return r;
       }
@@ -9421,6 +9537,9 @@ module.exports = {
   KR_CLOSED_MAX,
   krClosedAdd,
   krClosedHas,
+  // pure — #1890 exactly-once fill ingest
+  krFillIngestGate,
+  krBalRowRefs,
   KR_OIDSYM_MAX,
   krOidSymNote,
   krOidSymGet,
