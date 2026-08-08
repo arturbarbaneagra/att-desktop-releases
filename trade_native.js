@@ -2768,6 +2768,71 @@ function krFutFillOrderApply(orders, f, now) {
   row._updTs = now;
   return 'upd';
 }
+// --- #1884 fill-before-order-registration race (pure) -----------------------
+// A market order's consuming fill can land in the SAME WS beat the order is
+// born — the fill-close runs before the ledger row exists, finds nothing to
+// close, and the (later-processed) registration leaves the order OPEN
+// forever (observed: NO kr_ord_gone; a routine /state render re-added the
+// badge 29s later, right past the panel tombstone TTL — ~35s ghost).
+// Two-part fix: (1) deterministic intra-frame apply order — registrations
+// before trade rows (krExecsOrderFirst); (2) a short-lived CONSUMED-set of
+// order ids own trade executions touched while their row was absent — a
+// registration (WS delta OR snapshot) arriving for a consumed id closes
+// immediately instead of opening (krConsumedTake), TTL-independent.
+// Pending exec rows are retained (bounded) so the late registration can
+// still ship the symbol-backfilled fill row to the panel's lot accumulator.
+const KR_CONSUMED_TTL_MS = 30000;
+const KR_CONSUMED_EXEC_MAX = 8;
+// Deterministic intra-frame ordering: order registrations first, trade
+// executions second — a fill riding the same frame always finds its row.
+function krExecsOrderFirst(list) {
+  const l = Array.isArray(list) ? list : [];
+  const ords = [], fills = [];
+  for (const e of l) {
+    (String((e || {}).exec_type || '') === 'trade' ? fills : ords).push(e);
+  }
+  return (ords.length && fills.length) ? ords.concat(fills) : l;
+}
+function krConsumedPrune(map, now) {
+  for (const k of Object.keys(map || {})) {
+    if (!(now - map[k].ts <= KR_CONSUMED_TTL_MS)) delete map[k];
+  }
+}
+// Note an own trade execution whose order row was ABSENT at apply time.
+// note: { lastQty?, cumQty?, orderQty?, remaining?, gone?, exec? }
+function krConsumedNote(map, oid, note, now) {
+  if (!map || !oid || !note) return;
+  krConsumedPrune(map, now);
+  const r = map[oid] ||
+    (map[oid] = { ts: now, cq: 0, rq: NaN, oq: 0, gone: false, execs: [] });
+  r.ts = now;
+  const lq = Number(note.lastQty);
+  if (lq > 0) r.cq += lq;
+  const cq = Number(note.cumQty);
+  if (cq > 0 && cq > r.cq) r.cq = cq;
+  const oq = Number(note.orderQty);
+  if (oq > 0) r.oq = oq;
+  const rq = Number(note.remaining);
+  if (Number.isFinite(rq)) r.rq = rq;
+  if (note.gone) r.gone = true;
+  if (note.exec && r.execs.length < KR_CONSUMED_EXEC_MAX) r.execs.push(note.exec);
+}
+// A registration arrived for a possibly-consumed id. `row` is the incoming
+// registration row (order_qty source). Returns null (nothing pending) or
+// { eff: 'gone'|'upd', cq, rq, execs } — 'gone' = the fills already consumed
+// the full qty (or reported a gone status / remaining 0): close NOW, never
+// open. 'upd' = partial: caller merges the accumulated cum_qty onto the row.
+function krConsumedTake(map, oid, row, now) {
+  if (!map || !oid || !map[oid]) return null;
+  const r = map[oid];
+  delete map[oid];
+  if (!(now - r.ts <= KR_CONSUMED_TTL_MS)) return null;
+  const roq = Number(row && row.order_qty);
+  const oq = (roq > 0) ? roq : r.oq;
+  const gone = r.gone || (Number.isFinite(r.rq) && r.rq <= 0) ||
+               (oq > 0 && r.cq >= oq * (1 - 1e-9));
+  return { eff: gone ? 'gone' : 'upd', cq: r.cq, rq: r.rq, execs: r.execs };
+}
 // --- #1870 stale-snapshot auditor gate (pure) -------------------------------
 // A REST auditor snapshot may only mutate the ledger when (a) the response
 // actually carries its data section — a budget-deferred / failed / body-error
@@ -2969,7 +3034,12 @@ function krTradePts(L, now) {
 // subtract from their own asset rows. Values stay strings (WS balances
 // shape). Returns the list of touched asset names ([] = row not applicable)
 // so the caller can stamp per-asset touch times for the auditor grace.
-function krFillTotalsApply(totals, e) {
+// #1884: the optional `dirs` map additionally records each touched asset's
+// last fill DIRECTION ({ ts, d: ±1 }) — the auditor's regression clamp keys
+// on it (a stale REST page must never move a recently-filled asset BACK
+// against the fill's direction; the short 2.5s touch grace alone missed
+// pages that landed a few seconds later: observed qty 1194→796→1194).
+function krFillTotalsApply(totals, e, dirs, now) {
   if (!totals || !e || typeof e !== 'object') return [];
   if (String(e.exec_type || '') !== 'trade') return [];
   const sym = String(e.symbol || '');
@@ -2986,6 +3056,7 @@ function krFillTotalsApply(totals, e) {
     const cur = Number(totals[asset]);
     totals[asset] = String((Number.isFinite(cur) ? cur : 0) + d);
     touched[asset] = 1;
+    if (dirs && d !== 0) dirs[asset] = { ts: Number(now) || 0, d: d > 0 ? 1 : -1 };
   };
   add(base, buy ? qty : -qty);
   add(quote, buy ? -cost : cost);
@@ -3002,10 +3073,18 @@ function krFillTotalsApply(totals, e) {
 // "corrects on true divergence", never a silent stale clobber.
 const KR_FILL_TOUCH_GRACE_MS = 2500;
 const KR_AUDIT_REL_EPS = 1e-9;
-function krTotalsAudit(local, audit, touch, now, graceMs, eps) {
+// #1884 regression clamp window: a REST page fetched under budget deferral
+// can land several seconds after the fill that moved an asset — within this
+// window an audit value that moves the asset AGAINST the last fill's
+// direction (buy-increased asset shrinking / sell-reduced asset growing) is
+// provably stale and keeps the LOCAL value (clamp list → kr_audit_clamp
+// diag). Corrections IN the fill's direction still apply.
+const KR_FILL_CLAMP_GRACE_MS = 15000;
+function krTotalsAudit(local, audit, touch, now, graceMs, eps, dirs, clampMs) {
   const g = (graceMs == null) ? KR_FILL_TOUCH_GRACE_MS : graceMs;
   const e = (eps == null) ? KR_AUDIT_REL_EPS : eps;
-  const out = {}, div = [];
+  const cg = (clampMs == null) ? KR_FILL_CLAMP_GRACE_MS : clampMs;
+  const out = {}, div = [], clamp = [];
   const keys = {};
   for (const k of Object.keys(audit || {})) keys[k] = 1;
   for (const k of Object.keys(local || {})) keys[k] = 1;
@@ -3014,6 +3093,15 @@ function krTotalsAudit(local, audit, touch, now, graceMs, eps) {
     const lv = local && local[a] != null ? Number(local[a]) : null;
     const av = audit && audit[a] != null ? Number(audit[a]) : null;
     if (fresh && lv != null) { out[a] = String(local[a]); continue; }
+    // #1884: direction-aware regression clamp (see KR_FILL_CLAMP_GRACE_MS)
+    const dr = dirs && dirs[a];
+    if (dr && lv != null && (now - dr.ts) <= cg &&
+        ((dr.d > 0 && (av == null || av < lv - e * Math.max(1, Math.abs(lv)))) ||
+         (dr.d < 0 && av != null && av > lv + e * Math.max(1, Math.abs(lv))))) {
+      out[a] = String(local[a]);
+      clamp.push(a);
+      continue;
+    }
     if (av == null) {         // local-only asset past grace: auditor wins (drop)
       if (lv != null && Math.abs(lv) > e) div.push(a);
       continue;
@@ -3021,7 +3109,7 @@ function krTotalsAudit(local, audit, touch, now, graceMs, eps) {
     out[a] = String(audit[a]);
     if (lv == null || Math.abs(lv - av) > e * Math.max(1, Math.abs(av))) div.push(a);
   }
-  return { totals: out, div: div };
+  return { totals: out, div: div, clamp: clamp };
 }
 // Bounded prune for the per-asset fill-touch map (entries expire with the
 // grace window; the map only ever holds a scalp session's active assets).
@@ -3029,6 +3117,13 @@ function krFillTouchPrune(touch, now, graceMs) {
   const g = (graceMs == null) ? KR_FILL_TOUCH_GRACE_MS : graceMs;
   for (const a of Object.keys(touch || {})) {
     if (!(now - touch[a] <= g)) delete touch[a];
+  }
+}
+// #1884: same bounded-map rule for the fill-direction map (clamp window).
+function krFillDirsPrune(dirs, now, clampMs) {
+  const g = (clampMs == null) ? KR_FILL_CLAMP_GRACE_MS : clampMs;
+  for (const a of Object.keys(dirs || {})) {
+    if (!(now - (dirs[a] && dirs[a].ts) <= g)) delete dirs[a];
   }
 }
 
@@ -5495,7 +5590,10 @@ function createTradeNative(opts) {
             // would advance the panel cursor past the seed window).
             if (S.fills) S.fills.seeded = true;
           }
-          for (const e of (msg.data || [])) {
+          // #1884: order registrations apply BEFORE trade rows within one
+          // frame — a market order whose consuming fill rides the SAME frame
+          // always finds its ledger row (fill-close no longer no-ops).
+          for (const e of krExecsOrderFirst(msg.data)) {
             if (!e || typeof e !== 'object') continue;
             // #1814: trade executions feed the native fills cache (dedupe
             // by exec_id — snapshot + live overlap is a no-op). Snapshot
@@ -5510,12 +5608,15 @@ function createTradeNative(opts) {
             // Touched assets stamp a grace window so a venue snapshot taken
             // BEFORE this fill can't clobber the local value right back.
             if (fr && !lagSnapFrame && S.totals) {
-              const touched = krFillTotalsApply(S.totals, e);
+              const tnow0 = Date.now();
+              if (!S.fillDirs) S.fillDirs = {};   // #1884 auditor regression clamp
+              const touched = krFillTotalsApply(S.totals, e, S.fillDirs, tnow0);
               if (touched.length) {
                 if (!S.fillTouch) S.fillTouch = {};
-                const tnow = Date.now();
+                const tnow = tnow0;
                 for (const a of touched) S.fillTouch[a] = tnow;
                 krFillTouchPrune(S.fillTouch, tnow);
+                krFillDirsPrune(S.fillDirs, tnow);
                 krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
@@ -5530,8 +5631,22 @@ function createTradeNative(opts) {
               // only ever confirm/consume an EXISTING row).
               // #1876: a trade echo on a just-removed order must not
               // recreate its row (late partial-fill updates resurrect)
-              const eff = krTombBlock(S, String(e.order_id || ''), 'sfill')
+              const foid = String(e.order_id || '');
+              const hadRow = !!(foid && S.orders[foid]);
+              const eff = krTombBlock(S, foid, 'sfill')
                 ? null : krFillOrderApply(S.orders, e, Date.now());
+              // #1884: a LIVE fill whose order row was ABSENT (fill beat the
+              // registration) records into the consumed-set — a later
+              // registration (WS or snapshot) for the id closes immediately
+              // instead of opening it (no /state ghost, TTL-independent).
+              if (!lagSnapFrame && foid && !hadRow && !S.orders[foid]) {
+                if (!S.consumed) S.consumed = {};
+                const st84 = String(e.order_status || '').toLowerCase();
+                krConsumedNote(S.consumed, foid, {
+                  lastQty: e.last_qty, cumQty: e.cum_qty, orderQty: e.order_qty,
+                  gone: !!KR_WS_SPOT_GONE[st84] || eff === 'gone', exec: e,
+                }, Date.now());
+              }
               // #1874: fill-consumed rows push the gone oid — every panel
               // window tombstones the badge in the same push apply pass
               if (eff) { krLseq(S); krPushSc(S, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(e.order_id || '') : null); }   // #1860/#1867/#1874
@@ -5550,8 +5665,32 @@ function createTradeNative(opts) {
               // apply 10-20s late under budget); live deltas keep 12s.
               if (krTombBlock(S, oid, lagSnapFrame ? 'ssnap' : 'sord',
                               lagSnapFrame ? KR_TOMB_SNAP_TTL_MS : null)) continue;
+              // #1884: registration for an id own fills already CONSUMED
+              // (fill beat the registration — same/next push) closes NOW
+              // instead of opening; the pending exec rows ship their
+              // symbol-backfilled fill rows so the panel's lot accumulator
+              // still seeds this beat (fid re-push dedupes as sound-seen).
+              const cr84 = S.consumed
+                ? krConsumedTake(S.consumed, oid, e, Date.now()) : null;
+              if (cr84) {
+                for (const pe of cr84.execs) {
+                  const pfr = krWsSpotFillRow(pe);
+                  if (pfr) { krLseq(S); krPushSc(S, 'fill', pfr.id, krPushFillRow(pe, e)); }
+                }
+                if (cr84.eff === 'gone') {
+                  delete S.orders[oid];
+                  krLseq(S); krPushSc(S, 'ordgone', oid);   // #1884 close-on-late-registration
+                  continue;
+                }
+              }
               // delta frames carry partial fields — merge onto the row
               S.orders[oid] = Object.assign({}, S.orders[oid] || {}, e);
+              // #1884: partially-consumed pending fills carry their running
+              // cum_qty onto the fresh row (the next fill can complete it)
+              if (cr84 && cr84.cq > 0 &&
+                  !(Number(S.orders[oid].cum_qty) >= cr84.cq)) {
+                S.orders[oid].cum_qty = cr84.cq;
+              }
               // #1874: birth stamp (WS add seq/time) — the audit-omission
               // grace keys on it; live frames only (snapshot rows carry
               // historic orders whose birth predates this session)
@@ -5748,6 +5887,14 @@ function createTradeNative(opts) {
             const oid = String((o || {}).order_id || '');
             if (oid) {
               if (krTombBlock(F, oid, 'fsnap', KR_TOMB_SNAP_TTL_MS)) continue;   // #1876 just-removed — no resurrection (#1878 snap TTL)
+              // #1884: snapshot listing an id own fills already consumed —
+              // never (re)open it; push the gone id so badges die everywhere
+              if (F.consumed && F.consumed[oid] &&
+                  (krConsumedTake(F.consumed, oid, o, Date.now()) || {}).eff === 'gone') {
+                if (F.orders[oid]) { delete F.orders[oid]; }
+                krLseq(F); krPushSc(F, 'ordgone', oid);
+                continue;
+              }
               // #1874: keep the birth stamp across snapshot re-delivery
               if (F.orders[oid] && F.orders[oid]._bornTs != null) {
                 o._bornTs = F.orders[oid]._bornTs;
@@ -5767,6 +5914,12 @@ function createTradeNative(opts) {
                 krLseq(F); krPushSc(F, 'ordgone', oid);   // #1874 WS-gone badge fast path
               } else if (krTombBlock(F, oid, 'ford')) {
                 // #1876: lagging delta for a just-removed order — no resurrection
+              } else if (F.consumed && F.consumed[oid] &&
+                         (krConsumedTake(F.consumed, oid, o, Date.now()) || {}).eff === 'gone') {
+                // #1884: own fills already consumed this order (fill beat
+                // the registration) — close NOW instead of opening a ghost
+                delete F.orders[oid];
+                krLseq(F); krPushSc(F, 'ordgone', oid);
               } else {
                 // #1874: birth stamp on first WS add (kept across updates)
                 if (F.orders[oid] && F.orders[oid]._bornTs != null) {
@@ -5819,8 +5972,21 @@ function createTradeNative(opts) {
             // that used to drive it lags seconds); remaining>0 updates qty.
             if (feed === 'fills' && fr) {
               // #1876: no order-row writes for a just-removed order
-              const eff = krTombBlock(F, String((f || {}).order_id || ''), 'ffill')
+              const foid = String((f || {}).order_id || '');
+              const hadRow = !!(foid && F.orders[foid]);
+              const eff = krTombBlock(F, foid, 'ffill')
                 ? null : krFutFillOrderApply(F.orders, f, Date.now());
+              // #1884: fill beat the open_orders registration — remember the
+              // consumption (remaining_order_qty is authoritative) so the
+              // late registration closes instead of opening a ghost row.
+              if (foid && !hadRow && !F.orders[foid]) {
+                if (!F.consumed) F.consumed = {};
+                const rq84 = Number((f || {}).remaining_order_qty);
+                krConsumedNote(F.consumed, foid, {
+                  lastQty: (f || {}).qty, remaining: rq84,
+                  gone: eff === 'gone' || (Number.isFinite(rq84) && rq84 <= 0),
+                }, Date.now());
+              }
               // #1874: fill-consumed rows push the gone oid (badge fast path)
               if (eff) { krLseq(F); krPushSc(F, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(f.order_id || '') : null); }   // #1860/#1867/#1874
               // per-fill push id (#1870): each live fill rides the event so
@@ -8019,12 +8185,20 @@ function createTradeNative(opts) {
         // override (kr_audit_div) so a broken local ledger is visible.
         const aud = krTotalsAudit(sess.spot.totals || {},
                                   krBalanceExTotals(bal.data),
-                                  sess.spot.fillTouch || null, Date.now());
+                                  sess.spot.fillTouch || null, Date.now(),
+                                  null, null, sess.spot.fillDirs || null);
         sess.spot.totals = aud.totals;
         if (aud.div.length) {
           divA = aud.div.slice(0, 6);
           tdiag('acct', 'kr_audit_div', { k: slot, n: aud.div.length,
                                           a: divA.join(',').slice(0, 80) });
+        }
+        // #1884: audit value moved a recently-filled asset AGAINST the
+        // fill's direction → provably stale page, LOCAL value kept (the
+        // regression 1194→796→1194 becomes a diag line, never a display dip)
+        if (aud.clamp && aud.clamp.length) {
+          tdiag('acct', 'kr_audit_clamp', { k: slot, n: aud.clamp.length,
+            a: aud.clamp.slice(0, 6).join(',').slice(0, 80) });
         }
         krLseq(sess.spot); krPushSc(sess.spot, 'bal');   // #1860/#1867 auditor correction
       }
@@ -9078,6 +9252,16 @@ module.exports = {
   krFillOrderApply,
   krFutFillOrderApply,
   krOrderFilled,
+  krExecsOrderFirst,
+  krConsumedNote,
+  krConsumedTake,
+  krConsumedPrune,
+  KR_CONSUMED_TTL_MS,
+  krFillDirsPrune,
+  KR_FILL_CLAMP_GRACE_MS,
+  krFillTotalsApply,
+  krTotalsAudit,
+  krFillTouchPrune,
   krAuditGate,
   // pure — #1876 gone-order tombstones (no badge resurrection)
   KR_TOMB_TTL_MS,
