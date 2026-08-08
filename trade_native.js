@@ -2106,18 +2106,34 @@ function krWsSpotFillRow(e) {
 // fields the panel's fills-lane parser (krFillsStateRows) reads, so a pushed
 // row and the later poll/read copy of the SAME fill produce identical merged
 // rows (eid 's:<exec_id>') and dedupe to a no-op. Null for non-trade rows.
-function krPushFillRow(e) {
+function krPushFillRow(e, ord) {
   if (!e || typeof e !== 'object') return null;
   if (String(e.exec_type || '') !== 'trade') return null;
   if (!String(e.exec_id || e.trade_id || '')) return null;
-  if (!(Number(e.last_qty) > 0) || !e.symbol) return null;
-  const r = { exec_type: 'trade', symbol: String(e.symbol),
+  // #1881: burst exec rows may omit `symbol` — backfill from the ledger's
+  // order row (looked up BEFORE the fill consumes it) so the pushed seed
+  // row never silently drops while its fid still rides the event (the old
+  // asymmetry: sound counted the fill, the lot accumulator never saw it).
+  const sym = e.symbol != null && e.symbol !== '' ? e.symbol
+            : (ord && ord.symbol != null ? ord.symbol : '');
+  if (!(Number(e.last_qty) > 0) || !sym) return null;
+  const r = { exec_type: 'trade', symbol: String(sym),
               side: String(e.side || ''), last_qty: e.last_qty,
               last_price: e.last_price == null ? '0' : e.last_price };
   if (e.exec_id != null) r.exec_id = String(e.exec_id);
   if (e.trade_id != null) r.trade_id = String(e.trade_id);
   if (e.order_id != null) r.order_id = String(e.order_id);
   if (e.timestamp != null) r.timestamp = e.timestamp;
+  // #1881 seed-math parity: fees ride the pushed row in the SAME shape the
+  // REST TradesHistory seed rows carry (krRestSpotWsRow), so the panel's
+  // fee-aware cost-basis replay computes the SAME avg from either copy.
+  if (Array.isArray(e.fees) && e.fees.length) {
+    r.fees = e.fees.slice(0, 4).map(function (f) {
+      return { asset: String((f || {}).asset || ''),
+               qty: String((f || {}).qty == null ? '0' : (f || {}).qty) };
+    });
+  }
+  if (e.cost != null) r.cost = String(e.cost);
   return r;
 }
 // Futures ws/v1 `fills` feed row → cache row. fill_id keys the dedupe — the
@@ -2547,6 +2563,11 @@ function krOrdersReconcile(orders, liveIds, now, fetchTs) {
       if (o._synTs != null) { delete o._synTs; o._updTs = +now; }
       continue;
     }
+    // #1881: omission grace NEVER protects a fully-filled row — own fills
+    // already consumed it, the snapshot omitting it is right. Immediate
+    // removal (no birth grace, no double omission) makes ghost re-adds
+    // impossible regardless of tombstone TTL.
+    if (krOrderFilled(o)) { delete orders[oid]; gone.push(oid); continue; }
     const ts = (o._synTs != null) ? o._synTs
              : (o._updTs != null) ? o._updTs : null;
     if (ts != null && now - ts <= KR_CONFIRM_ORDER_GRACE_MS) continue;
@@ -2701,9 +2722,32 @@ function krFillOrderApply(orders, e, now) {
   }
   if (st === '' && !row) return null;   // snapshot/loose trade row — never a phantom badge
   orders[oid] = Object.assign({}, row || {}, e);
+  // #1881: persist the ACCUMULATED cum_qty — burst execs often omit cum_qty,
+  // and without storing the running sum every fill recomputed from the same
+  // stale row value, so consumption never triggered and the ledger kept a
+  // fully-consumed order open (kr_audit_omit then protected the ghost and
+  // later order pushes re-added its badge 28-30s past the tombstone TTL).
+  if (cq > 0) orders[oid].cum_qty = cq;
+  if (!(Number(orders[oid].order_qty) > 0) && oq > 0) orders[oid].order_qty = oq;
   delete orders[oid]._synTs;   // venue echo confirms the optimistic row
   orders[oid]._updTs = now;
   return 'upd';
+}
+// #1881: a ledger row whose cumulative fills consumed its full qty is DEAD —
+// own WS executions are authoritative, so no snapshot-omission grace, birth
+// grace or freshness window may protect it (that protection is what kept
+// burst-consumed orders alive: correct snapshots omitting them were
+// distrusted, and later 'order' pushes re-added their badges past the
+// tombstone TTL). Spot rows carry cum_qty/order_qty; futures ledger rows
+// carry qty = REMAINING + filled = cumulative.
+function krOrderFilled(o) {
+  if (!o || typeof o !== 'object') return false;
+  const oq = Number(o.order_qty);
+  const cq = Number(o.cum_qty);
+  if (oq > 0 && cq > 0 && cq >= oq * (1 - 1e-9)) return true;
+  const rq = Number(o.qty);
+  const fl = Number(o.filled);
+  return fl > 0 && Number.isFinite(rq) && rq <= 0;
 }
 // Futures twin: ws/v1 `fills` rows carry remaining_order_qty — remaining→0
 // deletes the row NOW (the open_orders echo that used to drive the delete
@@ -5475,7 +5519,7 @@ function createTradeNative(opts) {
                 krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
-            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id, krPushFillRow(e)); }   // #1867 push-driven chime (+#1870 per-fill id, +#1878 posrow-seed row) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
+            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id, krPushFillRow(e, S.orders[String(e.order_id || '')])); }   // #1867 push-driven chime (+#1870 per-fill id, +#1878 posrow-seed row) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
             if (fr) {
               // #1870 fill-consumption badge removal: a trade execution that
               // fully consumes its order deletes the ledger row in the SAME
@@ -9033,6 +9077,7 @@ module.exports = {
   // pure — #1870 fill-consumption badge removal + stale-snapshot auditor gate
   krFillOrderApply,
   krFutFillOrderApply,
+  krOrderFilled,
   krAuditGate,
   // pure — #1876 gone-order tombstones (no badge resurrection)
   KR_TOMB_TTL_MS,
