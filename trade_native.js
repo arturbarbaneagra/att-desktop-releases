@@ -2707,6 +2707,7 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   const rlUntil = {};    // venue → cool-down end ts
   const inflight = {};   // venue|credSlot → in-flight promise
   const memo = {};       // venue|credSlot → { ts, r }
+  let readSeq = 0;       // #1853: monotonic COMPLETION seq stamped on results
   const guarded = async function (intent) {
     const venue = String((intent && intent.venue) || '');
     const key = venue + '|' + String((intent && intent.credSlot) || venue);
@@ -2722,6 +2723,13 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
     if (inflight[key]) { emit('coalesced', { venue: venue }); return await inflight[key]; }
     const p = (async () => {
       const r = await runRaw(intent);
+      // #1853 snapshot ordering: stamp COMPLETION order so the panel can
+      // discard a slow stale read that lands after a fresher one already
+      // applied (live diag: five overlapped kraken reads completed together,
+      // ms 3302…53 — the 5.4s-old snapshot overwrote the 53ms one and
+      // blanked the posrow). Memo/coalesced callers share the stamp — same
+      // snapshot, same seq.
+      if (r && typeof r === 'object' && r.readSeq == null) r.readSeq = ++readSeq;
       if (acctRlHit(r)) {
         const wait = acctRlWaitMs(venue, Number.isFinite(r.retryInMs) ? r.retryInMs : null);
         rlUntil[venue] = now() + wait;
