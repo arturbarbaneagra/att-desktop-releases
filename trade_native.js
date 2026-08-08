@@ -7399,6 +7399,133 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
+  // the venue's own-trades REST over a caller-supplied [frm, to] window and
+  // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
+  // WS-shaped rows via krRestSpotWsRow/krRestFutWsRow — kr_ingest_rows'
+  // input; Phemex: /api-data trade rows keyed by symbol — fut/spot_fill_norm
+  // input). The ENGINE normalizes (single parser truth) so dedup keys are
+  // byte-identical to live/seed copies — the #1820 dupe-class rule. Paced
+  // (page gaps) and bounded (page caps, 92d window); read-only signed GETs
+  // ride the same per-venue request guards as the seed (LOW priority — no
+  // trading headroom touched). One in flight at a time.
+  const HB_MAX_SPAN_MS = 92 * 86400 * 1000;
+  const HB_PAGE_GAP_MS = 450;
+  const HB_KR_MAX_PAGES = 40;          // ≥ 2000 spot rows / 4000 fut rows
+  const HB_PH_MAX_CALLS = 60;          // 26h chunks × symbols bound
+  let _hbBusy = false;
+  function hbWindow(intent) {
+    const now = Date.now();
+    let to = Math.floor(Number(intent.to) || 0);
+    if (!(to > 0) || to > now + 60000) to = now;
+    let frm = Math.floor(Number(intent.frm) || 0);
+    if (!(frm > 0) || frm >= to) return null;
+    if (to - frm > HB_MAX_SPAN_MS) return null;
+    return { frm: frm, to: to };
+  }
+  async function execHistoryBackfill(intent) {
+    if (_hbBusy) return { ok: false, message: 'history backfill already in flight' };
+    _hbBusy = true;
+    try {
+      if (intent.venue === 'kraken') return await hbKraken(intent);
+      if (intent.venue === 'phemex') return await hbPhemex(intent);
+      return { ok: false, message: 'history_backfill not supported for this venue — re-import runs with a server-stored key' };
+    } finally { _hbBusy = false; }
+  }
+  async function hbKraken(intent) {
+    const creds = credsGet(intent.credSlot || 'kraken');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const w = hbWindow(intent);
+    if (!w) return { ok: false, message: 'Bad window (max 92 days)' };
+    const route = routeNorm(intent.route);
+    const market = String(intent.market || 'both');
+    const out = { ok: true, spot: [], futures: [] };
+    if (market !== 'futures' && krPairFor(creds, 'spot')) {
+      let codeMap = {};
+      try { codeMap = ((await krProducts(route)) || {}).spotCode || {}; } catch (e) {}
+      let ofs = 0;
+      for (let page = 0; page < HB_KR_MAX_PAGES && ofs !== null; page++) {
+        if (page) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+        const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory',
+          [['start', String(w.frm / 1000)], ['end', String(w.to / 1000)],
+           // #1829: per-execution rows only — never the consolidated synthetic.
+           ['ofs', String(ofs)], ['consolidate_taker', 'false']], route);
+        if (!th.ok) return th;
+        const res = ((th.data || {}).result) || {};
+        const trades = res.trades || {};
+        const tids = Object.keys(trades);
+        for (const tid of tids) {
+          const e = krRestSpotWsRow(tid, trades[tid], codeMap);
+          if (e) out.spot.push(e);
+        }
+        ofs = krSeedSpotNext(res, ofs, tids.length);
+      }
+    }
+    if (market !== 'spot' && krPairFor(creds, 'futures')) {
+      let cursor = new Date(w.to).toISOString();
+      for (let page = 0; page < HB_KR_MAX_PAGES; page++) {
+        if (page) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+        const fh = await krRequest(creds, 'GET', 'futures', '/derivatives/api/v3/fills',
+          [['lastFillTime', cursor]], route);
+        if (!fh.ok) return fh;
+        const fills = ((fh.data || {}).fills) || [];
+        for (const f of fills) {
+          const e = krRestFutWsRow(f);
+          if (e && e.time >= w.frm && e.time <= w.to) out.futures.push(e);
+        }
+        cursor = krSeedFutNext(fills, w.frm);
+        if (!cursor) break;
+      }
+    }
+    return out;
+  }
+  async function hbPhemex(intent) {
+    const creds = credsGet(intent.credSlot || 'phemex');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const w = hbWindow(intent);
+    if (!w) return { ok: false, message: 'Bad window (max 92 days)' };
+    const route = routeNorm(intent.route);
+    const symsOf = (v) => (Array.isArray(v) ? v : []).map(String)
+      .filter((s) => s && s.length <= 32 && /^[A-Za-z0-9]+$/.test(s)).slice(0, 12);
+    const futSyms = symsOf(intent.futSymbols);
+    const spotSyms = symsOf(intent.spotSymbols);
+    if (!futSyms.length && !spotSyms.length) {
+      return { ok: false, message: 'Phemex history needs explicit symbols (venue API is per-symbol)' };
+    }
+    // /api-data trades: per-symbol, start/end-bounded, limit 200 — walk the
+    // window in 26h chunks (same bound the live fills read uses).
+    const CHUNK = 26 * 3600 * 1000;
+    let calls = 0;
+    const futures = {}, spot = {};
+    const walk = async (path, sym, dst) => {
+      dst[sym] = dst[sym] || [];
+      for (let t0 = w.frm; t0 < w.to; t0 += CHUNK) {
+        if (++calls > HB_PH_MAX_CALLS) {
+          return { ok: false, message: 'Window too large for the symbol count — narrow the range' };
+        }
+        if (calls > 1) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+        const t1 = Math.min(t0 + CHUNK, w.to);
+        const r = await signedRequest(creds, {
+          method: 'GET', path: path,
+          query: 'symbol=' + encodeURIComponent(sym) + '&start=' + t0 + '&end=' + t1 + '&limit=200',
+          body: null }, route);
+        if (!r.ok) return r;
+        const rows = (r.data && r.data.rows) || (Array.isArray(r.data) ? r.data : []);
+        for (const row of rows) dst[sym].push(row);
+      }
+      return { ok: true };
+    };
+    for (const sym of futSyms) {
+      const r = await walk('/api-data/g-futures/trades', sym, futures);
+      if (!r.ok) return r;
+    }
+    for (const sym of spotSyms) {
+      const r = await walk('/api-data/spots/trades', sym, spot);
+      if (!r.ok) return r;
+    }
+    return { ok: true, futures: futures, spot: spot };
+  }
+
   // Phemex PUBLIC catalog/kline fetch (#1713): unsigned bridge intent for the
   // panel's "Catalogs & candles: Native" axis (Phemex REST has no CORS, so
   // the fetch must run here in the main process; honors the user proxy via
@@ -7613,6 +7740,12 @@ function createTradeNative(opts) {
     if (intent && typeof intent === 'object' && intent.op === 'fills_seed') {
       if (intent.venue === 'kraken') return await execKrakenFillsSeed(intent);
       return { ok: false, message: 'fills_seed not supported for this venue' };
+    }
+    // #1844 own-trade history backfill (re-import source) — kraken/phemex
+    // raw rows for the panel to POST to /history/reimport. Old shells fall
+    // through to 'unknown op'; the panel then offers the server-key path.
+    if (intent && typeof intent === 'object' && intent.op === 'history_backfill') {
+      return await execHistoryBackfill(intent);
     }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
