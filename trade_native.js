@@ -2494,6 +2494,36 @@ function krOrdersReconcile(orders, liveIds, now) {
   return gone;
 }
 
+// --- #1860 local-first ledger (pure) ----------------------------------------
+// The WS session maps (S.orders / S.totals) ARE the authoritative local
+// ledger: own actions mutate them synchronously (#1822 synthetics, cancel
+// deletes), the private WS confirms/corrects them, and REST snapshots are a
+// background AUDITOR. Two pure pieces pin the contract:
+//   krLseq   — monotonic mutation seq per scope (spot/fut), bumped by every
+//              ledger write; stamped on acct reads + diag so logs show
+//              display truth directly.
+//   krLedgerFreshIds — when a read falls back to REST (WS down), the venue
+//              snapshot may predate just-ACKed orders; any ledger row that
+//              is FRESH (optimistic within TTL, or WS-echoed within the
+//              reconcile grace) and absent from the snapshot is overlaid on
+//              top so a badge/hold never vanishes to a stale page. Stale
+//              ledger rows are NOT overlaid — the auditor wins for those.
+function krLseq(scope) { if (scope) scope.lseq = (scope.lseq | 0) + 1; }
+function krLedgerFreshIds(orders, presentIds, now) {
+  const present = {};
+  for (const id of (presentIds || [])) present[String(id)] = 1;
+  const out = [];
+  for (const oid of Object.keys(orders || {})) {
+    if (present[oid]) continue;
+    const o = orders[oid] || {};
+    const fresh =
+      (o._synTs != null && now - o._synTs <= KR_SYN_TTL_MS) ||
+      (o._updTs != null && now - o._updTs <= KR_CONFIRM_ORDER_GRACE_MS);
+    if (fresh) out.push(oid);
+  }
+  return out;
+}
+
 // --- #1832 Kraken spot private-REST points ledger (pure) --------------------
 // Live diag proof (v1.5.44, 4.3min REPPO scalp): the #1826/#1828 fast lane
 // (TradesHistory 2 + OpenOrders 1 + BalanceEx 1 per ack burst) exhausted
@@ -5013,6 +5043,7 @@ function createTradeNative(opts) {
               // by an OpenOrders page fetched moments earlier)
               S.orders[oid]._updTs = Date.now();
             }
+            krLseq(S);   // #1860 ledger mutation seq
           }
           // #1835: per-event venue-ts → arrival lag (live frames only) +
           // frame apply time; bounded per-minute diag emit.
@@ -5033,6 +5064,7 @@ function createTradeNative(opts) {
             const a = String(r.asset || '').toUpperCase();
             if (a && r.balance != null) S.totals[a] = r.balance;
           }
+          krLseq(S);   // #1860 ledger mutation seq
         }
         // status / heartbeat / pong frames → lastMsg bump only
       });
@@ -5167,6 +5199,7 @@ function createTradeNative(opts) {
             const oid = String((o || {}).order_id || '');
             if (oid) F.orders[oid] = o;
           }
+          krLseq(F);   // #1860 ledger mutation seq
           snapOrders = true; ready();
         } else if (feed === 'open_orders') {
           const o = msg.order;
@@ -5175,9 +5208,11 @@ function createTradeNative(opts) {
             if (oid) {
               if (msg.is_cancel) delete F.orders[oid];
               else F.orders[oid] = o;
+              krLseq(F);   // #1860
             }
           } else if (msg.order_id) {
             delete F.orders[String(msg.order_id)];
+            krLseq(F);   // #1860
           }
         } else if (feed === 'open_positions') {
           F.positions = msg.positions || [];
@@ -5357,6 +5392,7 @@ function createTradeNative(opts) {
             if (t === 'limit') {
               sessO.spot.orders[oid] =
                 krSynSpotOrder(oid, symbol, side, q, price, cid, Date.now());
+              krLseq(sessO.spot);   // #1860
             }
             krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
             const okW = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5373,6 +5409,7 @@ function createTradeNative(opts) {
         if (t === 'limit' && sessO) {   // #1822 optimistic echo (REST ack)
           sessO.spot.orders[oid] = krSynSpotOrder(oid, symbol, side, q, price,
                                                   krClOrdId(clOrdID), Date.now());
+          krLseq(sessO.spot);   // #1860
         }
         krOrderBirthRec(oid);   // #1839 cancel age-penalty anchor
         const okR = { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5454,7 +5491,7 @@ function createTradeNative(opts) {
       const r = await krRequest(creds, 'POST', 'spot', '/0/private/CancelOrder',
                                 [['txid', String(intent.orderID)]], route);
       if (!r.ok) return r;
-      if (sessC) delete sessC.spot.orders[String(intent.orderID)];   // #1822
+      if (sessC) { delete sessC.spot.orders[String(intent.orderID)]; krLseq(sessC.spot); }   // #1822/#1860
       return { ok: true, cancelled: intent.orderID };
     }
     if (intent.op === 'cancel_all') {
@@ -5466,7 +5503,7 @@ function createTradeNative(opts) {
                                   [['symbol', String(intent.symbol)]], route);
         if (!r.ok) return r;
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument');
+        if (sessF) { krSynSweepSymbol(sessF.fut.orders, intent.symbol, 'instrument'); krLseq(sessF.fut); }
         return { ok: true, cancelled: 'all' };
       }
       // #1839: Space = ONE bulk sweep. The old loop of per-txid cancels
@@ -5488,6 +5525,7 @@ function createTradeNative(opts) {
         // pairs), so holds/badges reflect the sweep immediately.
         if (sessA) {
           for (const k of Object.keys(sessA.spot.orders || {})) delete sessA.spot.orders[k];
+          krLseq(sessA.spot);   // #1860
         }
         const out = { ok: true, cancelled: 'all' };
         if (count != null) out.count = count;
@@ -7135,6 +7173,21 @@ function createTradeNative(opts) {
     const wsSpot = !!(sess && krWsLive(sess.spot) && sess.spot.totals != null);
     const wsFut = !!(sess && krWsLive(sess.fut));
     const out = { ok: true, wsSpot: wsSpot, wsFut: wsFut };
+    if (sess) {
+      // #1860: ledger seq stamps (diag/tests — panel ordering rides readSeq)
+      out.lseqSpot = sess.spot.lseq | 0;
+      out.lseqFut = sess.fut.lseq | 0;
+      // #1860 failure honesty: log ledger source transitions (WS primary ↔
+      // REST auditor) so diag shows exactly when the display went degraded.
+      const pv = sess._wsSt || {};
+      if (pv.spot !== wsSpot || pv.fut !== wsFut) {
+        sess._wsSt = { spot: wsSpot, fut: wsFut };
+        try {
+          tdiag('acct', 'kr_ledger',
+                { spot: wsSpot ? 1 : 0, fut: wsFut ? 1 : 0 });
+        } catch (e) { /* diag-only */ }
+      }
+    }
     if (sess && (sess.spot.err || sess.fut.err)) {
       out.wsErr = sess.spot.err || sess.fut.err;
     }
@@ -7163,6 +7216,19 @@ function createTradeNative(opts) {
       out.flexAccount = flex.data || null;
       out.positions = ((pos.data || {}).openPositions) || [];
       out.futOrders = ((fo.data || {}).openOrders) || [];
+      // #1860 ledger overlay: the REST page may predate just-ACKed orders —
+      // fresh ledger rows absent from it are appended so badges never
+      // vanish to a stale snapshot (stale ledger rows are NOT overlaid).
+      if (sess) {
+        const present = out.futOrders.map(
+          (o) => String((o || {}).order_id || ''));
+        const freshF = krLedgerFreshIds(sess.fut.orders, present, Date.now());
+        for (const oid of freshF) {
+          const row = krWsFutOrderRest(sess.fut.orders[oid]);
+          if (row) out.futOrders.push(row);
+        }
+        if (freshF.length) out.synFut = freshF.length;
+      }
     }
     if (wsSpot) {
       const S = sess.spot;
@@ -7180,6 +7246,23 @@ function createTradeNative(opts) {
       const spotOrders = [];
       const openMap = (((so.data || {}).result) || {}).open || {};
       for (const txid of Object.keys(openMap)) spotOrders.push({ txid: txid, o: openMap[txid] });
+      // #1860 ledger overlay (same rule as futures above): fresh optimistic /
+      // just-echoed spot rows missing from the REST page are appended in the
+      // same [{txid, o}] shape via the WS→REST mapper.
+      if (sess) {
+        const freshS = krLedgerFreshIds(
+          sess.spot.orders, spotOrders.map((r2) => r2.txid), Date.now());
+        if (freshS.length) {
+          let prods = null;
+          try { prods = await krProducts(route); } catch (e) { prods = null; }
+          const sub = {};
+          for (const oid of freshS) sub[oid] = sess.spot.orders[oid];
+          for (const row of krWsSpotOpenOrders(sub, (prods || {}).spot || {})) {
+            spotOrders.push(row);
+          }
+          out.synSpot = freshS.length;
+        }
+      }
       out.spotBalances = bal.data || null;
       out.spotOrders = spotOrders;
     }
@@ -7218,6 +7301,7 @@ function createTradeNative(opts) {
   }
   async function krConfirmRun(slot, L) {
     if (!krConfirmFire(L.st)) return;
+    let goneN = 0;   // #1860 auditor disagreement count (rows venue said gone)
     try {
       const sess = krWsSessGet(slot);
       const bal = await krRequest(L.creds, 'POST', 'spot',
@@ -7226,6 +7310,7 @@ function createTradeNative(opts) {
         // venue truth replaces the stale WS totals; later WS deltas keep
         // merging per-asset on top (both are venue truth, newest wins soon)
         sess.spot.totals = krBalanceExTotals(bal.data);
+        krLseq(sess.spot);   // #1860
       }
       // #1832 trim: OpenOrders exists to reconcile confirmed-gone rows — an
       // EMPTY local map has nothing to reconcile, skip the point entirely.
@@ -7235,7 +7320,8 @@ function createTradeNative(opts) {
                              '/0/private/OpenOrders', null, L.route);
         if (so.ok && sess) {
           const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
-          krOrdersReconcile(sess.spot.orders, ids, Date.now());
+          const gone = krOrdersReconcile(sess.spot.orders, ids, Date.now());
+          if (gone.length) { krLseq(sess.spot); goneN = gone.length; }
         }
       }
       // #1828 fast venue-truth fills: one recent-window TradesHistory page
@@ -7285,6 +7371,7 @@ function createTradeNative(opts) {
       // #1832 diag honesty: carry the first Kraken error string + skip flag —
       // body-level errors under HTTP 200 are otherwise invisible in the log.
       const kcd = { ok: !!(bal.ok && so.ok) };
+      if (goneN) kcd.gone = goneN;   // #1860 auditor corrected the ledger
       if (bal.skipped || so.skipped) kcd.skipped = true;
       if (!kcd.ok) {
         kcd.err = String((!bal.ok && bal.message) || (!so.ok && so.message)
@@ -8225,6 +8312,8 @@ module.exports = {
   KR_CONFIRM_DELAY_MS,
   KR_CONFIRM_MIN_GAP_MS,
   KR_CONFIRM_ORDER_GRACE_MS,
+  krLseq,
+  krLedgerFreshIds,
   krConfirmKick,
   krConfirmFire,
   krConfirmDone,
