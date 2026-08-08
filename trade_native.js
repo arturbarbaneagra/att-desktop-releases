@@ -5578,7 +5578,11 @@ function createTradeNative(opts) {
                                      null, route, null, null, true);
           if (lo.ok && sessA) {
             const ids = Object.keys(((((lo.data || {}).result) || {}).open) || {});
-            krOrdersReconcile(sessA.spot.orders, ids, Date.now());
+            // #1860: this auditor correction deletes displayed rows — the
+            // ledger seq must advance with them
+            if (krOrdersReconcile(sessA.spot.orders, ids, Date.now()).length) {
+              krLseq(sessA.spot);
+            }
           }
         } catch (e) { /* best-effort */ }
         return r;
