@@ -2524,17 +2524,31 @@ function krLseq(scope) { if (scope) scope.lseq = (scope.lseq | 0) + 1; }
 // event per scope with the kinds union and the LATEST lseq (seq is read at
 // drain time, so a window comparing seqs can detect it already applied it).
 const KR_PUSH_COALESCE_MS = 25;
-function krPushMark(P, key, kind) {
+// #1870: 'fill' marks may carry the individual fill id — the drained event
+// ships the ids so the panel chime plays PER FILL at push time instead of
+// waiting out the fills-read cycle. Bounded + deduped (a pathological frame
+// can't balloon the IPC payload; the panel latches ids anyway).
+const KR_PUSH_FIDS_CAP = 24;
+function krPushMark(P, key, kind, id) {
   if (!P[key]) P[key] = { kinds: {} };
   P[key].kinds[String(kind || 'ledger')] = 1;
+  if (id != null && String(kind) === 'fill') {
+    if (!P[key].fids) P[key].fids = [];
+    const s = String(id);
+    if (P[key].fids.length < KR_PUSH_FIDS_CAP && P[key].fids.indexOf(s) < 0) {
+      P[key].fids.push(s);
+    }
+  }
 }
 function krPushDrain(P, seqOf, nowMs) {
   const out = [];
   for (const key of Object.keys(P)) {
     const ix = key.indexOf('|');
-    out.push({ venue: 'kraken', slot: key.slice(0, ix), scope: key.slice(ix + 1),
-               kinds: Object.keys(P[key].kinds).sort(),
-               seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs });
+    const ev = { venue: 'kraken', slot: key.slice(0, ix), scope: key.slice(ix + 1),
+                 kinds: Object.keys(P[key].kinds).sort(),
+                 seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs };
+    if (P[key].fids && P[key].fids.length) ev.fids = P[key].fids.slice();
+    out.push(ev);
     delete P[key];
   }
   return out;
@@ -2566,6 +2580,73 @@ function krLedgerFreshIds(orders, presentIds, now) {
     if (fresh) out.push(oid);
   }
   return out;
+}
+// --- #1870 fill-consumption badge removal (pure) ---------------------------
+// A trade execution that fully consumes its order must delete the ledger row
+// in the SAME frame — the badge del rides the fill push beat (~10ms class,
+// like cancel deletes), never a later "order gone" confirmation (observed
+// 1.7-3.4s on red-zone taker fills). Full consumption = gone-family
+// order_status, OR cum_qty >= order_qty (venue-reported, both > 0; the row's
+// stored fields back-fill when the exec row omits them). Partial fills merge
+// the exec fields onto the row (badge qty update) and stamp _updTs — a
+// partial fill NEVER removes the badge. Returns 'gone' | 'upd' | null.
+function krFillOrderApply(orders, e, now) {
+  if (!orders || !e || typeof e !== 'object') return null;
+  if (String(e.exec_type || '') !== 'trade') return null;
+  const oid = String(e.order_id || '');
+  if (!oid) return null;
+  const row = orders[oid];
+  const st = String(e.order_status || '').toLowerCase();
+  const oq = Number(e.order_qty != null ? e.order_qty
+                                        : (row && row.order_qty));
+  let cq = Number(e.cum_qty);
+  if (!(cq > 0)) {
+    const pc = Number(row && row.cum_qty);
+    const lq = Number(e.last_qty);
+    cq = ((pc > 0) ? pc : 0) + ((lq > 0) ? lq : 0);
+  }
+  const consumed = (oq > 0 && cq >= oq * (1 - 1e-9));
+  if (KR_WS_SPOT_GONE[st] || consumed) {
+    delete orders[oid];
+    return 'gone';
+  }
+  if (st === '' && !row) return null;   // snapshot/loose trade row — never a phantom badge
+  orders[oid] = Object.assign({}, row || {}, e);
+  delete orders[oid]._synTs;   // venue echo confirms the optimistic row
+  orders[oid]._updTs = now;
+  return 'upd';
+}
+// Futures twin: ws/v1 `fills` rows carry remaining_order_qty — remaining→0
+// deletes the row NOW (the open_orders echo that used to drive the delete
+// lags the fill by seconds); remaining>0 updates the row's unfilled qty.
+// Unknown order / no remaining info → null (never fabricate a row).
+function krFutFillOrderApply(orders, f, now) {
+  if (!orders || !f || typeof f !== 'object') return null;
+  const oid = String(f.order_id || '');
+  if (!oid || !orders[oid]) return null;
+  const rq = Number(f.remaining_order_qty);
+  if (!Number.isFinite(rq)) return null;
+  if (rq <= 0) { delete orders[oid]; return 'gone'; }
+  const row = orders[oid];
+  row.qty = rq;
+  const fq = Number(f.qty);
+  if (fq > 0) row.filled = ((Number(row.filled) > 0) ? Number(row.filled) : 0) + fq;
+  delete row._synTs;
+  row._updTs = now;
+  return 'upd';
+}
+// --- #1870 stale-snapshot auditor gate (pure) -------------------------------
+// A REST auditor snapshot may only mutate the ledger when (a) the response
+// actually carries its data section — a budget-deferred / failed / body-error
+// read must NEVER synthesize an empty set (observed: 5 live resting orders
+// wiped by a snapshot fetched under rate-points pressure) — and (b) the WS
+// ledger seq has NOT moved since the fetch started (the snapshot provably
+// predates a mutation → discard, diag kr_audit_stale; the next confirm
+// re-audits). Returns 'apply' | 'stale' | 'nodata'.
+function krAuditGate(seq0, seqNow, hasData) {
+  if (!hasData) return 'nodata';
+  if ((seq0 | 0) !== (seqNow | 0)) return 'stale';
+  return 'apply';
 }
 
 // --- #1832 Kraken spot private-REST points ledger (pure) --------------------
@@ -5215,8 +5296,19 @@ function createTradeNative(opts) {
                 krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
-            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill'); }   // #1867 push-driven chime — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
-            if (fr && e.order_status == null) continue;
+            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill', fr.id); }   // #1867 push-driven chime (+#1870 per-fill id) — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
+            if (fr) {
+              // #1870 fill-consumption badge removal: a trade execution that
+              // fully consumes its order deletes the ledger row in the SAME
+              // frame (badge del rides this push beat, never a later "order
+              // gone" confirmation); partial fills update the row qty.
+              // Snapshot rows stay barred from the open-orders map (helper
+              // returns null for status-less unknown rows; lagSnapFrame rows
+              // only ever confirm/consume an EXISTING row).
+              const eff = krFillOrderApply(S.orders, e, Date.now());
+              if (eff) { krLseq(S); krPushSc(S, 'order'); }   // #1860/#1867
+              continue;
+            }
             const oid = String(e.order_id || '');
             if (!oid) continue;
             if (KR_WS_SPOT_GONE[String(e.order_status || '').toLowerCase()]) {
@@ -5449,10 +5541,17 @@ function createTradeNative(opts) {
           for (const f of (msg.fills || [])) {
             const fr = krWsFutFillRow(f);
             if (fr) krFillsCachePush(F.fills, fr);
+            // #1870: live fills consume their order row NOW — remaining→0
+            // deletes the badge in this push beat (the open_orders echo
+            // that used to drive it lags seconds); remaining>0 updates qty.
+            if (feed === 'fills' && fr) {
+              const eff = krFutFillOrderApply(F.orders, f, Date.now());
+              if (eff) { krLseq(F); krPushSc(F, 'order'); }   // #1860/#1867
+              // per-fill push id (#1870): each live fill rides the event so
+              // the panel chime plays per fill at push time
+              krLseq(F); krPushSc(F, 'fill', fr.id);   // seq advances per live fill (snapshot rows never bump)
+            }
           }
-          // #1867: live fill frames push (snapshot rows are historic — the
-          // panel's id-keyed chime must never re-ring the seed window)
-          if (feed === 'fills' && (msg.fills || []).length) { krLseq(F); krPushSc(F, 'fill'); }   // seq advances per live fill frame (snapshot rows never bump)
           if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
           // #1835: live fill frames only (snapshot = historic timestamps)
           if (feed === 'fills' && F.lag) {
@@ -5827,10 +5926,14 @@ function createTradeNative(opts) {
         // lane so truth lands before the user's next action. Best-effort —
         // the sweep failure itself stays the loud error.
         try {
+          const loSeq0 = sessA ? (sessA.spot.lseq | 0) : 0;   // #1870 stale guard
           const lo = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders',
                                      null, route, null, null, true);
-          if (lo.ok && sessA) {
-            const ids = Object.keys(((((lo.data || {}).result) || {}).open) || {});
+          const loMap = ((((lo.data || {}).result) || {}).open);
+          if (lo.ok && sessA &&
+              krAuditGate(loSeq0, sessA.spot.lseq | 0,
+                          !!(loMap && typeof loMap === 'object')) === 'apply') {
+            const ids = Object.keys(loMap);
             // #1860: this auditor correction deletes displayed rows — the
             // ledger seq must advance with them
             if (krOrdersReconcile(sessA.spot.orders, ids, Date.now()).length) {
@@ -7583,9 +7686,20 @@ function createTradeNative(opts) {
     let divA = null; // #1864 local-vs-audit totals divergence (asset names)
     try {
       const sess = krWsSessGet(slot);
+      // #1870 stale-snapshot guard: stamp the pre-fetch ledger seq — a
+      // snapshot fetched while the WS ledger moved is provably stale and is
+      // DISCARDED (diag kr_audit_stale), never applied; a budget-deferred /
+      // failed read never mutates the ledger at all (krAuditGate 'nodata').
+      const balSeq0 = sess ? (sess.spot.lseq | 0) : 0;
       const bal = await krRequest(L.creds, 'POST', 'spot',
                                   '/0/private/BalanceEx', null, L.route);
-      if (bal.ok && sess) {
+      const balGate = krAuditGate(balSeq0, sess ? (sess.spot.lseq | 0) : 0,
+                                  !!(bal.ok && bal.data));
+      if (sess && bal.ok && balGate === 'stale') {
+        tdiag('acct', 'kr_audit_stale', { k: slot, w: 'bal', seq0: balSeq0,
+                                          seq: sess.spot.lseq | 0 });
+      }
+      if (bal.ok && sess && balGate === 'apply') {
         // #1864: BalanceEx is a background AUDITOR now, not the display path
         // — the local fill math (krFillTotalsApply) already moved the posrow.
         // Fill-touched assets inside the grace keep the LOCAL value (the REST
@@ -7607,12 +7721,26 @@ function createTradeNative(opts) {
       // EMPTY local map has nothing to reconcile, skip the point entirely.
       let so = { ok: true, skipped: true };
       if (!sess || Object.keys(sess.spot.orders || {}).length) {
+        const soSeq0 = sess ? (sess.spot.lseq | 0) : 0;   // #1870 pre-fetch stamp
         so = await krRequest(L.creds, 'POST', 'spot',
                              '/0/private/OpenOrders', null, L.route);
         if (so.ok && sess) {
-          const ids = Object.keys(((((so.data || {}).result) || {}).open) || {});
-          const gone = krOrdersReconcile(sess.spot.orders, ids, Date.now());
-          if (gone.length) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); goneN = gone.length; }   // #1867
+          // #1870: the open map must EXIST in the body (a body-level error /
+          // deferred read under HTTP 200 must never read as "no open
+          // orders" — that wiped 5 live resting badges); and the ledger seq
+          // must not have moved during the fetch (a fill/cancel landed → the
+          // page is provably stale → discard, the next confirm re-audits).
+          const openMap = (((so.data || {}).result) || {}).open;
+          const soGate = krAuditGate(soSeq0, sess.spot.lseq | 0,
+                                     !!(openMap && typeof openMap === 'object'));
+          if (soGate === 'stale') {
+            tdiag('acct', 'kr_audit_stale', { k: slot, w: 'ord', seq0: soSeq0,
+                                              seq: sess.spot.lseq | 0 });
+          } else if (soGate === 'apply') {
+            const ids = Object.keys(openMap);
+            const gone = krOrdersReconcile(sess.spot.orders, ids, Date.now());
+            if (gone.length) { krLseq(sess.spot); krPushSc(sess.spot, 'order'); goneN = gone.length; }   // #1867
+          }
         }
       }
       // #1828 fast venue-truth fills: one recent-window TradesHistory page
@@ -8616,6 +8744,10 @@ module.exports = {
   krAssetWsName,
   krBalanceExTotals,
   krOrdersReconcile,
+  // pure — #1870 fill-consumption badge removal + stale-snapshot auditor gate
+  krFillOrderApply,
+  krFutFillOrderApply,
+  krAuditGate,
   // pure — Kraken private-REST points ledger (#1832)
   KR_LEDGER_MAX,
   KR_LEDGER_DECAY,
