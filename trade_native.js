@@ -5215,7 +5215,7 @@ function createTradeNative(opts) {
                 krLseq(S); krPushSc(S, 'bal');   // #1867 fills-first posrow beat
               }
             }
-            if (fr && !lagSnapFrame) krPushSc(S, 'fill');   // #1867 push-driven chime
+            if (fr && !lagSnapFrame) { krLseq(S); krPushSc(S, 'fill'); }   // #1867 push-driven chime — seq MUST advance per live fill or back-to-back fill-only frames dedupe as stale
             if (fr && e.order_status == null) continue;
             const oid = String(e.order_id || '');
             if (!oid) continue;
@@ -5452,7 +5452,7 @@ function createTradeNative(opts) {
           }
           // #1867: live fill frames push (snapshot rows are historic — the
           // panel's id-keyed chime must never re-ring the seed window)
-          if (feed === 'fills' && (msg.fills || []).length) krPushSc(F, 'fill');
+          if (feed === 'fills' && (msg.fills || []).length) { krLseq(F); krPushSc(F, 'fill'); }   // seq advances per live fill frame (snapshot rows never bump)
           if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
           // #1835: live fill frames only (snapshot = historic timestamps)
           if (feed === 'fills' && F.lag) {
