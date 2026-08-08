@@ -7460,6 +7460,9 @@ function createTradeNative(opts) {
         }
         ofs = krSeedSpotNext(res, ofs, tids.length);
       }
+      // Page-cap exhaustion = INCOMPLETE snapshot — reject, never let a
+      // truncated backfill become authoritative venue truth.
+      if (ofs !== null) return { ok: false, message: 'Window too large — spot history exceeds the page cap; narrow the date range' };
     }
     if (market !== 'spot' && krPairFor(creds, 'futures')) {
       let cursor = new Date(w.to).toISOString();
