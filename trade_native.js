@@ -5207,7 +5207,14 @@ function createTradeNative(opts) {
             const oid = String(o.order_id || '');
             if (oid) {
               if (msg.is_cancel) delete F.orders[oid];
-              else F.orders[oid] = o;
+              else {
+                F.orders[oid] = o;
+                // #1860 (mirrors spot): a venue echo confirms the optimistic
+                // synthetic and stamps last-WS-write so the reconcile grace /
+                // REST-fallback overlay treat the row as WS-confirmed fresh.
+                delete F.orders[oid]._synTs;
+                F.orders[oid]._updTs = Date.now();
+              }
               krLseq(F);   // #1860
             }
           } else if (msg.order_id) {
@@ -5443,6 +5450,7 @@ function createTradeNative(opts) {
           sessF.fut.orders[oid] = krSynFutOrder(oid, symbol, side, q, price,
                                                 krClOrdId(clOrdID),
                                                 !!f.reduceOnly, Date.now());
+          krLseq(sessF.fut);   // #1860
         }
       }
       return { ok: true, orderID: oid, clOrdID: krClOrdId(clOrdID) };
@@ -5462,7 +5470,7 @@ function createTradeNative(opts) {
         const st = String(cs.status || '');
         if (st !== 'cancelled') return { ok: false, message: st || 'Kraken rejected the cancel' };
         const sessF = krWsSessGet(intent.credSlot || 'kraken');   // #1822
-        if (sessF) delete sessF.fut.orders[String(intent.orderID)];
+        if (sessF) { delete sessF.fut.orders[String(intent.orderID)]; krLseq(sessF.fut); }   // #1860
         return { ok: true, cancelled: intent.orderID };
       }
       // #1839: TRADING-counter spend — cancel age penalty (young orders cost
