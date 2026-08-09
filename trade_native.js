@@ -5863,10 +5863,21 @@ function createTradeNative(opts) {
               if (!lagSnapFrame && foid && !hadRow && !S.orders[foid]) {
                 if (!S.consumed) S.consumed = {};
                 const st84 = String(e.order_status || '').toLowerCase();
+                const gone84 = !!KR_WS_SPOT_GONE[st84] || eff === 'gone';
                 krConsumedNote(S.consumed, foid, {
                   lastQty: e.last_qty, cumQty: e.cum_qty, orderQty: e.order_qty,
-                  gone: !!KR_WS_SPOT_GONE[st84] || eff === 'gone', exec: e,
+                  gone: gone84, exec: e,
                 }, Date.now());
+                // #1891: a gone-consuming fill with NO ledger row (never
+                // registered in this session) still closes the id NOW —
+                // unconditional closed-set entry at gone-processing time +
+                // the goid rides the push so every panel window kills the
+                // badge this beat (the old row-gated push skipped these, so
+                // a stale snapshot / ACK-shadow chip lingered 10-15s until
+                // a budget-deferred OpenOrders render). Symbol backfill for
+                // the panel's lot accumulator stays on the #1887 learn-drain
+                // (krOidSymLearn runs BEFORE the closed gate at registration).
+                if (gone84) { krLseq(S); krPushSc(S, 'ordgone', foid); }
               }
               // #1874: fill-consumed rows push the gone oid — every panel
               // window tombstones the badge in the same push apply pass
@@ -6235,10 +6246,14 @@ function createTradeNative(opts) {
               if (foid && !hadRow && !F.orders[foid]) {
                 if (!F.consumed) F.consumed = {};
                 const rq84 = Number((f || {}).remaining_order_qty);
+                const gone84 = eff === 'gone' || (Number.isFinite(rq84) && rq84 <= 0);
                 krConsumedNote(F.consumed, foid, {
-                  lastQty: (f || {}).qty, remaining: rq84,
-                  gone: eff === 'gone' || (Number.isFinite(rq84) && rq84 <= 0),
+                  lastQty: (f || {}).qty, remaining: rq84, gone: gone84,
                 }, Date.now());
+                // #1891: fully-consumed fill with NO ledger row → close the
+                // id NOW (unconditional closed-set entry + panel goid push),
+                // mirroring the spot scope — never wait for a snapshot.
+                if (gone84) { krLseq(F); krPushSc(F, 'ordgone', foid); }
               }
               // #1874: fill-consumed rows push the gone oid (badge fast path)
               if (eff) { krLseq(F); krPushSc(F, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(f.order_id || '') : null); }   // #1860/#1867/#1874
