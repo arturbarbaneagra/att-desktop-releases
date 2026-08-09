@@ -2145,6 +2145,29 @@ function krWsFutFillRow(f) {
   if (!(Number(f.qty) > 0)) return null;
   return { id: String(f.fill_id), ts: Number(f.time) || 0, raw: f };
 }
+// #1905: bounded push copy of a futures ws/v1 fill row — exactly the fields
+// the panel's fills-lane parser (krFillsStateRows fut branch) and the
+// engine's normalizer (norm_kr_ws_fut_fill) read, so a pushed row, the WS
+// cache's fills_read copy and a REST-seed copy of the SAME fill all key
+// 'f:<fill_id>' and dedupe to a no-op everywhere. Null for unusable rows.
+function krPushFutFillRow(f) {
+  if (!f || typeof f !== 'object') return null;
+  if (!String(f.fill_id || '')) return null;
+  if (!(Number(f.qty) > 0) || !String(f.instrument || '')) return null;
+  const r = { instrument: String(f.instrument),
+              time: Number(f.time) || 0,
+              price: f.price == null ? '0' : f.price,
+              buy: f.buy === true || f.buy === 'true' || f.buy === 1,
+              qty: f.qty,
+              fill_id: String(f.fill_id),
+              order_id: f.order_id == null ? '' : String(f.order_id),
+              fill_type: String(f.fill_type || '') };
+  if (f.fee_paid != null) r.fee_paid = f.fee_paid;
+  if (f.fee_currency != null) r.fee_currency = String(f.fee_currency);
+  return r;
+}
+// #1905 fills_read clock-skew allowance (see execKrakenFillsRead).
+const KR_FILLS_TS_SKEW_MS = 300000;
 // Bounded dedupe push; oldest rows (and their seen keys) roll off past cap.
 // Cache cap must hold a FULL seed walk (15 pages × ≤100 rows/page) or the
 // paged restart self-heal would evict its own oldest legs on push.
@@ -6271,7 +6294,10 @@ function createTradeNative(opts) {
               if (eff) { krLseq(F); krPushSc(F, eff === 'gone' ? 'ordgone' : 'order', eff === 'gone' ? String(f.order_id || '') : null); }   // #1860/#1867/#1874
               // per-fill push id (#1870): each live fill rides the event so
               // the panel chime plays per fill at push time
-              krLseq(F); krPushSc(F, 'fill', fr.id);   // seq advances per live fill (snapshot rows never bump)
+              // #1905: the raw row rides the push too — the panel's fills
+              // lane, posrow overlay and push-beat blotter POST consume it
+              // without waiting out the fills_read cadence.
+              krLseq(F); krPushSc(F, 'fill', fr.id, krPushFutFillRow(f));   // seq advances per live fill (snapshot rows never bump)
             }
           }
           if (feed === 'fills_snapshot' && F.fills) F.fills.seeded = true;
@@ -8622,6 +8648,13 @@ function createTradeNative(opts) {
     let start = Math.floor(Number(intent.startMs) || 0);
     if (!(start > 0) || start >= end) start = end - 24 * 3600 * 1000;
     if (end - start > 26 * 3600 * 1000) start = end - 26 * 3600 * 1000;
+    // #1905 clock-skew allowance: cached fill `ts` ride the VENUE clock while
+    // the caller's endMs is the panel's PC clock — a PC clock behind the
+    // venue made just-executed fills fall out of [start, end] and a whole
+    // burst read as 0 rows until local time caught up (observed 65s hole).
+    // Serving slightly-"future" rows is safe: panel merge and engine ingest
+    // both dedupe by exec id.
+    const hiEnd = end + KR_FILLS_TS_SKEW_MS;
     const out = { ok: true, wsSpot: false, wsFut: false, spot: [], futures: [] };
     if (krPairFor(creds, 'spot')) {
       if (!krFillsScopeReady(sess && krWsLive(sess.spot), sess && sess.spot.fills)) {
@@ -8629,7 +8662,7 @@ function createTradeNative(opts) {
                                      || 'Kraken spot fills not seeded yet' };
       }
       out.wsSpot = true;
-      out.spot = krFillsWindow(sess.spot.fills, start, end);
+      out.spot = krFillsWindow(sess.spot.fills, start, hiEnd);
     }
     if (krPairFor(creds, 'futures')) {
       if (!krFillsScopeReady(sess && krWsLive(sess.fut), sess && sess.fut.fills)) {
@@ -8637,7 +8670,7 @@ function createTradeNative(opts) {
                                      || 'Kraken futures fills not seeded yet' };
       }
       out.wsFut = true;
-      out.futures = krFillsWindow(sess.fut.fills, start, end);
+      out.futures = krFillsWindow(sess.fut.fills, start, hiEnd);
     }
     return out;
   }
@@ -9615,6 +9648,8 @@ module.exports = {
   krSeedSpotNext,
   krSeedFutNext,
   krWsFutFillRow,
+  krPushFutFillRow,
+  KR_FILLS_TS_SKEW_MS,
   krFillsCachePush,
   krFillsWindow,
   krFillsScopeReady,
