@@ -1000,6 +1000,28 @@ ipcMain.on('att:diag-role', (event, isAdmin) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// #1894 atomic cross-window sound claim — one serialized first-wins registry
+// in the main process. The panel's localStorage latch is NOT atomic across
+// renderer processes (writes propagate asynchronously), so several windows
+// applying the same Kraken fill push in one tick could each pass the latch
+// and all play (double/multi chime under roster skew). sendSync serializes
+// every claim here: exactly ONE window ever gets true per event id.
+// ---------------------------------------------------------------------------
+// PURE (node-testable): bounded FIFO claim set. true = caller took the id.
+function sndClaimTake(c, id, cap) {
+  if (!id) return false;
+  if (c.m[id]) return false;
+  c.m[id] = 1; c.q.push(id);
+  while (c.q.length > cap) delete c.m[c.q.shift()];
+  return true;
+}
+const sndClaims = { m: {}, q: [] };
+ipcMain.on('att:snd-claim', (event, id) => {
+  if (proxySenderKind(event) !== 'app') { event.returnValue = false; return; }
+  event.returnValue = sndClaimTake(sndClaims, String(id || ''), 800);
+});
+
 // Settings-card state for the admin-only "Diagnostic logging" toggle.
 ipcMain.handle('att:diag-get', (event) => {
   if (proxySenderKind(event) !== 'app') return null;

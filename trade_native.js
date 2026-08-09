@@ -2640,6 +2640,15 @@ function krPushMark(P, key, kind, id, row) {
       if (P[key].frows.length < KR_PUSH_FIDS_CAP) P[key].frows.push(row);
     }
   }
+  // #1894: pushed order ADD/UPDATE row (REST shape) rides the event — the
+  // panel merges it into its applied acct state at push time so the SL/TP
+  // badge renders that beat instead of waiting out a busy/paced acct read
+  // (observed 0.7-2.5s badge-add lag, worst on the 2nd of an SL+TP pair).
+  // Bounded like fids; panel replaces-by-oid so re-pushes dedupe there.
+  if (row && typeof row === 'object' && k === 'order') {
+    if (!P[key].orows) P[key].orows = [];
+    if (P[key].orows.length < KR_PUSH_FIDS_CAP) P[key].orows.push(row);
+  }
   if (id != null && k === 'ordgone') {
     if (!P[key].goids) P[key].goids = [];
     const g = String(id);
@@ -2658,6 +2667,7 @@ function krPushDrain(P, seqOf, nowMs) {
     if (P[key].fids && P[key].fids.length) ev.fids = P[key].fids.slice();
     if (P[key].frows && P[key].frows.length) ev.frows = P[key].frows.slice();   // #1878 posrow seed rows
     if (P[key].goids && P[key].goids.length) ev.goids = P[key].goids.slice();
+    if (P[key].orows && P[key].orows.length) ev.orows = P[key].orows.slice();   // #1894 order add/update rows
     out.push(ev);
     delete P[key];
   }
@@ -6195,7 +6205,9 @@ function createTradeNative(opts) {
                 // REST-fallback overlay treat the row as WS-confirmed fresh.
                 delete F.orders[oid]._synTs;
                 F.orders[oid]._updTs = Date.now();
-                krLseq(F); krPushSc(F, 'order');   // #1860 / #1867
+                // #1894: ship the added/updated row (REST shape) so the panel
+                // badge renders off THIS push beat, not the next acct read
+                krLseq(F); krPushSc(F, 'order', null, krWsFutOrderRest(F.orders[oid]));   // #1860 / #1867 / #1894
               }
             }
           } else if (msg.order_id) {

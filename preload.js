@@ -70,6 +70,14 @@ try {
     // boolean only, per the bridge's security rule. Missing on older shells —
     // the panel must treat absence as "no gating".
     getLaunchGate: () => ipcRenderer.invoke('att:get-launch-gate'),
+    // #1894 atomic cross-window sound claim: first window to claim an event
+    // id (serialized in main via sendSync) plays it; every other window gets
+    // false. Returns null on bridge failure so the panel can fall back to
+    // its localStorage latch. String id only — no renderer data flows back.
+    sndClaim: (id) => {
+      try { return ipcRenderer.sendSync('att:snd-claim', String(id || '')) === true; }
+      catch (e) { return null; }
+    },
     onLaunchGate: (cb) => { _launchGateCb = (typeof cb === 'function') ? cb : null; },
     // Update-state mirror for the in-titlebar Restart button (#1793): the panel
     // accents the button ("restart to update") when a downloaded update is
