@@ -10092,7 +10092,7 @@ function createTradeNative(opts) {
     // (panel gates them on the 'cat:mexc2' cap — see preload.js).
     'mexc|spot':      { host: 'api.mexc.com',      base: '', prefixes: ['/api/v3/exchangeInfo', '/api/v3/klines', '/api/v3/trades', '/api/v3/ticker/24hr', '/api/v3/ticker/price'] },
     'mexc|futures':   { host: 'contract.mexc.com', base: '', prefixes: ['/api/v1/contract/detail', '/api/v1/contract/kline/', '/api/v1/contract/deals/', '/api/v1/contract/ticker'] },
-    'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC'], hdrs: CAT_BROWSER_HDRS },
+    'kraken|spot':    { host: 'api.kraken.com',     base: '', prefixes: ['/0/public/AssetPairs', '/0/public/OHLC', '/0/public/Trades'], hdrs: CAT_BROWSER_HDRS },   // Trades: #1982 cluster deep-history forward pager
     'kraken|futures': { host: 'futures.kraken.com', base: '', prefixes: ['/derivatives/api/v3/instruments', '/api/charts/v1/trade/'], hdrs: CAT_BROWSER_HDRS },
     // Arcus futures host also carries the SPOT catalog overview (hostMarket
     // quirk) → its prefix list includes /v1/api-meta/spot/overview.
