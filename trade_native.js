@@ -1360,9 +1360,13 @@ function lbPruneRows(rows, cap) {
 // trade id) when known, else one most-recent page. `covOk:false` whenever
 // coverage is knowably incomplete (call-cap hit, overflowing first page,
 // too many symbols) — the panel must NOT suppress server legs on it.
-const LB_BN_MAX_CALLS = 60;
+// #1979: 25/60 was too tight — a real 30-pair spot universe tripped the cap
+// and kept Binance in ramp mode. 50 pairs comfortably covers realistic
+// holdings; the call budget is raised in proportion (50 spot pages + futures
+// windows) so the cap-hit path still fires honestly on truly huge universes.
+const LB_BN_MAX_CALLS = 90;
 const LB_BN_FUT_WIN_MS = 7 * 86400 * 1000;
-const LB_BN_SPOT_SYM_CAP = 25;
+const LB_BN_SPOT_SYM_CAP = 50;
 const LB_BN_QUOTES = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BTC', 'ETH', 'BNB', 'EUR', 'TRY'];
 // Spot symbol UNIVERSE for backfill: local rows alone miss never-recorded
 // pairs, so derive from the account itself — held assets (spot balances) ×
@@ -1444,6 +1448,10 @@ async function lbBnBackfill(bnReq, futFrm, to, spotSyms, spotFrom, pageGapMs) {
     if (t0 < to && pageGapMs) await new Promise((rs) => setTimeout(rs, pageGapMs));
   }
   const symList = (spotSyms || []).filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
+  // #1979: when trimming to the cap, page watermarked (locally-known) pairs
+  // FIRST — the overflow note then names only never-traded pairs.
+  const hasWm = (s) => spotFrom && Number(spotFrom[s]) > 0;
+  symList.sort((a, b) => (hasWm(b) - hasWm(a)) || (a < b ? -1 : a > b ? 1 : 0));
   if (symList.length > LB_BN_SPOT_SYM_CAP) {
     out.gap = true; out.covOk = false;
     out.notes.push('too many spot pairs (' + symList.length + ' > ' + LB_BN_SPOT_SYM_CAP + ')');
