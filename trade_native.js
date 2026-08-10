@@ -928,6 +928,90 @@ function binancePositionRows(data) {
   return rows;
 }
 
+// --- #1943 Binance shell user-data streams (pure helpers) -------------------
+// Kraken-grade instant display for native Binance: the shell keeps private
+// user-data WS sessions per armed slot and pushes ledger mutations to every
+// panel window through the same att:ledger-push channel (venue-tagged
+// 'binance'; Kraken frames stay byte-identical — krPushDrain's venue arg
+// defaults 'kraken').
+//   Spot: the legacy listenKey REST plumbing was REMOVED by Binance
+//   2026-02-20 (HTTP 410). Private events ride the ws-api connection —
+//   send a userDataStream.subscribe.signature frame (params {apiKey,
+//   recvWindow, timestamp} sorted+urlencoded, HMAC-SHA256 hex; the
+//   signature excluded from the signed payload). Events arrive WRAPPED
+//   ({subscriptionId, event:{...}}); expiry is in-band eventStreamTerminated.
+//   Futures: listenKey REST (POST/PUT /fapi/v1/listenKey — API-key header
+//   only, unsigned) is unchanged, but private events since 2026-04-23 push
+//   only on the routed /private/ws/<listenKey> path (the plain /ws/<lk>
+//   connects but stays silent). Same facts the server engine path learned.
+const BN_SPOT_WSAPI_URL = 'wss://ws-api.binance.com:443/ws-api/v3';
+const BN_FUT_WS_BASE = 'wss://fstream.binance.com/private/ws/';
+const BN_LK_KEEPALIVE_MS = 30 * 60 * 1000;   // Binance listenKey expiry: 60 min
+// User-data streams carry no ~1s heartbeat (Binance pings every ~3 min) —
+// the live window must be generous or a quiet account flaps stale.
+const BN_UDS_STALE_MS = 10 * 60 * 1000;
+const BN_UDS_FILLS_CAP = 400;
+
+// ws-api signature-subscribe frame (engine twin: spot_subscribe_frame).
+// MUST be built immediately before the ws send (fresh timestamp each
+// (re)connect). Pure — node-testable with a fixed nowMs.
+function bnSpotSubscribeFrame(apiKey, secret, nowMs, reqId) {
+  const params = [['apiKey', String(apiKey)],
+                  ['recvWindow', String(BINANCE_RECV_WINDOW_MS)],
+                  ['timestamp', String(nowMs)]];
+  params.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const payload = params.map((p) =>
+    encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1])).join('&');
+  return { id: String(reqId || ('bnsub' + nowMs)),
+           method: 'userDataStream.subscribe.signature',
+           params: { apiKey: String(apiKey),
+                     recvWindow: BINANCE_RECV_WINDOW_MS,
+                     timestamp: Number(nowMs),
+                     signature: binanceSign(secret, payload) } };
+}
+
+// Normalize one ws-api / user-stream frame to the bare event dict (engine
+// twin: bn_ws_event). Spot ws-api wraps events as {subscriptionId, event};
+// futures /private/ws pushes bare {e:...}. Request responses ({id, status})
+// and anything without an event type return null.
+function bnWsEvent(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  const ev = msg.event;
+  if (ev && typeof ev === 'object' && ev.e) return ev;
+  if (msg.e) return msg;
+  return null;
+}
+
+// Order lifecycle classification for executionReport / ORDER_TRADE_UPDATE
+// status X. 'add' keeps/creates the ledger row, 'gone' removes it (push
+// 'ordgone'), null = no order-state mutation (calculated/unknown states).
+function bnOrdEffect(X) {
+  const s = String(X || '');
+  if (s === 'NEW' || s === 'PARTIALLY_FILLED') return 'add';
+  if (s === 'FILLED' || s === 'CANCELED' || s === 'EXPIRED' ||
+      s === 'REJECTED' || s === 'EXPIRED_IN_MATCH') return 'gone';
+  return null;
+}
+
+// Exactly-once fill ingest at the shell boundary: one seen-map per scope
+// keyed by the venue trade id namespace ('s:<t>' spot / 'f:<t>' futures) —
+// a WS redelivery (reconnect replay) can never double-apply. Returns the
+// fid when the row is NEW (caller records + pushes), null when seen.
+function bnFillIngest(fills, prefix, tradeId) {
+  if (!fills || tradeId == null || tradeId === '') return null;
+  const fid = prefix + ':' + String(tradeId);
+  if (fills.seen[fid]) return null;
+  fills.seen[fid] = 1;
+  if (Object.keys(fills.seen).length > 4000) {
+    // bounded: keep the ids of the retained rows only
+    const keep = {};
+    for (const r of fills.rows) if (r && r._fid) keep[r._fid] = 1;
+    keep[fid] = 1;
+    fills.seen = keep;
+  }
+  return fid;
+}
+
 // --- Bybit pure builders ----------------------------------------------------
 function bybitSign(secret, tsMs, apiKey, recvWindow, payload) {
   const msg = String(tsMs) + String(apiKey) + String(recvWindow) + String(payload);
@@ -2680,11 +2764,11 @@ function krPushMark(P, key, kind, id, row) {
     }
   }
 }
-function krPushDrain(P, seqOf, nowMs) {
+function krPushDrain(P, seqOf, nowMs, venue) {
   const out = [];
   for (const key of Object.keys(P)) {
     const ix = key.indexOf('|');
-    const ev = { venue: 'kraken', slot: key.slice(0, ix), scope: key.slice(ix + 1),
+    const ev = { venue: venue || 'kraken', slot: key.slice(0, ix), scope: key.slice(ix + 1),
                  kinds: Object.keys(P[key].kinds).sort(),
                  seq: seqOf ? (seqOf(key) | 0) : 0, ts: nowMs };
     if (P[key].fids && P[key].fids.length) ev.fids = P[key].fids.slice();
@@ -3493,6 +3577,7 @@ function createTradeNative(opts) {
     venues[venue] = { b64: b64, tail: tailSrc.length >= 4 ? tailSrc.slice(-4) : tailSrc, ts: Math.floor(Date.now() / 1000) };
     if (!credsSaveAll(venues)) return { ok: false, error: 'persist-failed' };
     try { krWsCloseAll(venue); } catch (e) { /* no session */ }
+    try { bnUdsClose(venue); } catch (e) { /* no session */ }
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
@@ -3500,6 +3585,7 @@ function createTradeNative(opts) {
     if (venue) delete venues[venue];
     credsSaveAll(venues);
     try { if (venue) krWsCloseAll(venue); else for (const k of Object.keys(krWsSessions)) krWsClose(k); } catch (e) { /* no session */ }
+    try { if (venue) bnUdsClose(venue); else bnUdsCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -3889,6 +3975,9 @@ function createTradeNative(opts) {
 
   async function execBinance(creds, intent, route) {
     const market = intent.market === 'spot' ? 'spot' : 'futures';
+    // #1943: warm the user-data streams for this slot (push-driven display)
+    try { bnUdsEnsure(intent.credSlot || 'binance', creds, route); } catch (e) { /* REST-only */ }
+    const bnSlot = intent.credSlot || 'binance';
     const fetchPos = async () => {
       // v3 + explicit symbol: the symbol-less v2 call returns EVERY listed
       // contract (200KB+, past the httpJson byte cap → truncated body).
@@ -3898,11 +3987,17 @@ function createTradeNative(opts) {
       return { ok: true, rows: binancePositionRows(r.data) };
     };
     if (intent.op === 'order') {
-      return bnPlace(creds, route, market, intent.symbol, intent.side, intent.type,
-                     intent.qty, intent.price, intent.clOrdID,
-                     { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+      const r = await bnPlace(creds, route, market, intent.symbol, intent.side, intent.type,
+                              intent.qty, intent.price, intent.clOrdID,
+                              { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+      if (r && r.ok) { try { bnMutKick(bnSlot, market, 'order'); } catch (e) { /* push-less */ } }
+      return r;
     }
     if (intent.op === 'cancel') {
+      const bnCancelOk = () => {
+        try { bnMutKick(bnSlot, market, 'ordgone', String(intent.orderID)); } catch (e) { /* push-less */ }
+        return { ok: true, cancelled: intent.orderID };
+      };
       const reqPath = market === 'futures' ? '/fapi/v1/order' : '/api/v3/order';
       const r = await bnRequest(creds, 'DELETE', market, reqPath,
                                 [['symbol', intent.symbol], ['orderId', intent.orderID]], route);
@@ -3910,13 +4005,17 @@ function createTradeNative(opts) {
         // Conditionals carry algoIds the plain endpoint doesn't know.
         const r2 = await bnRequest(creds, 'DELETE', 'futures', '/fapi/v1/algoOrder',
                                    [['algoId', intent.orderID]], route);
-        if (r2.ok) return { ok: true, cancelled: intent.orderID };
+        if (r2.ok) return bnCancelOk();
         return r;                       // surface the ORIGINAL (clearer) error
       }
       if (!r.ok) return r;
-      return { ok: true, cancelled: intent.orderID };
+      return bnCancelOk();
     }
     if (intent.op === 'cancel_all') {
+      const bnSweepOk = () => {
+        try { bnMutKick(bnSlot, market, 'order'); } catch (e) { /* push-less */ }
+        return { ok: true, cancelled: 'all' };
+      };
       if (market === 'futures') {
         const r = await bnRequest(creds, 'DELETE', 'futures', '/fapi/v1/allOpenOrders',
                                   [['symbol', intent.symbol]], route);
@@ -3925,12 +4024,12 @@ function createTradeNative(opts) {
         const ra = await bnRequest(creds, 'DELETE', 'futures', '/fapi/v1/algoOpenOrders',
                                    [['symbol', intent.symbol]], route);
         if (!ra.ok && ra.code !== -2011 && ra.code !== -2013) return ra;
-        return { ok: true, cancelled: 'all' };
+        return bnSweepOk();
       }
       const r = await bnRequest(creds, 'DELETE', 'spot', '/api/v3/openOrders',
                                 [['symbol', intent.symbol]], route);
       if (!r.ok && r.code !== -2011) return r;   // -2011 = nothing open — fine
-      return { ok: true, cancelled: 'all' };
+      return bnSweepOk();
     }
     const pr = await findPosRetry(fetchPos, intent.symbol);
     if (!pr.ok) return pr;
@@ -3953,6 +4052,287 @@ function createTradeNative(opts) {
                             { reduceOnly: true, trigger: intent.trigger, closePosition: true });
     if (!r.ok) return r;
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // --- #1943 Binance user-data streams (shell push runtime) -----------------
+  // Kraken-grade instant display: per armed slot the shell keeps a spot
+  // ws-api signature-subscribe session and a futures /private/ws/<listenKey>
+  // session, maintains local-first ledger maps (orders + fills seen-set),
+  // bumps a per-scope seq (generic krLseq) on every mutation and pushes
+  // coalesced venue-tagged events through the same att:ledger-push fan-out.
+  // NO silent fallback: when a socket is down the panel simply keeps riding
+  // its existing 5s REST poll (unchanged), and reconnects are surfaced in
+  // the diag log. All traffic rides the proxy agent like everything else.
+  const bnUdsSessions = {};
+  const bnPushPend = {};
+  let bnPushTimer = null;
+  function bnPushFlush() {
+    bnPushTimer = null;
+    const evs = krPushDrain(bnPushPend, (key) => {
+      const ix = key.indexOf('|');
+      const s = bnUdsSessions[key.slice(0, ix)];
+      const sc = s && (key.slice(ix + 1) === 'fut' ? s.fut : s.spot);
+      return sc ? sc.lseq : 0;
+    }, Date.now(), 'binance');
+    for (const ev of evs) {
+      // memo-bust so the push-triggered acct_read observes the mutation
+      try { execAcctRead.bust('binance', ev.slot); } catch (e) { /* best-effort */ }
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      tdiag('acct', 'bn_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+  }
+  function bnPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(bnPushPend, scope._pk, kind, id, row);
+    if (!bnPushTimer) {
+      bnPushTimer = setTimeout(bnPushFlush, KR_PUSH_COALESCE_MS);
+      if (bnPushTimer && typeof bnPushTimer.unref === 'function') bnPushTimer.unref();
+    }
+  }
+  function bnUdsScope(kind) {
+    return { running: false, up: false, ws: null, err: null, lastMsg: 0,
+             lseq: 0, orders: {}, fills: { rows: [], seen: {} }, _pk: null };
+  }
+  function bnUdsClose(slot) {
+    const s = bnUdsSessions[slot];
+    if (!s) return;
+    s.closed = true;
+    for (const sc of [s.spot, s.fut]) {
+      try { if (sc.ws) sc.ws.terminate(); } catch (e) { /* already gone */ }
+      sc.ws = null; sc.up = false;
+    }
+    delete bnUdsSessions[slot];
+  }
+  function bnUdsCloseAll() {
+    for (const k of Object.keys(bnUdsSessions)) bnUdsClose(k);
+  }
+  function bnUdsEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key || !creds.secret) return null;
+    slot = String(slot || 'binance');
+    let s = bnUdsSessions[slot];
+    if (s && s.tail !== creds.key) { bnUdsClose(slot); s = null; }
+    if (!s) {
+      s = bnUdsSessions[slot] = {
+        tail: creds.key, closed: false, route: route,
+        spot: bnUdsScope('spot'), fut: bnUdsScope('fut'),
+      };
+      s.spot._pk = slot + '|spot';
+      s.fut._pk = slot + '|fut';
+    }
+    s.route = route;   // latest route pick wins for the next (re)dial
+    if (!s.spot.running) bnUdsLoop(slot, s, creds, 'spot');
+    if (!s.fut.running) bnUdsLoop(slot, s, creds, 'fut');
+    return s;
+  }
+  function bnUdsLoop(slot, s, creds, which) {
+    const S = which === 'fut' ? s.fut : s.spot;
+    S.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (bnUdsSessions[slot] === s && !s.closed) {
+        const t0 = Date.now();
+        try {
+          if (which === 'fut') await bnUdsFutConn(slot, s, creds);
+          else await bnUdsSpotConn(slot, s, creds);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          S.err = 'Binance ' + which + ' stream: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'bn_uds_err', { w: which, m: String(S.err).slice(0, 120) });
+        }
+        S.up = false; S.ws = null;
+        if (s.closed || bnUdsSessions[slot] !== s) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      S.running = false;
+    })().catch(() => { S.running = false; });
+  }
+  function bnUdsSpotConn(slot, s, creds) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(BN_SPOT_WSAPI_URL, s.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const S = s.spot;
+      S.ws = ws;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        S.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      ws.on('open', async () => {
+        try {
+          // fresh signed subscribe frame each (re)connect — venue clock,
+          // never raw Date.now() (-1021 discipline)
+          const offMs = await ensureVenueTime('binance', 'spot', s.route);
+          ws.send(JSON.stringify(bnSpotSubscribeFrame(
+            creds.key, creds.secret, Number(venueStampMs(offMs)))));
+        } catch (e) { done(e); }
+      });
+      ws.on('ping', () => { S.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        S.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        if (msg && msg.id != null && msg.status != null) {
+          // subscribe ack — status!=200 is a hard, visible failure
+          if (Number(msg.status) === 200) {
+            S.up = true; S.err = null;
+            tdiag('acct', 'bn_uds_up', { w: 'spot' });
+          } else {
+            done(new Error('spot subscribe failed: ' +
+              String(((msg.error || {}).msg) || msg.status).slice(0, 120)));
+          }
+          return;
+        }
+        const ev = bnWsEvent(msg);
+        if (!ev) return;
+        try { bnSpotEvApply(S, ev, done); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function bnSpotEvApply(B, ev, done) {
+    const t = String(ev.e || '');
+    if (t === 'eventStreamTerminated') { done(new Error('stream terminated')); return; }
+    if (t === 'outboundAccountPosition' || t === 'balanceUpdate') {
+      krLseq(B); bnPushSc(B, 'bal');
+      return;
+    }
+    if (t !== 'executionReport') return;
+    if (String(ev.x) === 'TRADE' && Number(ev.l) > 0) {
+      const fid = bnFillIngest(B.fills, 's', ev.t);
+      if (fid) {
+        const row = Object.assign({ _fid: fid }, ev);
+        B.fills.rows.push(row);
+        if (B.fills.rows.length > BN_UDS_FILLS_CAP) {
+          B.fills.rows.splice(0, B.fills.rows.length - BN_UDS_FILLS_CAP);
+        }
+        krLseq(B); bnPushSc(B, 'fill', fid, ev);
+      }
+    }
+    const oid = String(ev.i != null ? ev.i : '');
+    const eff = bnOrdEffect(ev.X);
+    if (!oid || !eff) return;
+    if (eff === 'add') {
+      B.orders[oid] = ev;
+      krLseq(B); bnPushSc(B, 'order', null, ev);
+    } else {
+      if (B.orders[oid]) delete B.orders[oid];
+      krLseq(B); bnPushSc(B, 'ordgone', oid);
+    }
+  }
+  async function bnListenKey(creds, route, method) {
+    // API-key header only — unsigned by design (Binance listenKey REST)
+    let r;
+    try {
+      r = await httpJson(BINANCE_FUT_HOST, method || 'POST', '/fapi/v1/listenKey',
+                         '', null, { 'X-MBX-APIKEY': creds.key }, route);
+    } catch (e) { return { ok: false, message: (e && e.message) || 'transport error' }; }
+    let data = null;
+    try { data = JSON.parse(r.text); } catch (e) { /* PUT returns {} */ }
+    if (r.status >= 400) {
+      return { ok: false, message: 'HTTP ' + r.status + ' ' +
+               String((data && data.msg) || '').slice(0, 100) };
+    }
+    return { ok: true, key: String((data && data.listenKey) || '') };
+  }
+  async function bnUdsFutConn(slot, s, creds) {
+    const lk = await bnListenKey(creds, s.route, 'POST');
+    if (!lk.ok || !lk.key) throw new Error('listenKey: ' + (lk.message || 'empty'));
+    return new Promise((resolve, reject) => {
+      // routed /private/ws path — the plain /ws/<lk> connects but pushes
+      // nothing (same fact the server engine path learned 2026-04-23)
+      const ws = krWsDial(BN_FUT_WS_BASE + lk.key, s.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const F = s.fut;
+      F.ws = ws;
+      let settled = false;
+      // keepalive PUT every 30 min (60 min expiry) — a failed keepalive
+      // tears the conn down for a clean redial with a fresh key; interval
+      // pacing keeps REST churn at 2 calls/hour (rate-limit friendly).
+      const kaT = setInterval(async () => {
+        try {
+          const ka = await bnListenKey(creds, s.route, 'PUT');
+          if (!ka.ok) done(new Error('listenKey keepalive: ' + (ka.message || 'failed')));
+        } catch (e) { /* transient — next tick retries */ }
+      }, BN_LK_KEEPALIVE_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        F.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      ws.on('open', () => {
+        F.up = true; F.err = null; F.lastMsg = Date.now();
+        tdiag('acct', 'bn_uds_up', { w: 'fut' });
+      });
+      ws.on('ping', () => { F.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        F.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const ev = bnWsEvent(msg);
+        if (!ev) return;
+        try { bnFutEvApply(F, ev, done); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function bnFutEvApply(B, ev, done) {
+    const t = String(ev.e || '');
+    if (t === 'listenKeyExpired') { done(new Error('listenKey expired')); return; }
+    if (t === 'ACCOUNT_UPDATE') {
+      krLseq(B); bnPushSc(B, 'pos');
+      krLseq(B); bnPushSc(B, 'bal');
+      return;
+    }
+    if (t !== 'ORDER_TRADE_UPDATE') return;
+    const o = ev.o || {};
+    if (String(o.x) === 'TRADE' && Number(o.l) > 0) {
+      const fid = bnFillIngest(B.fills, 'f', o.t);
+      if (fid) {
+        // stamp the event ts on the o payload (engine normalizer fallback)
+        const row = Object.assign({ _fid: fid }, o);
+        if (row.T == null && ev.T != null) row.T = ev.T;
+        B.fills.rows.push(row);
+        if (B.fills.rows.length > BN_UDS_FILLS_CAP) {
+          B.fills.rows.splice(0, B.fills.rows.length - BN_UDS_FILLS_CAP);
+        }
+        krLseq(B); bnPushSc(B, 'fill', fid, row);
+      }
+      krLseq(B); bnPushSc(B, 'pos');   // a fill moves the position — refresh
+    }
+    const oid = String(o.i != null ? o.i : '');
+    const eff = bnOrdEffect(o.X);
+    if (!oid || !eff) return;
+    if (eff === 'add') {
+      B.orders[oid] = o;
+      krLseq(B); bnPushSc(B, 'order', null, o);
+    } else {
+      if (B.orders[oid]) delete B.orders[oid];
+      krLseq(B); bnPushSc(B, 'ordgone', oid);
+    }
+  }
+  // Optimistic mutation stamps at the order-send/cancel sites (Kraken
+  // pattern): the WS echo lands ~100ms later, but the local bump makes the
+  // badge/posrow read fire immediately after the REST ack.
+  function bnMutKick(slot, market, kind, oid) {
+    const s = bnUdsSessions[String(slot || 'binance')];
+    if (!s) return;
+    const B = market === 'futures' ? s.fut : s.spot;
+    if (kind === 'ordgone' && oid) {
+      if (B.orders[oid]) delete B.orders[oid];
+      krLseq(B); bnPushSc(B, 'ordgone', String(oid));
+    } else {
+      krLseq(B); bnPushSc(B, 'order');
+    }
   }
 
   // --- Bybit -------------------------------------------------------------------
@@ -7760,6 +8140,8 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'binance');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
+    // #1943: acct reads keep the user-data streams warm (push-driven display)
+    try { bnUdsEnsure(intent.credSlot || 'binance', creds, route); } catch (e) { /* REST-only */ }
     const sa = await bnRequest(creds, 'GET', 'spot', '/api/v3/account',
                                [['omitZeroBalances', 'true']], route);
     if (!sa.ok) return sa;
@@ -9309,6 +9691,19 @@ function createTradeNative(opts) {
           }
         } catch (e) { /* non-fatal */ }
       }
+      // #1943: same one-time kick for Binance user-data streams — the push
+      // channel is live before the first order/read; loops self-maintain.
+      if (venue === 'binance') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'binance') continue;
+            const c = credsGet(k);
+            if (c) { try { bnUdsEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
     } catch (e) { /* non-fatal */ }
   }
 
@@ -9658,6 +10053,16 @@ module.exports = {
   krLagRec,
   krLagPct,
   krLagSnap,
+  // pure — #1943 Binance shell user-data push
+  BN_SPOT_WSAPI_URL,
+  BN_FUT_WS_BASE,
+  BN_LK_KEEPALIVE_MS,
+  BN_UDS_STALE_MS,
+  BN_UDS_FILLS_CAP,
+  bnSpotSubscribeFrame,
+  bnWsEvent,
+  bnOrdEffect,
+  bnFillIngest,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
