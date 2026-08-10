@@ -1012,6 +1012,655 @@ function bnFillIngest(fills, prefix, tradeId) {
   return fid;
 }
 
+// --- #1969 device-local blotter (pure) --------------------------------------
+// Local "Your trades" store for NATIVE-armed venues: the shell keeps a
+// persistent per-scope fills archive on the device and the panel renders the
+// blotter from it — the server participates in NOTHING during trading.
+// The functions below are PURE twins of the engine's normalizers
+// (norm_kr_ws_spot_trade / norm_kr_ws_fut_fill / norm_bn_fut_fill /
+// norm_bn_spot_fill) and of reconstruct_trades — parity is test-guarded
+// (tests/test_local_blotter.py golden sets). Same schema, same exec-id
+// space, so an explicit "Save to server" ingests without duplicate legs.
+function lbNum(v) {
+  // bn_num twin: venue decimal string → trimmed decimal string; null when
+  // unparseable. Lexical trim (no float round-trip) for plain decimals.
+  if (v == null) return null;
+  let s = String(v).trim();
+  if (!/^[+-]?(\d+)(\.\d+)?([eE][+-]?\d+)?$/.test(s)) return null;
+  if (/[eE]/.test(s)) {
+    const n = Number(s);
+    if (!Number.isFinite(n)) return null;
+    return lbFmt(n);
+  }
+  let neg = false;
+  if (s[0] === '+') s = s.slice(1);
+  if (s[0] === '-') { neg = true; s = s.slice(1); }
+  if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+  s = s.replace(/^0+(?=\d)/, '');
+  if (s === '' || s === '0') return '0';
+  return (neg ? '-' : '') + s;
+}
+function lbFmt(n) {
+  // _hist_fmt twin for COMPUTED values: ~12 significant digits, trailing
+  // zeros trimmed, '0' for zero/non-finite. Plain notation (no exponent).
+  n = Number(n);
+  if (!Number.isFinite(n) || n === 0) return '0';
+  const mag = Math.floor(Math.log10(Math.abs(n)));
+  const dec = Math.min(20, Math.max(0, 12 - mag));
+  let s = n.toFixed(dec);
+  if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+  return s === '-0' ? '0' : s;
+}
+function lbMoney(n) {
+  // _hist_money twin: money/percent aggregate → 8-dp-rounded number.
+  n = Number(n);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 1e8) / 1e8;
+}
+function lbKrAsset(a) {
+  // kr_asset_norm twin.
+  let s = String(a || '');
+  if (s.length === 4 && (s[0] === 'X' || s[0] === 'Z')) s = s.slice(1);
+  s = s.split('.')[0];
+  return { XBT: 'BTC', XDG: 'DOGE' }[s] || s;
+}
+function lbKrFeeAlt(amt, asset) {
+  // kr_fee_alt_str twin: '0.0000041 BTC'.
+  const a = lbNum(amt) || '0';
+  return (a + ' ' + lbKrAsset(String(asset || '').toUpperCase())).trim();
+}
+function lbIsoMs(v) {
+  // kr_iso_ms twin: ISO timestamp → epoch ms (0 on failure).
+  const t = v ? Date.parse(String(v)) : NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+// One kraken spot WS-v2 executions element (exec_type 'trade') → the
+// reconstruct_trades fill schema. Twin of norm_kr_ws_spot_trade (no
+// fee_map on the device — WS rows carry their own fees list).
+function lbNormKrWsSpot(e) {
+  if (!e || typeof e !== 'object') return null;
+  if (String(e.exec_type || '') !== 'trade') return null;
+  const sym = String(e.symbol || '');
+  const sz = lbNum(e.last_qty);
+  if (!sym || sz == null || !(Number(sz) > 0)) return null;
+  let px = lbNum(e.last_price) || '0';
+  const cost = lbNum(e.cost);
+  if (!(Number(px) > 0) && cost && Number(cost) > 0 && Number(sz) > 0) {
+    px = lbFmt(Number(cost) / Number(sz));
+  }
+  const quote = sym.indexOf('/') >= 0
+    ? lbKrAsset(sym.split('/').pop().toUpperCase()) : '';
+  let fee = 0, alt = null;
+  for (const f of (Array.isArray(e.fees) ? e.fees : [])) {
+    if (!f || typeof f !== 'object') continue;
+    const q = lbNum(f.qty);
+    if (q == null) continue;
+    const asset = lbKrAsset(String(f.asset || '').toUpperCase());
+    if (asset && asset === quote) fee += Number(q);
+    else if (alt === null) alt = lbKrFeeAlt(q, asset);
+  }
+  const out = {
+    venue: 'kraken', market: 'spot', symbol: sym,
+    side: String(e.side || '').toLowerCase(), posSide: '',
+    order_px: '', exec_px: px, qty: sz,
+    value: lbNum(e.cost) || lbFmt(Number(sz) * Number(px)),
+    fee: fee ? lbFmt(fee) : '0', closed_pnl: '0',
+    exec_id: String(e.exec_id || e.trade_id || ''),
+    order_id: String(e.order_id || ''),
+    ts: lbIsoMs(e.timestamp), type: 'Trade',
+  };
+  if (alt) out.fee_alt = alt;
+  return out;
+}
+// One kraken futures ws/v1 fills row → the fill schema. Twin of
+// norm_kr_ws_fut_fill without the Account-Log fee_map join (device-only:
+// fee_paid when the WS carries it, honest '0' otherwise).
+function lbNormKrWsFut(f) {
+  if (!f || typeof f !== 'object') return null;
+  const sym = String(f.instrument || '').toUpperCase();
+  const sz = lbNum(f.qty);
+  if (!sym || sz == null || !(Number(sz) > 0)) return null;
+  const px = lbNum(f.price) || '0';
+  const ts = lbIsoMs(f.time) || (Number(f.time) > 0 ? Number(f.time) : 0);
+  let fee = '0', alt = null;
+  const fp = lbNum(f.fee_paid);
+  if (fp != null && Number(fp) !== 0) {
+    const cur = lbKrAsset(String(f.fee_currency || 'USD').toUpperCase());
+    if (cur === '' || cur === 'USD' || cur === 'USDT' || cur === 'USDC') fee = fp;
+    else alt = lbKrFeeAlt(fp, cur);
+  }
+  const out = {
+    venue: 'kraken', market: 'futures', symbol: sym,
+    side: (f.buy === true || f.buy === 'true' || f.buy === 1) ? 'buy' : 'sell',
+    posSide: '', order_px: '', exec_px: px, qty: sz,
+    value: lbFmt(Number(sz) * Number(px)),
+    fee: fee, closed_pnl: '0',
+    exec_id: String(f.fill_id || ''),
+    order_id: String(f.order_id || ''),
+    ts: ts,
+    type: String(f.fill_type || '').toLowerCase() === 'liquidation'
+      ? 'Liquidation' : 'Trade',
+  };
+  if (alt) out.fee_alt = alt;
+  return out;
+}
+// One Binance futures ORDER_TRADE_UPDATE `o` payload (x==TRADE) → the fill
+// schema. Twin of norm_bn_fut_fill.
+function lbNormBnFut(o, evTs) {
+  if (!o || typeof o !== 'object') return null;
+  const qty = lbNum(o.l) || '0';
+  if (!(Number(qty) > 0)) return null;
+  const sym = String(o.s || '');
+  if (!sym) return null;
+  const px = lbNum(o.L) || '0';
+  const feeAsset = String(o.N || '');
+  const fee = (feeAsset === 'USDT' || feeAsset === 'USDC' || feeAsset === 'BUSD'
+               || feeAsset === 'FDUSD' || feeAsset === '')
+    ? (lbNum(o.n) || '0') : '0';
+  return {
+    venue: 'binance', market: 'futures', symbol: sym,
+    side: String(o.S || '').toUpperCase() === 'BUY' ? 'buy' : 'sell',
+    posSide: '', order_px: lbNum(o.p) || '', exec_px: px, qty: qty,
+    value: lbFmt(Number(px) * Number(qty)),
+    fee: fee, closed_pnl: lbNum(o.rp) || '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(o.T) || Number(evTs) || 0),
+    exec_id: String(o.t != null ? o.t : ''),
+  };
+}
+// One Binance spot executionReport (x==TRADE) → the fill schema. Twin of
+// norm_bn_spot_fill (base-asset fee ×price, quote as-is, BNB → 0).
+function lbNormBnSpot(m) {
+  if (!m || typeof m !== 'object') return null;
+  const qty = lbNum(m.l) || '0';
+  if (!(Number(qty) > 0)) return null;
+  const sym = String(m.s || '');
+  if (!sym) return null;
+  const px = lbNum(m.L) || '0';
+  const feeRaw = lbNum(m.n) || '0';
+  const feeAsset = String(m.N || '');
+  let fee;
+  if (feeAsset && sym.indexOf(feeAsset) === 0 && sym.slice(-feeAsset.length) !== feeAsset) {
+    fee = lbFmt(Number(feeRaw) * Number(px));
+  } else if (feeAsset && sym.slice(-feeAsset.length) === feeAsset) {
+    fee = feeRaw;
+  } else if (!feeAsset) {
+    fee = feeRaw;
+  } else {
+    fee = '0';
+  }
+  const val = lbNum(m.Y) || lbFmt(Number(px) * Number(qty));
+  return {
+    venue: 'binance', market: 'spot', symbol: sym,
+    side: String(m.S || '').toUpperCase() === 'BUY' ? 'buy' : 'sell',
+    posSide: '', order_px: lbNum(m.p) || '', exec_px: px, qty: qty,
+    value: val, fee: fee, closed_pnl: '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(m.T) || Number(m.E) || 0),
+    exec_id: String(m.t != null ? m.t : ''),
+  };
+}
+// Binance REST backfill rows — /fapi/v1/userTrades and /api/v3/myTrades.
+// SAME exec-id space as the WS twins (REST `id` == WS `t` trade id), so
+// the startup backfill dedupes against live-recorded copies to a no-op.
+function lbNormBnFutRest(r) {
+  if (!r || typeof r !== 'object') return null;
+  const qty = lbNum(r.qty) || '0';
+  if (!(Number(qty) > 0)) return null;
+  const sym = String(r.symbol || '');
+  if (!sym) return null;
+  const px = lbNum(r.price) || '0';
+  const feeAsset = String(r.commissionAsset || '');
+  const fee = (feeAsset === 'USDT' || feeAsset === 'USDC' || feeAsset === 'BUSD'
+               || feeAsset === 'FDUSD' || feeAsset === '')
+    ? (lbNum(r.commission) || '0') : '0';
+  return {
+    venue: 'binance', market: 'futures', symbol: sym,
+    side: String(r.side || '').toUpperCase() === 'BUY' ? 'buy' : 'sell',
+    posSide: '', order_px: '', exec_px: px, qty: qty,
+    value: lbNum(r.quoteQty) || lbFmt(Number(px) * Number(qty)),
+    fee: fee, closed_pnl: lbNum(r.realizedPnl) || '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(r.time) || 0),
+    exec_id: String(r.id != null ? r.id : ''),
+  };
+}
+function lbNormBnSpotRest(r) {
+  if (!r || typeof r !== 'object') return null;
+  const qty = lbNum(r.qty) || '0';
+  if (!(Number(qty) > 0)) return null;
+  const sym = String(r.symbol || '');
+  if (!sym) return null;
+  const px = lbNum(r.price) || '0';
+  const feeRaw = lbNum(r.commission) || '0';
+  const feeAsset = String(r.commissionAsset || '');
+  let fee;
+  if (feeAsset && sym.indexOf(feeAsset) === 0 && sym.slice(-feeAsset.length) !== feeAsset) {
+    fee = lbFmt(Number(feeRaw) * Number(px));
+  } else if (feeAsset && sym.slice(-feeAsset.length) === feeAsset) {
+    fee = feeRaw;
+  } else if (!feeAsset) {
+    fee = feeRaw;
+  } else {
+    fee = '0';
+  }
+  return {
+    venue: 'binance', market: 'spot', symbol: sym,
+    side: r.isBuyer === true ? 'buy' : 'sell',
+    posSide: '', order_px: '', exec_px: px, qty: qty,
+    value: lbNum(r.quoteQty) || lbFmt(Number(px) * Number(qty)),
+    fee: fee, closed_pnl: '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(r.time) || 0),
+    exec_id: String(r.id != null ? r.id : ''),
+  };
+}
+// Exactly-once merge key: the fill's market + venue exec id (funding rows
+// have no exec id → ts-keyed like the engine's funding handling).
+function lbFillKey(f) {
+  if (!f) return '';
+  const eid = String(f.exec_id || '');
+  // Side-INCLUSIVE (engine _fill_dedup_key parity): a self-match returns TWO
+  // rows sharing ONE execID (opposite sides) — a side-less key silently
+  // dropped the second leg and the trade stuck OPEN forever.
+  if (eid) return String(f.market || '') + ':' + eid + ':'
+    + String(f.side || '').toLowerCase();
+  return String(f.market || '') + ':t' + String(f.ts || 0) + ':'
+    + String(f.side || '') + ':' + String(f.qty || '');
+}
+// PRE-side-inclusive key ("market:eid") — used ONLY to honor tombstones
+// written by older stores (never for new writes: a legacy key would
+// cross-suppress the sibling leg of a self-match).
+function lbFillKeyLegacy(f) {
+  if (!f) return '';
+  const eid = String(f.exec_id || '');
+  if (eid) return String(f.market || '') + ':' + eid;
+  return lbFillKey(f);
+}
+// Merge normalized fills into a scope store EXACTLY-ONCE: seen-key dedupe,
+// tombstone respect (locally deleted fills stay deleted). Returns added n.
+function lbScopeMerge(sc, fills) {
+  if (!sc || !Array.isArray(fills)) return 0;
+  if (!sc.seen) {
+    sc.seen = {};
+    for (const r of sc.rows) sc.seen[lbFillKey(r)] = 1;
+  }
+  let added = 0;
+  for (const f of fills) {
+    if (!f || !f.symbol || !(Number(f.qty) > 0) || !(Number(f.ts) > 0)) continue;
+    const k = lbFillKey(f);
+    // tombstones: honor BOTH the current side-inclusive key and the legacy
+    // side-less key (older stores' deletes keep suppressing after upgrade)
+    if (!k || sc.seen[k]
+        || (sc.del && (sc.del[k] || sc.del[lbFillKeyLegacy(f)]))) continue;
+    sc.seen[k] = 1;
+    sc.rows.push(f);
+    added++;
+  }
+  if (added) sc.rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return added;
+}
+// Per-market high-water mark (newest locally recorded fill ts) — the
+// startup backfill fetches "everything since here".
+function lbHwm(rows, market) {
+  let hi = 0;
+  for (const r of (rows || [])) {
+    if (market && String(r.market || '') !== market) continue;
+    if (Number(r.ts) > hi) hi = Number(r.ts);
+  }
+  return hi;
+}
+// POSITION-AWARE size prune (the blotter-prune rule: NEVER a bare ts
+// cutoff). When the scope exceeds `cap` rows, compute the cutoff ts that
+// keeps ~cap newest rows, then per (venue|market|symbol|aid) group prune
+// only the longest ts-ordered PREFIX that is entirely older than the
+// cutoff AND ends with the running signed position flat. Funding rows
+// (qty 0 semantics) prune by raw ts. Whole-group-stale groups drop
+// wholesale. Returns the pruned rows array (input order preserved by ts).
+function lbPruneRows(rows, cap) {
+  cap = cap || 20000;
+  if (!Array.isArray(rows) || rows.length <= cap) return rows || [];
+  const sorted = rows.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const cutoff = Number(sorted[sorted.length - cap].ts || 0);
+  const groups = {};
+  for (const r of sorted) {
+    const gk = (r.venue || 'phemex') + '|' + (r.market || '') + '|'
+      + (r.symbol || '') + '|' + String(r.aid || 0);
+    (groups[gk] = groups[gk] || []).push(r);
+  }
+  const keep = [];
+  for (const gk of Object.keys(groups)) {
+    const g = groups[gk];
+    const funding = g.filter((r) => r.kind === 'funding');
+    const trade = g.filter((r) => r.kind !== 'funding');
+    for (const fr of funding) if (Number(fr.ts) >= cutoff) keep.push(fr);
+    if (!trade.length) continue;
+    // NOTE: no whole-group ts shortcut here — a stale group that never
+    // returned to flat is an OPEN position and must survive in full; the
+    // flat-boundary walk below drops fully-flat stale groups by itself.
+    let pos = 0, cut = -1;
+    for (let i = 0; i < trade.length; i++) {
+      const r = trade[i];
+      if (Number(r.ts) >= cutoff) break;
+      const q = Number(r.qty) || 0;
+      pos += (String(r.side) === 'buy') ? q : -q;
+      if (Math.abs(pos) <= 1e-9) cut = i;    // flat boundary inside the stale prefix
+    }
+    for (let i = cut + 1; i < trade.length; i++) keep.push(trade[i]);
+  }
+  keep.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return keep;
+}
+// #1969 Binance startup-backfill pagers — I/O injected via `bnReq(market,
+// path, params)` (markets: 'spot'/'futures' signed, 'spotPub' unsigned big-
+// cap GET) so node tests drive them with a fake requester. Futures:
+// symbol-less GET /fapi/v1/userTrades over ≤7d windows (limit 1000; a full
+// page continues the SAME window from lastRow.time+1). Spot: /api/v3/myTrades
+// REQUIRES a symbol — page per symbol with fromId (>= the local high-water
+// trade id) when known, else one most-recent page. `covOk:false` whenever
+// coverage is knowably incomplete (call-cap hit, overflowing first page,
+// too many symbols) — the panel must NOT suppress server legs on it.
+const LB_BN_MAX_CALLS = 60;
+const LB_BN_FUT_WIN_MS = 7 * 86400 * 1000;
+const LB_BN_SPOT_SYM_CAP = 25;
+const LB_BN_QUOTES = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BTC', 'ETH', 'BNB', 'EUR', 'TRY'];
+// Spot symbol UNIVERSE for backfill: local rows alone miss never-recorded
+// pairs, so derive from the account itself — held assets (spot balances) ×
+// common quotes via exchangeInfo, plus open-order symbols. A failed read
+// returns ok:false — coverage UNKNOWN, caller keeps the server blotter.
+async function lbBnSpotUniverse(bnReq, localSyms) {
+  const syms = {};
+  for (const s of (localSyms || [])) if (s) syms[String(s).toUpperCase()] = 1;
+  const acct = await bnReq('spot', '/api/v3/account', []);
+  if (!acct || !acct.ok) return { ok: false, message: 'Binance spot account read: ' + ((acct && acct.message) || 'failed') };
+  const held = {};
+  for (const b of ((acct.data && acct.data.balances) || [])) {
+    if ((Number(b.free) || 0) + (Number(b.locked) || 0) > 0) held[String(b.asset || '').toUpperCase()] = 1;
+  }
+  const oo = await bnReq('spot', '/api/v3/openOrders', []);
+  if (!oo || !oo.ok) return { ok: false, message: 'Binance spot open-orders read: ' + ((oo && oo.message) || 'failed') };
+  for (const o of (Array.isArray(oo.data) ? oo.data : [])) {
+    if (o && o.symbol) syms[String(o.symbol).toUpperCase()] = 1;
+  }
+  // stables/fiat are never a traded BASE worth enumerating; BTC/ETH/BNB are
+  // quotes too but commonly held as bases — keep them.
+  const LB_BN_STABLES = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'EUR', 'TRY'];
+  const bases = Object.keys(held).filter((a) => LB_BN_STABLES.indexOf(a) < 0);
+  if (bases.length) {
+    const xi = await bnReq('spotPub', '/api/v3/exchangeInfo', []);
+    if (!xi || !xi.ok) return { ok: false, message: 'Binance exchangeInfo: ' + ((xi && xi.message) || 'failed') };
+    for (const s of ((xi.data && xi.data.symbols) || [])) {
+      if (!s || s.status !== 'TRADING') continue;
+      if (held[String(s.baseAsset || '').toUpperCase()]
+          && LB_BN_QUOTES.indexOf(String(s.quoteAsset || '').toUpperCase()) >= 0)
+        syms[String(s.symbol).toUpperCase()] = 1;
+    }
+  }
+  return { ok: true, syms: Object.keys(syms).sort() };
+}
+async function lbBnBackfill(bnReq, futFrm, to, spotSyms, spotFrom, pageGapMs) {
+  const out = { ok: true, fills: [], gap: false, covOk: true, notes: [] };
+  let calls = 0;
+  let t0 = futFrm;
+  while (t0 < to) {
+    if (calls >= LB_BN_MAX_CALLS) { out.gap = true; out.covOk = false; out.notes.push('futures window cap hit'); break; }
+    const t1 = Math.min(t0 + LB_BN_FUT_WIN_MS, to);
+    calls++;
+    const r = await bnReq('futures', '/fapi/v1/userTrades',
+      [['startTime', String(t0)], ['endTime', String(t1)], ['limit', '1000']]);
+    if (!r || !r.ok) return { ok: false, message: 'Binance futures backfill: ' + ((r && r.message) || 'request failed') };
+    const rows = Array.isArray(r.data) ? r.data : [];
+    let lastTs = 0;
+    for (const raw of rows) {
+      const f = lbNormBnFutRest(raw);
+      if (f) { out.fills.push(f); if (f.ts > lastTs) lastTs = f.ts; }
+    }
+    if (rows.length >= 1000 && lastTs > t0) t0 = lastTs + 1;   // full page → continue same window
+    else t0 = t1 + 1;
+    if (t0 < to && pageGapMs) await new Promise((rs) => setTimeout(rs, pageGapMs));
+  }
+  const symList = (spotSyms || []).filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
+  if (symList.length > LB_BN_SPOT_SYM_CAP) {
+    out.gap = true; out.covOk = false;
+    out.notes.push('too many spot pairs (' + symList.length + ' > ' + LB_BN_SPOT_SYM_CAP + ')');
+  }
+  for (const sym of symList.slice(0, LB_BN_SPOT_SYM_CAP)) {
+    let fromId = spotFrom && Number(spotFrom[sym]) > 0 ? Math.floor(Number(spotFrom[sym])) : null;
+    for (;;) {
+      if (calls >= LB_BN_MAX_CALLS) { out.gap = true; out.covOk = false; out.notes.push('spot call cap hit at ' + sym); break; }
+      calls++;
+      const params = [['symbol', String(sym).toUpperCase()], ['limit', '1000']];
+      if (fromId != null) params.push(['fromId', String(fromId)]);
+      const r = await bnReq('spot', '/api/v3/myTrades', params);
+      if (!r || !r.ok) return { ok: false, message: 'Binance spot backfill (' + sym + '): ' + ((r && r.message) || 'request failed') };
+      const rows = Array.isArray(r.data) ? r.data : [];
+      let maxId = fromId != null ? fromId : 0;
+      for (const raw of rows) {
+        const f = lbNormBnSpotRest(raw);
+        if (f) out.fills.push(f);   // keep the WHOLE page — dedupe absorbs overlap
+        const rid = Math.floor(Number(raw && raw.id) || 0);
+        if (rid > maxId) maxId = rid;
+      }
+      if (fromId == null) {
+        // no local watermark for this symbol: one most-recent page only —
+        // a FULL page means history extends past it (coverage incomplete).
+        if (rows.length >= 1000) { out.gap = true; out.covOk = false; out.notes.push('spot ' + sym + ': >1000 trades — older history not fetched'); }
+        break;
+      }
+      if (rows.length < 1000) break;
+      fromId = maxId + 1;
+      if (pageGapMs) await new Promise((rs) => setTimeout(rs, pageGapMs));
+    }
+  }
+  return out;
+}
+// reconstruct_trades twin: normalized fills → OPEN + CLOSED round-trip
+// trade rows in the engine's output schema (id/dir/vol/net/pct/fee/…),
+// plus a local-only `keys` array (contributing fill keys — offline delete
+// sweeps exactly these). Float arithmetic with lbFmt/lbMoney display
+// rounding; golden-set parity vs the engine replay is test-guarded.
+const LB_EPS = 1e-9;
+const LB_SPOT_DUST_USD = 1;
+function lbReconstruct(fills, displayMap) {
+  const groups = {};
+  for (const f of (fills || [])) {
+    let aid = 0;
+    try { aid = parseInt(f.aid, 10) || 0; } catch (e) { aid = 0; }
+    const key = (f.venue || 'phemex') + '\u0000' + (f.market || '') + '\u0000'
+      + (f.symbol || '') + '\u0000' + aid;
+    const g = groups[key] = groups[key]
+      || { venue: f.venue || 'phemex', market: f.market || '', symbol: f.symbol || '', aid: aid, trade: [], funding: [] };
+    (f.kind === 'funding' ? g.funding : g.trade).push(f);
+  }
+  const out = [];
+  for (const key of Object.keys(groups)) {
+    const G = groups[key];
+    const tradeRows = G.trade.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const fundingRows = G.funding.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    let pos = 0, cur = null;
+    const nnew = (dir, ts) => ({
+      venue: G.venue, aid: G.aid, market: G.market, symbol: G.symbol,
+      dir: dir, open_ts: ts, close_ts: ts,
+      open_qty: 0, open_notional: 0, close_qty: 0, close_notional: 0,
+      commission: 0, closed_pnl: 0, fee_alt: {}, fills: [], keys: [],
+    });
+    const add = (tr, row, portion, kind) => {
+      const px = Number(row.exec_px) || 0;
+      const val = px * portion;
+      const rowq = Number(row.qty) || 0;
+      const frac = rowq > 0 ? portion / rowq : 1;
+      const fee = (Number(row.fee) || 0) * frac;
+      tr.commission += fee;
+      if (kind === 'open') { tr.open_qty += portion; tr.open_notional += val; }
+      else {
+        tr.close_qty += portion; tr.close_notional += val;
+        tr.closed_pnl += (Number(row.closed_pnl) || 0) * frac;
+      }
+      tr.close_ts = row.ts != null ? row.ts : tr.close_ts;
+      const entry = {
+        type: kind, side: row.side,
+        price: row.order_px || '', exec_price: row.exec_px || '',
+        qty: lbFmt(portion), value: lbMoney(val), fee: lbMoney(fee),
+        ts: row.ts || 0,
+      };
+      const fa = String(row.fee_alt || '');
+      if (fa) {
+        const parts = fa.split(' ');
+        if (parts.length === 2 && Number.isFinite(Number(parts[0]))) {
+          const amt = Number(parts[0]) * frac;
+          tr.fee_alt[parts[1]] = (tr.fee_alt[parts[1]] || 0) + amt;
+          entry.fee_alt = lbFmt(amt) + ' ' + parts[1];
+        }
+      }
+      tr.fills.push(entry);
+      const k = lbFillKey(row);
+      if (k && tr.keys.indexOf(k) < 0) tr.keys.push(k);
+    };
+    const feeAltOut = (tr) => {
+      const parts = [];
+      for (const c of Object.keys(tr.fee_alt).sort()) {
+        if (tr.fee_alt[c] !== 0) parts.push(lbFmt(tr.fee_alt[c]) + ' ' + c);
+      }
+      if (parts.length) tr.out.fee_alt = parts.join(' + ');
+    };
+    const finalize = (tr) => {
+      let fund = 0;
+      for (const fr of fundingRows) {
+        if (tr.open_ts <= fr.ts && fr.ts <= tr.close_ts) fund += Number(fr.funding) || 0;
+      }
+      const openPx = tr.open_qty > 0 ? tr.open_notional / tr.open_qty : 0;
+      const closePx = tr.close_qty > 0 ? tr.close_notional / tr.close_qty : 0;
+      let net;
+      if (tr.market === 'spot') net = tr.close_notional - tr.open_notional - tr.commission;
+      else {
+        net = tr.closed_pnl - tr.commission - fund;
+        if ((tr.venue === 'bybit' || tr.venue === 'kucoin' || tr.venue === 'bitmex'
+             || tr.venue === 'kraken')
+            && tr.closed_pnl === 0 && tr.close_qty > 0) {
+          const sign = tr.dir === 'long' ? 1 : -1;
+          net = sign * (tr.close_notional - tr.open_notional) - tr.commission - fund;
+        }
+      }
+      let pct = 0;
+      if (openPx > 0 && closePx > 0) {
+        const raw = (closePx - openPx) / openPx * 100;
+        pct = tr.dir === 'long' ? raw : -raw;
+      }
+      let tid = tr.market + ':' + tr.symbol + ':' + tr.open_ts + ':' + tr.close_ts;
+      if (tr.aid) tid = 'a' + tr.aid + ':' + tid;
+      tr.out = {
+        id: tr.venue === 'phemex' ? tid : tr.venue + ':' + tid,
+        venue: tr.venue,
+        ...(tr.aid ? { aid: tr.aid } : {}),
+        market: tr.market, symbol: tr.symbol, display: tr.symbol,
+        dir: tr.dir,
+        vol_base: lbFmt(tr.open_qty), vol_usd: lbMoney(tr.open_notional),
+        open_px: lbFmt(openPx), close_px: lbFmt(closePx),
+        pct: lbMoney(pct), net: lbMoney(net),
+        commission: lbMoney(tr.commission), funding: lbMoney(fund),
+        open_ts: tr.open_ts, close_ts: tr.close_ts,
+        fills: tr.fills, keys: tr.keys,
+      };
+      feeAltOut(tr);
+    };
+    const finalizeOpen = (tr) => {
+      let fund = 0;
+      for (const fr of fundingRows) if (fr.ts >= tr.open_ts) fund += Number(fr.funding) || 0;
+      let remaining = tr.open_qty - tr.close_qty;
+      if (remaining < 0) remaining = 0;
+      const openPx = tr.open_qty > 0 ? tr.open_notional / tr.open_qty : 0;
+      let oid = tr.market + ':' + tr.symbol + ':' + tr.open_ts + ':open';
+      if (tr.aid) oid = 'a' + tr.aid + ':' + oid;
+      tr.out = {
+        id: tr.venue === 'phemex' ? oid : tr.venue + ':' + oid,
+        venue: tr.venue,
+        ...(tr.aid ? { aid: tr.aid } : {}),
+        market: tr.market, symbol: tr.symbol, display: tr.symbol,
+        dir: tr.dir, open: true,
+        vol_base: lbFmt(remaining), vol_usd: lbMoney(openPx * remaining),
+        open_px: lbFmt(openPx), close_px: '',
+        pct: 0, net: 0,
+        commission: lbMoney(tr.commission), funding: lbMoney(fund),
+        open_ts: tr.open_ts, close_ts: null,
+        fills: tr.fills, keys: tr.keys,
+      };
+      feeAltOut(tr);
+    };
+    const dustRemainder = (tr, posAbs) => {
+      if (tr.market !== 'spot') return false;
+      if (tr.close_qty <= 0 || tr.open_qty <= 0) return false;
+      const openPx = tr.open_notional / tr.open_qty;
+      if (openPx <= 0) return false;
+      return posAbs * openPx < LB_SPOT_DUST_USD;
+    };
+    const finalizeDust = (tr) => {
+      const matched = tr.close_qty;
+      const openPx = tr.open_qty > 0 ? tr.open_notional / tr.open_qty : 0;
+      tr.open_qty = matched;
+      tr.open_notional = openPx * matched;
+      finalize(tr);
+    };
+    for (const row of tradeRows) {
+      const q = Number(row.qty) || 0;
+      if (q <= 0) continue;
+      const buy = row.side === 'buy';
+      const signed = buy ? q : -q;
+      if (cur === null) {
+        cur = nnew(buy ? 'long' : 'short', row.ts || 0);
+        add(cur, row, q, 'open');
+        pos = signed;
+        continue;
+      }
+      const reducing = (cur.dir === 'long' && !buy) || (cur.dir === 'short' && buy);
+      if (!reducing) { add(cur, row, q, 'open'); pos += signed; }
+      else {
+        const closing = Math.min(q, Math.abs(pos));
+        add(cur, row, closing, 'close');
+        const remaining = q - closing;
+        pos += buy ? closing : -closing;
+        if (Math.abs(pos) <= LB_EPS) {
+          finalize(cur); out.push(cur.out); cur = null; pos = 0;
+          if (remaining > LB_EPS) {
+            const px = Number(row.exec_px) || 0;
+            if (G.market === 'spot' && px > 0 && remaining * px < LB_SPOT_DUST_USD) continue;
+            cur = nnew(buy ? 'long' : 'short', row.ts || 0);
+            add(cur, row, remaining, 'open');
+            pos = buy ? remaining : -remaining;
+          }
+        } else if (dustRemainder(cur, Math.abs(pos))) {
+          finalizeDust(cur); out.push(cur.out); cur = null; pos = 0;
+        }
+      }
+    }
+    if (cur !== null && Math.abs(pos) > LB_EPS) {
+      if (dustRemainder(cur, Math.abs(pos))) finalizeDust(cur);
+      else finalizeOpen(cur);
+      out.push(cur.out);
+    }
+  }
+  const dm = displayMap || {};
+  for (const tr of out) {
+    const d = dm[(tr.venue || 'phemex') + '|' + tr.market + '|' + tr.symbol]
+      || dm[tr.market + '|' + tr.symbol];
+    if (d) tr.display = d;
+  }
+  out.sort((a, b) => {
+    const ka = a.open ? 0 : 1, kb = b.open ? 0 : 1;
+    if (ka !== kb) return ka - kb;
+    const ta = a.open ? (a.open_ts || 0) : (a.close_ts || 0);
+    const tb = b.open ? (b.open_ts || 0) : (b.close_ts || 0);
+    return tb - ta;
+  });
+  const seen = {};
+  for (const tr of out) {
+    const base = tr.id;
+    const n = seen[base] || 0;
+    if (n) tr.id = base + '#' + n;
+    seen[base] = n + 1;
+  }
+  return out;
+}
+
 // --- Bybit pure builders ----------------------------------------------------
 function bybitSign(secret, tsMs, apiKey, recvWindow, payload) {
   const msg = String(tsMs) + String(apiKey) + String(recvWindow) + String(payload);
@@ -2101,6 +2750,20 @@ function krQtyFloor(qty, step) {
     }
   }
   return decFmt(false, q.digits, q.scale);
+}
+// #1966 pure: /derivatives/api/v3/leveragepreferences envelope → the
+// configured leverage for `symbol` (string) or null when no preference row
+// exists (Kraken default: cross margin at the contract's max — the PANEL
+// resolves that to the spec max, engine #1895 parity).
+function krLevPrefPick(data, symbol) {
+  const sym = String(symbol || '').toUpperCase();
+  for (const p of (((data || {}).leveragePreferences) || [])) {
+    if (String((p || {}).symbol || '').toUpperCase() === sym) {
+      const v = parseFloat((p || {}).maxLeverage);
+      return (isFinite(v) && v > 0) ? String(v) : null;
+    }
+  }
+  return null;
 }
 // Futures /derivatives/api/v3/sendorder param list — kr_fut_order_params
 // parity (stp/take_profit + triggerSignal=mark; stop w/o limitPrice executes
@@ -9172,6 +9835,49 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // #1966 Kraken futures leverage preferences (native device-signed). The
+  // server shares the SAME futures key with this signer — Kraken futures
+  // nonces are strictly increasing PER KEY, so the device's venue-synced
+  // nonce stream ratchets the watermark above the server clock and every
+  // server-signed leverage call 502s (nonceBelowThreshold TOO_SMALL).
+  // GET/PUT /derivatives/api/v3/leveragepreferences via krRequest (krFutSign,
+  // venue-synced nonce, user's proxy route). Old shells fall through to
+  // 'unknown op' — the panel detects that and keeps the server path.
+  async function execKrakenLeverage(intent) {
+    // #1973 field-test diag: every native op logs ONE outcome line (what/
+    // symbol/ok/value/ms, errors verbatim) to the admin diag file.
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'kraken');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '').toUpperCase();
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    if (intent.what === 'set') {
+      const lev = parseInt(intent.leverage, 10);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      const r = await krRequest(creds, 'PUT', 'futures',
+        '/derivatives/api/v3/leveragepreferences',
+        [['symbol', sym], ['maxLeverage', String(lev)]], route);
+      if (!r.ok) return _dgLine(r);
+      return _dgLine({ ok: true, symbol: sym, leverage: String(lev) });
+    }
+    const r = await krRequest(creds, 'GET', 'futures',
+      '/derivatives/api/v3/leveragepreferences', null, route);
+    if (!r.ok) return _dgLine(r);
+    return _dgLine({ ok: true, symbol: sym,
+             leverage: krLevPrefPick(r.data, sym) });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -9510,6 +10216,348 @@ function createTradeNative(opts) {
     return { ok: false, message: 'unknown cat_fetch kind' };
   }
 
+  // ── #1969 device-local blotter (runtime) ─────────────────────────────────
+  // Persistent per-scope (venue#aN cred slot) fills archive on the device:
+  // the panel renders "Your trades" from HERE for native-armed venues and
+  // the server participates in NOTHING during trading. Writes are exactly-
+  // once (lbScopeMerge seen-key dedupe + tombstones), size-bounded with the
+  // POSITION-AWARE prune (lbPruneRows — never a bare ts cutoff), persisted
+  // as JSON in userData (same convention as trade_creds.json; fill rows are
+  // not secrets). All desktop windows read the same truth through the one
+  // main-process store.
+  const LB_ROWS_CAP = 20000;               // per scope, prune is position-aware
+  const LB_SAVE_DEBOUNCE_MS = 1500;
+  const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
+  let _lbStore = null, _lbSaveT = null;
+  function lbLoad() {
+    if (_lbStore) return _lbStore;
+    let d = null;
+    try { d = JSON.parse(fs.readFileSync(lbFile(), 'utf8')); } catch (e) { d = null; }
+    _lbStore = (d && typeof d === 'object' && d.scopes && typeof d.scopes === 'object')
+      ? d : { v: 1, scopes: {} };
+    return _lbStore;
+  }
+  function lbSaveSoon() {
+    if (_lbSaveT) return;
+    _lbSaveT = setTimeout(() => {
+      _lbSaveT = null;
+      lbSaveNow();
+    }, LB_SAVE_DEBOUNCE_MS);
+  }
+  function lbSaveNow() {
+    if (!_lbStore) return true;
+    try {
+      const slim = { v: 1, scopes: {} };
+      for (const k of Object.keys(_lbStore.scopes)) {
+        const sc = _lbStore.scopes[k];
+        slim.scopes[k] = { rows: sc.rows, del: sc.del || {}, bf: sc.bf || null };
+      }
+      fs.writeFileSync(lbFile(), JSON.stringify(slim));
+      return true;
+    } catch (e) { return false; }   // read ops report persistErr — never silent
+  }
+  function lbScope(slot) {
+    const st = lbLoad();
+    let sc = st.scopes[slot];
+    if (!sc) sc = st.scopes[slot] = { rows: [], del: {}, bf: null };
+    if (!Array.isArray(sc.rows)) sc.rows = [];
+    if (!sc.del || typeof sc.del !== 'object') sc.del = {};
+    return sc;
+  }
+  // Drain the live shell fill caches (kraken WS session / binance UDS
+  // session) into the scope store — normalize with the engine-twin
+  // normalizers, merge exactly-once. Cheap and idempotent: called from
+  // every lblot_read/backfill, so panel polling IS the persistence beat.
+  function lbDrain(slot, venue) {
+    const sc = lbScope(slot);
+    const aid = (() => {
+      const sn = tnSlotNorm(slot);
+      const m = sn && sn.slot !== sn.base ? /#a(\d+)$/.exec(sn.slot) : null;
+      return m ? parseInt(m[1], 10) : 0;
+    })();
+    const fills = [];
+    if (venue === 'kraken') {
+      const sess = krWsSessions[slot];
+      if (sess) {
+        for (const r of ((sess.spot.fills && sess.spot.fills.rows) || [])) {
+          const f = lbNormKrWsSpot(r.raw);
+          if (f) fills.push(f);
+        }
+        for (const r of ((sess.fut.fills && sess.fut.fills.rows) || [])) {
+          const f = lbNormKrWsFut(r.raw);
+          if (f) fills.push(f);
+        }
+      }
+    } else if (venue === 'binance') {
+      const sess = bnUdsSessions[slot];
+      if (sess) {
+        for (const r of ((sess.spot.fills && sess.spot.fills.rows) || [])) {
+          const f = lbNormBnSpot(r);
+          if (f) fills.push(f);
+        }
+        for (const r of ((sess.fut.fills && sess.fut.fills.rows) || [])) {
+          const f = lbNormBnFut(r, r.T);
+          if (f) fills.push(f);
+        }
+      }
+    }
+    if (aid) for (const f of fills) f.aid = aid;
+    // #1973 field-test diag: pre-compute which drained rows are NEW (the WS
+    // cache re-serves old rows every drain — `fills.length` alone is not a
+    // batch). Diag-only, skipped when the seen index isn't built yet.
+    let newIds = null;
+    if (diagTap && sc.seen) {
+      newIds = [];
+      for (const f of fills) {
+        const k = lbFillKey(f);
+        if (k && !sc.seen[k] && !(sc.del && (sc.del[k] || sc.del[lbFillKeyLegacy(f)])))
+          newIds.push(String(f.exec_id || k));
+      }
+    }
+    const added = lbScopeMerge(sc, fills);
+    if (added) {
+      // one line per live drain batch that actually merged rows — venue,
+      // source, count, first/last exec id, store total. Never per empty poll.
+      tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'ws-drain', n: added,
+        first: newIds && newIds.length ? newIds[0] : undefined,
+        last: newIds && newIds.length ? newIds[newIds.length - 1] : undefined,
+        total: sc.rows.length });
+      if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+      lbSaveSoon();
+    }
+    return added;
+  }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance'; }
+  async function execLblotRead(intent) {
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    const added = lbDrain(slot, venue);
+    const sc = lbScope(slot);
+    return {
+      ok: true, added: added, count: sc.rows.length,
+      fills: sc.rows,
+      hwm: { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') },
+      bf: sc.bf || null,
+    };
+  }
+  async function execLblotIngest(intent) {
+    // Explicit merge of NORMALIZED fills (server "Import" / panel-supplied
+    // rows). Venue must match; rows are whitelisted before storage.
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    const rowsIn = Array.isArray(intent.fills) ? intent.fills : [];
+    if (rowsIn.length > 60000) return { ok: false, message: 'too many rows' };
+    const fills = [];
+    for (const r of rowsIn) {
+      if (!r || typeof r !== 'object') continue;
+      if (String(r.venue || '') !== venue) continue;
+      const f = {
+        venue: venue,
+        market: String(r.market || ''), symbol: String(r.symbol || ''),
+        side: String(r.side || ''), posSide: String(r.posSide || ''),
+        order_px: String(r.order_px || ''), exec_px: String(r.exec_px || ''),
+        qty: String(r.qty || ''), value: String(r.value || ''),
+        fee: String(r.fee || '0'), closed_pnl: String(r.closed_pnl || '0'),
+        ts: Math.floor(Number(r.ts) || 0), exec_id: String(r.exec_id || ''),
+      };
+      if (r.order_id != null) f.order_id = String(r.order_id);
+      if (r.kind != null) f.kind = String(r.kind);
+      if (r.funding != null) f.funding = String(r.funding);
+      if (r.type != null) f.type = String(r.type);
+      if (r.fee_alt) f.fee_alt = String(r.fee_alt);
+      fills.push(f);
+    }
+    // Rows adopt the SLOT's account id (never a caller-supplied aid): the
+    // scope store is per-account, a mismatched aid would leak rows across
+    // account replays.
+    const slotAid = (() => {
+      const m = /#a(\d+)$/.exec(slot);
+      return m ? parseInt(m[1], 10) : 0;
+    })();
+    if (slotAid) for (const f of fills) f.aid = slotAid;
+    const sc = lbScope(slot);
+    const added = lbScopeMerge(sc, fills);
+    if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+    const saved = lbSaveNow();
+    // #1973: explicit ingest flow (panel Import button / supplied rows)
+    tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'import', recv: rowsIn.length,
+      n: added, dedup: fills.length - added, total: sc.rows.length,
+      persistErr: saved ? undefined : 1 });
+    return { ok: true, added: added, count: sc.rows.length,
+             ...(saved ? {} : { persistErr: true }) };
+  }
+  async function execLblotDelete(intent) {
+    // OFFLINE delete: tombstone + remove locally. Server tombstones
+    // reconcile only at explicit save/import — never automatically.
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    const keys = Array.isArray(intent.keys) ? intent.keys.map(String).slice(0, 5000) : [];
+    if (!keys.length) return { ok: false, message: 'no keys' };
+    const sc = lbScope(slot);
+    const now = Date.now();
+    const set = {};
+    for (const k of keys) { set[k] = 1; sc.del[k] = now; }
+    const before = sc.rows.length;
+    sc.rows = sc.rows.filter((r) => !set[lbFillKey(r)]);
+    sc.seen = null;
+    const saved = lbSaveNow();
+    return { ok: true, removed: before - sc.rows.length,
+             ...(saved ? {} : { persistErr: true }) };
+  }
+  async function execLblotTrades(intent) {
+    // Drain + replay: the local fills → OPEN/CLOSED trade rows via the
+    // engine-twin lbReconstruct (grouping parity test-guarded). One replay
+    // implementation shell-side = every window/pop-out renders the same
+    // truth. `keys` on each row = contributing fill keys (offline delete).
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    const added = lbDrain(slot, venue);
+    const sc = lbScope(slot);
+    let trades;
+    try { trades = lbReconstruct(sc.rows, intent.displayMap || null); }
+    catch (e) { return { ok: false, message: 'replay failed: ' + ((e && e.message) || 'error') }; }
+    return { ok: true, added: added, count: sc.rows.length, trades: trades,
+             hwm: { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') },
+             bf: sc.bf || null };
+  }
+  // Startup/arm gap backfill: "all fills since my newest locally-recorded
+  // fill", per market, straight from the exchange with the device key.
+  // Single-flight; result (incl. an explicit possible-gap flag when the
+  // lookback horizon is exceeded or there is no local watermark) is stamped
+  // on the scope (`bf`) so every window/pop-out can surface it.
+  const LB_BF_OVERLAP_MS = 10 * 60 * 1000;   // re-fetch overlap — dedupe absorbs it
+  const LB_BF_DEFAULT_MS = 7 * 86400 * 1000; // empty store: last 7d + gap note
+  let _lbBfBusy = {};
+  async function execLblotBackfill(intent) {
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    if (_lbBfBusy[slot]) return { ok: false, message: 'backfill already in flight', busy: true };
+    _lbBfBusy[slot] = true;
+    try {
+      const creds = credsGet(slot);
+      if (!creds) {
+        tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, err: 'no device key' });   // #1973
+        return { ok: false, message: 'No API key on this device — provision Native trading first' };
+      }
+      const route = routeNorm(intent.route);
+      lbDrain(slot, venue);
+      const sc = lbScope(slot);
+      const now = Date.now();
+      // #1973 field-test diag: high-water marks the backfill windows anchor on
+      const _dgHwmS = lbHwm(sc.rows.filter((f) => f.market === 'spot'), null);
+      const _dgHwmF = lbHwm(sc.rows.filter((f) => f.market === 'futures'), null);
+      let _dgFetched = 0;   // #1973 rows returned by the venue fetch (pre-dedupe)
+      let gap = false;
+      let covOk = true;
+      const notes = [];
+      // PER-MARKET windows: a recent fill in one market must never shorten
+      // the other market's backfill window (a futures-only store would
+      // silently skip older spot history otherwise).
+      const bfFrm = (market, label) => {
+        const hwm = lbHwm(sc.rows.filter((f) => f.market === market), null);
+        if (!(hwm > 0)) {
+          gap = true;
+          notes.push('no local ' + label + ' history — fetched the last 7 days only');
+          return now - LB_BF_DEFAULT_MS;
+        }
+        let f0 = hwm - LB_BF_OVERLAP_MS;
+        if (f0 < now - HB_MAX_SPAN_MS) {
+          f0 = now - HB_MAX_SPAN_MS + 60000;
+          gap = true;
+          notes.push('local ' + label + ' history older than the venue lookback horizon — a gap is possible');
+        }
+        return f0;
+      };
+      let added = 0;
+      if (venue === 'kraken') {
+        // one venue-wide time-window fetch covers BOTH markets → take the
+        // older of the two per-market windows (full coverage either way).
+        const frm = Math.min(bfFrm('spot', 'spot'), bfFrm('futures', 'futures'));
+        const r = await hbKraken({ credSlot: slot, route: intent.route,
+                                   market: 'both', frm: frm, to: now });
+        if (!r.ok) {
+          sc.bf = { ts: now, ok: false, msg: r.message || 'backfill failed' };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now,
+            err: String(r.message || 'backfill failed') });   // #1973
+          return { ok: false, message: r.message || 'backfill failed' };
+        }
+        const fills = [];
+        for (const e of (r.spot || [])) { const f = lbNormKrWsSpot(e); if (f) fills.push(f); }
+        for (const e of (r.futures || [])) { const f = lbNormKrWsFut(e); if (f) fills.push(f); }
+        _dgFetched = fills.length;   // #1973
+        added = lbScopeMerge(sc, fills);
+      } else {
+        const futFrm = bfFrm('futures', 'futures');
+        // spot watermarks: max numeric exec id per locally-known spot symbol
+        const spotFrom = {};
+        const symSet = {};
+        for (const f of sc.rows) {
+          if (f.market !== 'spot') continue;
+          symSet[f.symbol] = 1;
+          const eid = Math.floor(Number(f.exec_id) || 0);
+          if (eid > (spotFrom[f.symbol] || 0)) spotFrom[f.symbol] = eid;
+        }
+        const extra = Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [];
+        for (const s of extra) if (s) symSet[String(s).toUpperCase()] = 1;
+        const bnReq = (mkt, reqPath, params) => {
+          if (mkt === 'spotPub') {
+            // unsigned public GET, big cap (spot exchangeInfo is multi-MB)
+            return httpJson(bnHost('spot'), 'GET', reqPath, formEnc(params || []),
+                            null, {}, route, 16 * 1024 * 1024)
+              .then((r) => {
+                let d = null;
+                try { d = JSON.parse(r.text); } catch (e) { d = null; }
+                return (r.status < 400 && d) ? { ok: true, data: d }
+                  : { ok: false, message: 'Binance returned HTTP ' + r.status };
+              })
+              .catch((e) => transportFail(e, 'Binance'));
+          }
+          return bnRequest(creds, 'GET', mkt, reqPath, params, route);
+        };
+        // spot symbol UNIVERSE (holdings × quotes + open orders + local rows):
+        // unknown universe = coverage unknown → covOk:false, panel keeps the
+        // server blotter for this slot (best-effort fetch still runs).
+        const uni = await lbBnSpotUniverse(bnReq, Object.keys(symSet));
+        let spotList = Object.keys(symSet);
+        if (uni.ok) spotList = uni.syms;
+        else { covOk = false; gap = true; notes.push('spot coverage unknown — ' + (uni.message || 'account read failed')); }
+        const r = await lbBnBackfill(bnReq, futFrm, now, spotList, spotFrom, HB_PAGE_GAP_MS);
+        if (!r.ok) {
+          sc.bf = { ts: now, ok: false, msg: r.message || 'backfill failed' };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now,
+            err: String(r.message || 'backfill failed') });   // #1973
+          return { ok: false, message: r.message || 'backfill failed' };
+        }
+        if (r.gap) gap = true;
+        if (r.covOk === false) covOk = false;
+        for (const n of r.notes) notes.push(n);
+        _dgFetched = (r.fills || []).length;   // #1973
+        added = lbScopeMerge(sc, r.fills);
+      }
+      if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+      sc.bf = { ts: now, ok: true, added: added, gap: gap, covOk: covOk,
+                note: notes.join('; ') };
+      const saved = lbSaveNow();
+      // #1973 field-test diag: hwm anchors, fetched vs merged (rest deduped),
+      // duration + the explicit gap/coverage verdict and any horizon notes
+      tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 1, ms: Date.now() - now,
+        hwmSpot: _dgHwmS, hwmFut: _dgHwmF, fetched: _dgFetched, merged: added,
+        dedup: _dgFetched - added, gap: gap ? 1 : 0, covOk: covOk ? 1 : 0,
+        note: notes.join('; ') || undefined, total: sc.rows.length,
+        persistErr: saved ? undefined : 1 });
+      return { ok: true, added: added, gap: gap, covOk: covOk, to: now,
+               note: notes.join('; '), count: sc.rows.length,
+               ...(saved ? {} : { persistErr: true }) };
+    } finally { delete _lbBfBusy[slot]; }
+  }
+
   async function execIntent(intent) {
     // Read-only latency probe (op:'ping_rt') — handled BEFORE validation and
     // creds: no keys, no signing, no order. One cheap public GET/POST against
@@ -9532,11 +10580,35 @@ function createTradeNative(opts) {
       if (intent.venue === 'kraken') return await execKrakenFillsSeed(intent);
       return { ok: false, message: 'fills_seed not supported for this venue' };
     }
+    // #1966 Kraken futures leverage GET/PUT (device-signed — see
+    // execKrakenLeverage). Old shells fall through to 'unknown op' and the
+    // panel falls back to the server path (never a dead chip).
+    if (intent && typeof intent === 'object' && intent.op === 'leverage') {
+      if (intent.venue === 'kraken') return await execKrakenLeverage(intent);
+      return { ok: false, message: 'leverage not supported for this venue' };
+    }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
     // raw rows for the panel to POST to /history/reimport. Old shells fall
     // through to 'unknown op'; the panel then offers the server-key path.
     if (intent && typeof intent === 'object' && intent.op === 'history_backfill') {
       return await execHistoryBackfill(intent);
+    }
+    // #1969 device-local blotter ops (kraken/binance): read/merge/delete the
+    // persistent local fills store; backfill "since my newest local fill".
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_read') {
+      return await execLblotRead(intent);
+    }
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_trades') {
+      return await execLblotTrades(intent);
+    }
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_ingest') {
+      return await execLblotIngest(intent);
+    }
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_delete') {
+      return await execLblotDelete(intent);
+    }
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_backfill') {
+      return await execLblotBackfill(intent);
     }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
@@ -9988,6 +11060,7 @@ module.exports = {
   krSpotSign,
   krFutSign,
   krFutSignPath,
+  krLevPrefPick,
   krClOrdId,
   krDecStep,
   krQtyFloor,
@@ -10114,6 +11187,24 @@ module.exports = {
   bnWsEvent,
   bnOrdEffect,
   bnFillIngest,
+  // pure — #1969 device-local blotter
+  lbNum,
+  lbFmt,
+  lbMoney,
+  lbKrAsset,
+  lbKrFeeAlt,
+  lbIsoMs,
+  lbNormKrWsSpot,
+  lbNormKrWsFut,
+  lbNormBnFut,
+  lbNormBnSpot,
+  lbNormBnFutRest,
+  lbNormBnSpotRest,
+  lbFillKey,
+  lbScopeMerge,
+  lbHwm,
+  lbPruneRows,
+  lbReconstruct,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
