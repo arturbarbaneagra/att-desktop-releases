@@ -1387,7 +1387,10 @@ async function lbBnSpotUniverse(bnReq, localSyms) {
   const LB_BN_STABLES = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'EUR', 'TRY'];
   const bases = Object.keys(held).filter((a) => LB_BN_STABLES.indexOf(a) < 0);
   if (bases.length) {
-    const xi = await bnReq('spotPub', '/api/v3/exchangeInfo', []);
+    // #1977: unfiltered exchangeInfo grew past 16MB (permission sets are
+    // ~90% of the body) — showPermissionSets=false shrinks it ~10×.
+    const xi = await bnReq('spotPub', '/api/v3/exchangeInfo',
+                           [['showPermissionSets', 'false']]);
     if (!xi || !xi.ok) return { ok: false, message: 'Binance exchangeInfo: ' + ((xi && xi.message) || 'failed') };
     for (const s of ((xi.data && xi.data.symbols) || [])) {
       if (!s || s.status !== 'TRADING') continue;
@@ -10534,10 +10537,15 @@ function createTradeNative(opts) {
         for (const s of extra) if (s) symSet[String(s).toUpperCase()] = 1;
         const bnReq = (mkt, reqPath, params) => {
           if (mkt === 'spotPub') {
-            // unsigned public GET, big cap (spot exchangeInfo is multi-MB)
+            // unsigned public GET, big cap (spot exchangeInfo is multi-MB;
+            // #1977: unfiltered it crossed 16MB — request is shrunk at the
+            // caller via showPermissionSets=false, 64MB cap is headroom)
             return httpJson(bnHost('spot'), 'GET', reqPath, formEnc(params || []),
-                            null, {}, route, 16 * 1024 * 1024)
+                            null, {}, route, 64 * 1024 * 1024)
               .then((r) => {
+                // #1977: a body clipped at the cap must fail HONESTLY as
+                // coverage-unknown — never parse into a partial universe.
+                if (r.tr) return { ok: false, message: 'Binance response truncated at byte cap' };
                 let d = null;
                 try { d = JSON.parse(r.text); } catch (e) { d = null; }
                 return (r.status < 400 && d) ? { ok: true, data: d }
