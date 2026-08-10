@@ -4231,6 +4231,10 @@ function createTradeNative(opts) {
     if (String(ev.x) === 'TRADE' && Number(ev.l) > 0) {
       const fid = bnFillIngest(B.fills, 's', ev.t);
       if (fid) {
+        // #1950: the RAW executionReport rides the push (bnPushSc row →
+        // frows) — commission (n) + commissionAsset (N) included, so the
+        // panel's fee-inclusive cost-basis replay and the pending blotter
+        // row carry the fee the same beat. Never slim this row.
         const row = Object.assign({ _fid: fid }, ev);
         B.fills.rows.push(row);
         if (B.fills.rows.length > BN_UDS_FILLS_CAP) {
@@ -4334,7 +4338,9 @@ function createTradeNative(opts) {
     if (String(o.x) === 'TRADE' && Number(o.l) > 0) {
       const fid = bnFillIngest(B.fills, 'f', o.t);
       if (fid) {
-        // stamp the event ts on the o payload (engine normalizer fallback)
+        // stamp the event ts on the o payload (engine normalizer fallback).
+        // #1950: the RAW OTU `o` payload rides the push — commission (n) +
+        // commissionAsset (N) included (fee passthrough). Never slim it.
         const row = Object.assign({ _fid: fid }, o);
         if (row.T == null && ev.T != null) row.T = ev.T;
         B.fills.rows.push(row);
