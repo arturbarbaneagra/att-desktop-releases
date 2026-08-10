@@ -1398,6 +1398,27 @@ async function lbBnSpotUniverse(bnReq, localSyms) {
   }
   return { ok: true, syms: Object.keys(syms).sort() };
 }
+// #1975 Kraken budget-aware backfill retry — a `kr_budget` deferral
+// (skipped:true) at app start just means the startup account-read burst
+// drained the rate-points ledger; wait for it to refill and retry (bounded,
+// exponential backoff). Any OTHER failure — and budget still exhausted past
+// the retry bound — surfaces honestly. I/O injected (hbFn/sleepFn/diagFn)
+// so node tests drive it with fakes.
+const LB_KR_BF_TRIES = 6;
+const LB_KR_BF_WAIT0_MS = 15000;
+const LB_KR_BF_WAIT_MAX_MS = 120000;
+async function lbKrBackfillRetry(hbFn, intent, sleepFn, diagFn) {
+  let waitMs = LB_KR_BF_WAIT0_MS;
+  for (let attempt = 1; ; attempt++) {
+    const r = await hbFn(intent);
+    if (!r) return { ok: false, message: 'backfill failed', bfTries: attempt };
+    if (r.ok || !r.skipped || attempt >= LB_KR_BF_TRIES)
+      return Object.assign({}, r, { bfTries: attempt });
+    if (diagFn) diagFn(attempt, waitMs);
+    await sleepFn(waitMs);
+    waitMs = Math.min(waitMs * 2, LB_KR_BF_WAIT_MAX_MS);
+  }
+}
 async function lbBnBackfill(bnReq, futFrm, to, spotSyms, spotFrom, pageGapMs) {
   const out = { ok: true, fills: [], gap: false, covOk: true, notes: [] };
   let calls = 0;
@@ -10478,8 +10499,14 @@ function createTradeNative(opts) {
         // one venue-wide time-window fetch covers BOTH markets → take the
         // older of the two per-market windows (full coverage either way).
         const frm = Math.min(bfFrm('spot', 'spot'), bfFrm('futures', 'futures'));
-        const r = await hbKraken({ credSlot: slot, route: intent.route,
-                                   market: 'both', frm: frm, to: now });
+        // #1975 budget-aware: a kr_budget deferral at startup is "wait and
+        // retry", never a one-shot failure (bounded — honest fail past it).
+        const r = await lbKrBackfillRetry(hbKraken,
+          { credSlot: slot, route: intent.route, market: 'both', frm: frm, to: now },
+          (ms) => new Promise((rs) => setTimeout(rs, ms)),
+          (attempt, waitMs) => tdiag('lblot', 'backfill', { k: slot, v: venue,
+            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }));
+        if (r.bfTries > 1) notes.push('kraken rate budget deferred — ' + r.bfTries + ' attempts');
         if (!r.ok) {
           sc.bf = { ts: now, ok: false, msg: r.message || 'backfill failed' };
           lbSaveSoon();
@@ -10518,7 +10545,12 @@ function createTradeNative(opts) {
               })
               .catch((e) => transportFail(e, 'Binance'));
           }
-          return bnRequest(creds, 'GET', mkt, reqPath, params, route);
+          // #1975 signed backfill GETs (futures userTrades, spot myTrades,
+          // spot account/openOrders) need a big response cap too — a full
+          // 1000-row userTrades page can exceed the 256 KB httpJson default,
+          // which truncates the body and JSON.parse fails ("unreadable
+          // response"). Trading-path requests keep the default cap.
+          return bnRequest(creds, 'GET', mkt, reqPath, params, route, 16 * 1024 * 1024);
         };
         // spot symbol UNIVERSE (holdings × quotes + open orders + local rows):
         // unknown universe = coverage unknown → covOk:false, panel keeps the
