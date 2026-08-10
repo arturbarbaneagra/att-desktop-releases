@@ -124,6 +124,12 @@ let lastCheckTs = 0;
 // not itself fire browser-window-focus, but keep it so a windowing hiccup can
 // never loop us back into the focus handler mid-raise).
 let raisingWindows = false;
+// Whether ANY app window currently holds focus. Used so raiseAppWindows() only
+// runs on a GENUINE app activation (returning from another program) — a focus
+// event fired while the app already had focus (e.g. a click inside the main
+// window that just opened a native confirm() dialog) must NOT raise siblings,
+// or they land on top of the freshly-opened JS dialog and bury it.
+let appHasFocus = false;
 
 // ---------------------------------------------------------------------------
 // Simple JSON settings (window bounds, feature-window layout)
@@ -1575,9 +1581,26 @@ function setupAutoUpdater() {
   // already early-returns while downloading/ready, so an in-flight download is
   // never restarted.
   app.on('browser-window-focus', () => {
-    raiseAppWindows(BrowserWindow.getFocusedWindow());
+    // Only lift the whole layout when the app as a whole regains focus (user
+    // came back from another program). Focus churn WITHIN the app — clicking
+    // around the already-focused window, switching between app windows, or a
+    // native JS dialog handing focus back — must not re-raise siblings: that
+    // buried just-opened confirm()/prompt() dialogs for multi-window users.
+    const wasAppFocused = appHasFocus;
+    appHasFocus = true;
+    if (!wasAppFocused) raiseAppWindows(BrowserWindow.getFocusedWindow());
     if (Date.now() - lastCheckTs < 10 * 60 * 1000) return;
     checkForUpdatesQuiet();
+  });
+
+  // A blur is ambiguous: switching between two app windows fires blur then
+  // focus back-to-back, while leaving the app fires only the blur. Decide on
+  // the next tick — if no app window holds focus by then, the app truly lost
+  // focus and the next browser-window-focus is a genuine activation.
+  app.on('browser-window-blur', () => {
+    setImmediate(() => {
+      if (!BrowserWindow.getFocusedWindow()) appHasFocus = false;
+    });
   });
 }
 

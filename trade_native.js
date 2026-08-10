@@ -2756,6 +2756,20 @@ function krPushMark(P, key, kind, id, row) {
     if (!P[key].orows) P[key].orows = [];
     if (P[key].orows.length < KR_PUSH_FIDS_CAP) P[key].orows.push(row);
   }
+  // #1945: pushed POSITION rows (Binance futures ACCOUNT_UPDATE a.P) and
+  // BALANCE rows (a.B futures / outboundAccountPosition B spot) ride the
+  // event — the panel steps posrow qty/entry/uPnL and wallets on the push
+  // beat instead of waiting out the paced 1-1.5s REST re-read (observed
+  // bn_apply maxMs 1219-1545 vs Kraken's ~1ms). Kind-only marks (no row)
+  // stay byte-identical for Kraken and old panel builds (additive lanes).
+  if (row && typeof row === 'object' && k === 'pos') {
+    if (!P[key].prows) P[key].prows = [];
+    if (P[key].prows.length < KR_PUSH_FIDS_CAP) P[key].prows.push(row);
+  }
+  if (row && typeof row === 'object' && k === 'bal') {
+    if (!P[key].brows) P[key].brows = [];
+    if (P[key].brows.length < KR_PUSH_FIDS_CAP) P[key].brows.push(row);
+  }
   if (id != null && k === 'ordgone') {
     if (!P[key].goids) P[key].goids = [];
     const g = String(id);
@@ -2775,6 +2789,8 @@ function krPushDrain(P, seqOf, nowMs, venue) {
     if (P[key].frows && P[key].frows.length) ev.frows = P[key].frows.slice();   // #1878 posrow seed rows
     if (P[key].goids && P[key].goids.length) ev.goids = P[key].goids.slice();
     if (P[key].orows && P[key].orows.length) ev.orows = P[key].orows.slice();   // #1894 order add/update rows
+    if (P[key].prows && P[key].prows.length) ev.prows = P[key].prows.slice();   // #1945 position rows
+    if (P[key].brows && P[key].brows.length) ev.brows = P[key].brows.slice();   // #1945 balance rows
     out.push(ev);
     delete P[key];
   }
@@ -3700,6 +3716,10 @@ function createTradeNative(opts) {
                                  b: buf.length, tr: buf.length >= cap,
                                  reused: !!req.reusedSocket });
           resolve({ status: res.statusCode, text: buf,
+                    // #1945: truncation surfaced to callers — a body clipped
+                    // at the byte cap must fail EXPLICITLY (catalog parse
+                    // mysteries), never masquerade as a short-but-valid reply.
+                    tr: buf.length >= cap,
                     date: (res.headers && res.headers.date) || null,
                     // #1724: Retry-After surfaced so 429 branches can hand the
                     // acct_read guard an honest venue cool-down hint.
@@ -4198,7 +4218,13 @@ function createTradeNative(opts) {
     const t = String(ev.e || '');
     if (t === 'eventStreamTerminated') { done(new Error('stream terminated')); return; }
     if (t === 'outboundAccountPosition' || t === 'balanceUpdate') {
-      krLseq(B); bnPushSc(B, 'bal');
+      // #1945: outboundAccountPosition carries the changed wallet rows (B:
+      // [{a,f,l}]) — ship them so spot wallets/posrow step on the push beat.
+      // balanceUpdate ({a,d} delta) stays kind-only (no absolute row).
+      const bs = Array.isArray(ev.B) ? ev.B : [];
+      krLseq(B);
+      if (bs.length) { for (const b of bs) bnPushSc(B, 'bal', null, b); }
+      else bnPushSc(B, 'bal');
       return;
     }
     if (t !== 'executionReport') return;
@@ -4289,8 +4315,18 @@ function createTradeNative(opts) {
     const t = String(ev.e || '');
     if (t === 'listenKeyExpired') { done(new Error('listenKey expired')); return; }
     if (t === 'ACCOUNT_UPDATE') {
-      krLseq(B); bnPushSc(B, 'pos');
-      krLseq(B); bnPushSc(B, 'bal');
+      // #1945: ship the actual mutated rows (a.P positions / a.B balances)
+      // so the panel's posrow steps on the push beat — a kind-only flag can
+      // only mark-dirty and wait out the paced REST re-read (1-1.5s).
+      const a = ev.a || {};
+      const ps = Array.isArray(a.P) ? a.P : [];
+      const bs = Array.isArray(a.B) ? a.B : [];
+      krLseq(B);
+      if (ps.length) { for (const p of ps) bnPushSc(B, 'pos', null, p); }
+      else bnPushSc(B, 'pos');
+      krLseq(B);
+      if (bs.length) { for (const b of bs) bnPushSc(B, 'bal', null, b); }
+      else bnPushSc(B, 'bal');
       return;
     }
     if (t !== 'ORDER_TRADE_UPDATE') return;
@@ -9322,7 +9358,11 @@ function createTradeNative(opts) {
   // 8MB cap: full venue catalogs (KuCoin symbols, MEXC exchangeInfo, etc.)
   // routinely exceed httpJson's 256KB default — a truncated body would fail
   // the panel parser (see .agents/memory/shell-httpjson-response-cap.md).
-  const CAT_GET_MAXBYTES = 8 * 1024 * 1024;
+  // #1945: 16MB (spot exchangeInfo with permission sets measured 8.4MB —
+  // just over the old 8MB cap; the truncated JSON failed the panel parser
+  // as a silent "unknown symbol" mystery). Truncation is now ALSO an
+  // explicit {ok:false} below — the cap can never silently clip again.
+  const CAT_GET_MAXBYTES = 16 * 1024 * 1024;
   // Generic PUBLIC catalog/kline bridge (#1715): CORS-open venues' catalog +
   // chart-history fetches move out of the renderer into this main-process
   // intent so EACH request carries its own Proxy/Direct agent (agentFor's
@@ -9356,10 +9396,13 @@ function createTradeNative(opts) {
     }
     const route = routeNorm(intent.route);
     try {
-      // Catalogs can be huge (full product lists) — same 8 MB cap as the
-      // Phemex products fetch; httpJson's default 256 KB would truncate.
+      // Catalogs can be huge (full product lists) — same cap as the generic
+      // cat_fetch GET branch; httpJson's default 256 KB would truncate.
       const r = await httpJson(u.hostname, method, u.pathname, u.search.replace(/^\?/, ''),
-                               body, {}, route, 8 * 1024 * 1024);
+                               body, {}, route, CAT_GET_MAXBYTES);
+      // #1945: a body clipped at the cap is an EXPLICIT failure — the panel
+      // surfaces it in the picker error row instead of a JSON.parse mystery.
+      if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
       return { ok: true, status: r.status | 0, body: r.text || '' };
     } catch (e) {
       const em = (e && e.message) || 'error';
@@ -9399,6 +9442,8 @@ function createTradeNative(opts) {
         const code = (e && e.code) ? String(e.code) + ' ' : '';
         return { ok: false, message: 'catalog fetch failed: ' + code + ((e && e.message) || 'error') };
       }
+      // #1945: truncated-at-cap bodies fail explicitly (never a parse mystery).
+      if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
       // Non-2xx still returns ok:true with the status so the panel can treat
       // the reply like a fetch Response (new Response(text, {status})). The
       // RAW body text goes back untouched — the panel parser owns the shape.
