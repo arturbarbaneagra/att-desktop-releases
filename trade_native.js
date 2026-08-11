@@ -1393,6 +1393,53 @@ function lbScopeMerge(sc, fills) {
   if (added) sc.rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
   return added;
 }
+// #2038 SPOT truncated-history quarantine (local twin of the engine's #1849
+// rule): cash spot can never be net short, so a spot scope whose fill replay
+// goes NEGATIVE provably starts mid-position (the backfill window cut off
+// earlier buys). Left as-is, the phantom offset swallows every later round
+// trip into one stale OPEN group (open_ts weeks old → date filters hide it
+// → "kraken spot never shows"). Fix: per spot scope, when the running signed
+// sum dips below 0, quarantine the prefix up to the FIRST time the sum
+// reaches its minimum — that is the first PROVABLE flat/floor point; the
+// suffix replays from a true zero so round trips close honestly. Scopes that
+// never go negative (no proof of truncation) are returned untouched, so
+// normal long-only histories and deliberate sell-first stores replayed by
+// lbReconstruct stay byte-identical. PURE (node-tested).
+function lbSpotQuar(rows) {
+  const out = { rows: [], quar: [] };
+  if (!Array.isArray(rows) || !rows.length) { out.rows = rows || []; return out; }
+  const EPS = 1e-12;
+  const groups = {};   // spot trade scopes only
+  let anySpot = false;
+  for (const f of rows) {
+    if (String(f && f.market || '') !== 'spot' || (f && f.kind === 'funding')) continue;
+    anySpot = true;
+    let aid = 0;
+    try { aid = parseInt(f.aid, 10) || 0; } catch (e) { aid = 0; }
+    const k = (f.venue || 'phemex') + '\u0000' + (f.symbol || '') + '\u0000' + aid;
+    (groups[k] = groups[k] || []).push(f);
+  }
+  if (!anySpot) { out.rows = rows; return out; }
+  const drop = new Set();   // fill object identity of quarantined rows
+  for (const k of Object.keys(groups)) {
+    const g = groups[k].slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    let run = 0, min = 0, minI = -1;
+    for (let i = 0; i < g.length; i++) {
+      const q = Number(g[i].qty) || 0;
+      run += (String(g[i].side || '').toLowerCase() === 'buy') ? q : -q;
+      if (run < min - EPS) { min = run; minI = i; }
+    }
+    if (!(min < -EPS) || minI < 0) continue;   // never negative → no proof
+    for (let i = 0; i <= minI; i++) drop.add(g[i]);
+    const parts = k.split('\u0000');
+    out.quar.push({ venue: parts[0], market: 'spot', symbol: parts[1],
+                    aid: parseInt(parts[2], 10) || 0,
+                    before: Number(g[minI].ts) || 0, hidden: minI + 1 });
+  }
+  if (!drop.size) { out.rows = rows; return out; }
+  out.rows = rows.filter((f) => !drop.has(f));
+  return out;
+}
 // Per-market high-water mark (newest locally recorded fill ts) — the
 // startup backfill fetches "everything since here".
 function lbHwm(rows, market) {
@@ -10985,10 +11032,19 @@ function createTradeNative(opts) {
     await lbHlWarm(venue, intent.route);
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
-    let trades;
-    try { trades = lbReconstruct(sc.rows, intent.displayMap || null); }
+    let trades, quar;
+    try {
+      // #2038 spot truncated-history quarantine BEFORE the replay: a spot
+      // scope whose sum goes negative provably starts mid-position — the
+      // incomplete prefix hides behind an honest ⚠ marker (engine #1849
+      // parity), never a phantom OPEN group that swallows new round trips.
+      const vis = lbSpotQuar(sc.rows);
+      quar = vis.quar;
+      trades = lbReconstruct(vis.rows, intent.displayMap || null);
+    }
     catch (e) { return { ok: false, message: 'replay failed: ' + ((e && e.message) || 'error') }; }
     return { ok: true, added: added, count: sc.rows.length, trades: trades,
+             quar: quar || [],
              hwm: { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') },
              bf: sc.bf || null };
   }
