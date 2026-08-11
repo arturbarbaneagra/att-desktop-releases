@@ -8047,19 +8047,52 @@ function createTradeNative(opts) {
   }
 
   // --- Hyperliquid (DEX — wallet-signed /exchange actions) --------------------
-  async function hlInfo(body, route) {
-    let r;
-    try {
-      r = await httpJson(HL_HOST, 'POST', '/info', '', JSON.stringify(body), {}, route);
-    } catch (e) { return transportFail(e, 'Hyperliquid'); }
-    if (r.status === 429) return { ok: false, message: 'Rate limited by Hyperliquid — retry shortly' };
-    if (r.status !== 200) return { ok: false, message: 'Hyperliquid returned HTTP ' + r.status };
-    try { return { ok: true, data: JSON.parse(r.text) }; } catch (e) {
-      return { ok: false, message: 'Hyperliquid returned malformed JSON' };
+  // #2008: every shell-side background /info rides the weight-paced budgeter
+  // queue (429 → shared backoff + up to 2 bounded retries); /exchange order
+  // sends bypass the queue and only debit the bucket (see hlExchange).
+  const _hlBudget = hlBudgetMake(1000, Date.now());
+  let _hlBudgetT = null;
+  function _hlBudgetPump() {
+    for (;;) {
+      const r = hlBudgetNext(_hlBudget, Date.now());
+      if (r.item) { try { r.item.res(); } catch (e) {} continue; }
+      if (r.wait >= 0 && !_hlBudgetT)
+        _hlBudgetT = setTimeout(() => { _hlBudgetT = null; _hlBudgetPump(); }, r.wait);
+      return;
     }
+  }
+  function _hlBudgetGate(typ) {
+    return new Promise((res) => {
+      _hlBudget.q[hlInfoTier(String(typ || ''))].push(
+        { w: hlInfoWeight(String(typ || '')), res: res });
+      _hlBudgetPump();
+    });
+  }
+  async function hlInfo(body, route) {
+    for (let a = 0; a < 3; a++) {
+      await _hlBudgetGate(body && body.type);
+      let r;
+      try {
+        r = await httpJson(HL_HOST, 'POST', '/info', '', JSON.stringify(body), {}, route);
+      } catch (e) { return transportFail(e, 'Hyperliquid'); }
+      if (r.status === 429) {
+        hlBudget429(_hlBudget, Date.now(), 0);
+        if (a < 2) continue;
+        return { ok: false, message: 'Rate limited by Hyperliquid — retry shortly' };
+      }
+      hlBudgetOk(_hlBudget);
+      if (r.status !== 200) return { ok: false, message: 'Hyperliquid returned HTTP ' + r.status };
+      try { return { ok: true, data: JSON.parse(r.text) }; } catch (e) {
+        return { ok: false, message: 'Hyperliquid returned malformed JSON' };
+      }
+    }
+    return { ok: false, message: 'Rate limited by Hyperliquid — retry shortly' };
   }
 
   async function hlExchange(creds, action, route) {
+    // #2008: order sends never queue — debit the shared bucket so background
+    // /info pauses while order flow is hot (never the reverse).
+    try { hlBudgetSpend(_hlBudget, 1, Date.now()); _hlBudgetPump(); } catch (e) {}
     const nonce = dexSign.hlNextNonce();
     let sig;
     try { sig = dexSign.hlSignAction(String(creds.secret).trim(), action, nonce); }
@@ -10387,6 +10420,14 @@ function createTradeNative(opts) {
       method = 'POST';
     }
     const route = routeNorm(intent.route);
+    // #2008: the bridge's one allowed POST is an HL /info read — it must ride
+    // the same shared budget as shell hlInfo or panel callers (leverage GET,
+    // pub-reads) escape the pacing entirely.
+    let _hlTyp = '';
+    if (method === 'POST') {
+      try { _hlTyp = String((JSON.parse(body) || {}).type || ''); } catch (e) {}
+      await _hlBudgetGate(_hlTyp);
+    }
     try {
       // Catalogs can be huge (full product lists) — same cap as the generic
       // cat_fetch GET branch; httpJson's default 256 KB would truncate.
@@ -10394,6 +10435,10 @@ function createTradeNative(opts) {
                                body, {}, route, CAT_GET_MAXBYTES);
       // #1945: a body clipped at the cap is an EXPLICIT failure — the panel
       // surfaces it in the picker error row instead of a JSON.parse mystery.
+      if (method === 'POST') {
+        if ((r.status | 0) === 429) hlBudget429(_hlBudget, Date.now(), 0);
+        else if ((r.status | 0) === 200) hlBudgetOk(_hlBudget);
+      }
       if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
       return { ok: true, status: r.status | 0, body: r.text || '' };
     } catch (e) {
@@ -11238,6 +11283,62 @@ function createTradeNative(opts) {
   return { execIntent, credsStatus };   // exposed for shell-internal use/tests
 }
 
+// ── PURE — HL background REST budgeter (#2008) ──────────────────────────────
+// Shell twin of the panel's budgeter: every background /info call rides ONE
+// weight-aware paced queue with priority tiers (0 account > 1 chart seeds >
+// 2 backfill > 3 catalogs) + a shared 429 backoff-and-resume latch. Signed
+// /exchange order sends NEVER queue — they only debit the shared bucket
+// (hlBudgetSpend) so heavy order flow pauses background traffic, never the
+// reverse. 1000 weight/min vs HL's published 1200/min per-IP budget: the
+// head-room absorbs order sends + WS so charts can't starve orders.
+function hlInfoWeight(t) {
+  if (t === 'l2Book' || t === 'allMids' || t === 'clearinghouseState' ||
+      t === 'orderStatus' || t === 'spotClearinghouseState' ||
+      t === 'exchangeStatus') return 2;
+  if (t === 'userRole') return 60;
+  return 20;
+}
+function hlInfoTier(t) {
+  if (t === 'clearinghouseState' || t === 'spotClearinghouseState' ||
+      t === 'frontendOpenOrders' || t === 'activeAssetData' ||
+      t === 'userRole' || t === 'orderStatus' || t === 'openOrders' ||
+      t === 'userFills' || t === 'userFillsByTime' || t === 'historicalOrders')
+    return 0;
+  if (t === 'candleSnapshot') return 1;
+  if (t === 'meta' || t === 'spotMeta' || t === 'perpDexs' ||
+      t === 'metaAndAssetCtxs' || t === 'spotMetaAndAssetCtxs') return 3;
+  return 2;
+}
+function hlBudgetMake(capPerMin, now) {
+  return { cap: capPerMin, tokens: capPerMin, ts: now || 0,
+           q: [[], [], [], []], bkOff: 0, bkN: 0 };
+}
+function hlBudgetRefill(B, now) {
+  const el = now - B.ts;
+  if (el > 0) { B.tokens = Math.min(B.cap, B.tokens + el * (B.cap / 60000)); B.ts = now; }
+}
+function hlBudgetNext(B, now) {
+  hlBudgetRefill(B, now);
+  if (now < (B.bkOff || 0)) return { item: null, wait: B.bkOff - now };
+  for (let t = 0; t < B.q.length; t++) {
+    if (!B.q[t].length) continue;
+    const it = B.q[t][0];
+    if (B.tokens >= it.w) { B.q[t].shift(); B.tokens -= it.w; return { item: it, wait: 0 }; }
+    return { item: null, wait: Math.max(10, Math.ceil((it.w - B.tokens) / (B.cap / 60000))) };
+  }
+  return { item: null, wait: -1 };
+}
+function hlBudget429(B, now, hintMs) {
+  B.bkN = Math.min((B.bkN | 0) + 1, 6);
+  const d = (hintMs > 0) ? hintMs : Math.min(60000, 1000 * Math.pow(2, B.bkN));
+  if (now + d > (B.bkOff || 0)) B.bkOff = now + d;
+}
+function hlBudgetOk(B) { B.bkN = 0; }
+function hlBudgetSpend(B, w, now) {
+  hlBudgetRefill(B, now);
+  B.tokens = Math.max(-B.cap, B.tokens - w);
+}
+
 module.exports = {
   // pure (parity/validation tested under plain node)
   PHEMEX_BASE,
@@ -11530,6 +11631,15 @@ module.exports = {
   acctRlHit,
   acctRlWaitMs,
   acctReadGuard,
+  // pure — #2008 HL background REST budgeter
+  hlInfoWeight,
+  hlInfoTier,
+  hlBudgetMake,
+  hlBudgetRefill,
+  hlBudgetNext,
+  hlBudget429,
+  hlBudgetOk,
+  hlBudgetSpend,
   // runtime
   createTradeNative,
 };
