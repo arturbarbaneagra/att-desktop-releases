@@ -5113,6 +5113,16 @@ function createTradeNative(opts) {
       try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
       tdiag('acct', 'hl_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
+    // #2020 push-beat local-blotter drain: fills land in the local store on
+    // the push flush itself (idempotent — lbDrain dedups by exec_id), so the
+    // panel's push-kicked read serves already-drained rows and the store
+    // stays current even with every window hidden. Fill events only.
+    try {
+      for (const ev of evs) {
+        if (ev && ev.kinds && ev.kinds.indexOf('fill') >= 0)
+          lbDrain(String(ev.slot || 'hyperliquid'), 'hyperliquid');
+      }
+    } catch (e) { /* local store off — panel read drains later */ }
   }
   function hlPushSc(scope, kind, id, row) {
     if (!pushLedgerCb || !scope || !scope._pk) return;
@@ -11484,12 +11494,23 @@ function hlInfoTier(t) {
   return 2;
 }
 function hlBudgetMake(capPerMin, now) {
+  // #2020 burst bucket (bcap/btokens): the main bucket boots FULL, so cold
+  // start / board open could dequeue a 6-9 req/s thundering herd before the
+  // per-minute pacing ever bit (field log: 16× /info 429 in minute 0). The
+  // small secondary bucket caps instantaneous bursts (~6 heavy calls), then
+  // refills at the SAME per-minute rate — steady-state throughput unchanged.
   return { cap: capPerMin, tokens: capPerMin, ts: now || 0,
-           q: [[], [], [], []], bkOff: 0, bkN: 0 };
+           q: [[], [], [], []], bkOff: 0, bkN: 0,
+           bcap: 120, btokens: 120, bts: now || 0 };
 }
 function hlBudgetRefill(B, now) {
   const el = now - B.ts;
   if (el > 0) { B.tokens = Math.min(B.cap, B.tokens + el * (B.cap / 60000)); B.ts = now; }
+  const eb = now - (B.bts || 0);
+  if (eb > 0 && B.bcap > 0) {
+    B.btokens = Math.min(B.bcap, (B.btokens || 0) + eb * (B.cap / 60000));
+    B.bts = now;
+  }
 }
 function hlBudgetNext(B, now) {
   hlBudgetRefill(B, now);
@@ -11497,8 +11518,14 @@ function hlBudgetNext(B, now) {
   for (let t = 0; t < B.q.length; t++) {
     if (!B.q[t].length) continue;
     const it = B.q[t][0];
-    if (B.tokens >= it.w) { B.q[t].shift(); B.tokens -= it.w; return { item: it, wait: 0 }; }
-    return { item: null, wait: Math.max(10, Math.ceil((it.w - B.tokens) / (B.cap / 60000))) };
+    const bok = !(B.bcap > 0) || B.btokens >= it.w;   // burst gate (#2020)
+    if (B.tokens >= it.w && bok) {
+      B.q[t].shift(); B.tokens -= it.w;
+      if (B.bcap > 0) B.btokens -= it.w;
+      return { item: it, wait: 0 };
+    }
+    const have = bok ? B.tokens : Math.min(B.tokens, B.btokens || 0);
+    return { item: null, wait: Math.max(10, Math.ceil((it.w - have) / (B.cap / 60000))) };
   }
   return { item: null, wait: -1 };
 }
@@ -11527,11 +11554,14 @@ function hlBudgetSpend(B, w, now) {
 // gestures jump to the FRONT of the queue (closing risk beats adding).
 // Total retry latency per send is bounded by HL_ALIM_DEADLINE_MS — on
 // expiry the caller gets an honest final `alim` result (toast + optimistic
-// badge rollback), never a 14s silent grind. Twin lives in
-// panel_terminal.js — keep in lockstep.
-const HL_ALIM_MAX_TRIES = 5;
+// badge rollback). Twin lives in panel_terminal.js — keep in lockstep.
+// #2020: 6s gave up too early — the address budget refills continuously and
+// HL's 1/s lane keeps working, so a burst-limited clip that would succeed a
+// few seconds later failed "Rate limited". 20 tries / 20s rides out a deep
+// FIFO queue at 1/s; the final failure stays honest (alim toast + rollback).
+const HL_ALIM_MAX_TRIES = 20;      // covers the full deadline at the 1/s pace
 const HL_ALIM_PACE_MS = 1000;
-const HL_ALIM_DEADLINE_MS = 6000;  // hard bound per gesture, queue wait included
+const HL_ALIM_DEADLINE_MS = 20000; // hard bound per gesture, queue wait included
 const HL_ALIM_POLL_MS = 120;       // head-of-queue re-check while waiting
 function hlAlimHit(status, message) {
   if ((status | 0) === 429) return true;
