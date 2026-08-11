@@ -4289,6 +4289,7 @@ function createTradeNative(opts) {
     if (!credsSaveAll(venues)) return { ok: false, error: 'persist-failed' };
     try { krWsCloseAll(venue); } catch (e) { /* no session */ }
     try { bnUdsClose(venue); } catch (e) { /* no session */ }
+    try { hlPushClose(venue); } catch (e) { /* no session */ }
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
@@ -4297,6 +4298,7 @@ function createTradeNative(opts) {
     credsSaveAll(venues);
     try { if (venue) krWsCloseAll(venue); else for (const k of Object.keys(krWsSessions)) krWsClose(k); } catch (e) { /* no session */ }
     try { if (venue) bnUdsClose(venue); else bnUdsCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) hlPushClose(venue); else hlPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -5057,6 +5059,192 @@ function createTradeNative(opts) {
       krLseq(B); bnPushSc(B, 'ordgone', oid);
     }
   }
+  // --- #2000 Hyperliquid account push lane -----------------------------------
+  // HL's public info WS is ADDRESS-keyed (no signing): userFills + orderUpdates
+  // subscribed for the armed account's MASTER address give a Kraken-style push
+  // channel. Agent creds resolve agent→master via a userRole probe (the creds
+  // key can BE an agent address); probe failure retries on the next redial.
+  // ONE 'acct' scope per slot — HL account events are account-level, so spot,
+  // perp AND HIP-3 builder dexes all ride the same two subscriptions.
+  // Snapshot frames seed the seen-set only (dedup), never push. All traffic
+  // rides the proxy agent like everything else.
+  const HL_WS_URL = 'wss://' + HL_HOST + '/ws';
+  const HL_PUSH_FILLS_CAP = 600;
+  const hlPushSessions = {};
+  const hlPushPend = {};
+  let hlPushTimer = null;
+  function hlPushFlush() {
+    hlPushTimer = null;
+    const evs = krPushDrain(hlPushPend, (key) => {
+      const sess = hlPushSessions[key.slice(0, key.indexOf('|'))];
+      return sess ? sess.acct.lseq : 0;
+    }, Date.now(), 'hyperliquid');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      tdiag('acct', 'hl_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+  }
+  function hlPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(hlPushPend, scope._pk, kind, id, row);
+    if (!hlPushTimer) {
+      hlPushTimer = setTimeout(hlPushFlush, KR_PUSH_COALESCE_MS);
+      if (hlPushTimer && typeof hlPushTimer.unref === 'function') hlPushTimer.unref();
+    }
+  }
+  function hlPushClose(slot) {
+    const sess = hlPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    try { if (sess.acct.ws) sess.acct.ws.terminate(); } catch (e) { /* gone */ }
+    sess.acct.ws = null; sess.acct.up = false;
+    delete hlPushSessions[slot];
+  }
+  function hlPushCloseAll() {
+    for (const k of Object.keys(hlPushSessions)) hlPushClose(k);
+  }
+  async function hlMasterResolve(addr, route) {
+    // agent→master: subscribing for an AGENT address gets NO account events —
+    // the probe is mandatory before the first subscribe (hl-agent-master rule).
+    const r = await hlInfo({ type: 'userRole', user: addr }, route);
+    if (!r.ok || !r.data) throw new Error('userRole probe: ' + (r.message || 'empty'));
+    if (String(r.data.role || '') === 'agent') {
+      const m = String(((r.data || {}).data || {}).user || '');
+      if (!/^0x[0-9a-fA-F]{40}$/.test(m)) throw new Error('agent master address missing');
+      return m;
+    }
+    return addr;
+  }
+  function hlPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key) return null;
+    slot = String(slot || 'hyperliquid');
+    let sess = hlPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { hlPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = hlPushSessions[slot] = {
+        tail: creds.key, closed: false, route: route,
+        acct: { running: false, up: false, ws: null, err: null, lastMsg: 0,
+                lseq: 0, user: null, fills: { rows: [], seen: {} }, _pk: null },
+      };
+      sess.acct._pk = slot + '|acct';
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    if (!sess.acct.running) hlPushLoop(slot, sess, creds);
+    return sess;
+  }
+  function hlPushLoop(slot, sess, creds) {
+    const A = sess.acct;
+    A.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (hlPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          // A.user is a READ/SUBSCRIBE address only (userFills/orderUpdates
+          // are account-level, keyed by the MASTER). Signing identity is
+          // never touched here: hlSignAction derives the signer from the
+          // PRIVATE KEY alone (creds.secret) — an agent key keeps signing
+          // as the agent wallet regardless of what creds.key resolves to.
+          if (!A.user) A.user = await hlMasterResolve(String(creds.key).trim(), sess.route);
+          await hlPushConn(slot, sess);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          A.err = 'Hyperliquid push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'hl_push_err', { m: String(A.err).slice(0, 120) });
+        }
+        A.up = false; A.ws = null;
+        if (sess.closed || hlPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      A.running = false;
+    })().catch(() => { A.running = false; });
+  }
+  function hlPushConn(slot, sess) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(HL_WS_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const A = sess.acct;
+      A.ws = ws;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        A.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // HL idle-closes quiet conns — app-level {method:'ping'} every 30s
+      // keeps it live; a 90s frame gap tears down for a clean redial.
+      const kaT = setInterval(() => {
+        try { ws.send('{"method":"ping"}'); } catch (e) { /* dying */ }
+        if (Date.now() - (A.lastMsg || 0) > 90000) done(new Error('stream stalled'));
+      }, 30000);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      ws.on('open', () => {
+        A.lastMsg = Date.now();
+        try {
+          ws.send(JSON.stringify({ method: 'subscribe',
+            subscription: { type: 'userFills', user: A.user } }));
+          ws.send(JSON.stringify({ method: 'subscribe',
+            subscription: { type: 'orderUpdates', user: A.user } }));
+        } catch (e) { done(e); return; }
+        A.up = true; A.err = null;
+        tdiag('acct', 'hl_push_up', { u: String(A.user).slice(0, 8) });
+      });
+      ws.on('ping', () => { A.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        A.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        try { hlPushEvApply(A, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function hlPushEvApply(A, msg) {
+    const ch = String((msg && msg.channel) || '');
+    if (ch === 'userFills') {
+      const d = (msg && msg.data) || {};
+      const fills = Array.isArray(d.fills) ? d.fills : [];
+      const snap = !!d.isSnapshot;
+      for (const f of fills) {
+        const tid = f && f.tid != null ? String(f.tid) : '';
+        if (!tid || A.fills.seen[tid]) continue;
+        A.fills.seen[tid] = 1;
+        if (snap) continue;   // snapshot seeds dedup ONLY — never pushes
+        // RAW fill row rides the push (coin/px/sz/side/time/fee/feeToken/
+        // closedPnl/dir all included — fee passthrough). Never slim it.
+        A.fills.rows.push(f);
+        if (A.fills.rows.length > HL_PUSH_FILLS_CAP) {
+          A.fills.rows.splice(0, A.fills.rows.length - HL_PUSH_FILLS_CAP);
+        }
+        krLseq(A); hlPushSc(A, 'fill', tid, f);
+        krLseq(A); hlPushSc(A, 'pos');   // a fill moves the position — refresh
+      }
+      return;
+    }
+    if (ch !== 'orderUpdates') return;
+    const rows = Array.isArray(msg && msg.data) ? msg.data : [];
+    for (const u of rows) {
+      const o = (u || {}).order || {};
+      const oid = o.oid != null ? String(o.oid) : '';
+      if (!oid) continue;
+      const st = String((u || {}).status || '');
+      if (st === 'open') {
+        // flattened row (order fields + status) — the panel's tolerant
+        // hlAcctOrderRow reads the WS basic-order shape directly.
+        const row = Object.assign({}, o, { status: st,
+          statusTimestamp: (u || {}).statusTimestamp });
+        krLseq(A); hlPushSc(A, 'order', null, row);
+      } else {
+        krLseq(A); hlPushSc(A, 'ordgone', oid);
+      }
+    }
+  }
+
   // Optimistic mutation stamps at the order-send/cancel sites (Kraken
   // pattern): the WS echo lands ~100ms later, but the local bump makes the
   // badge/posrow read fire immediately after the REST ack.
@@ -9910,6 +10098,66 @@ function createTradeNative(opts) {
              leverage: krLevPrefPick(r.data, sym) });
   }
 
+  // #2000 Hyperliquid per-asset leverage GET/SET — read via activeAssetData
+  // (leverage.type cross/isolated + value), set via the signed updateLeverage
+  // /exchange action. Builder-dex symbols resolve THEIR dex asset id through
+  // hlSpec. Honest failures — the panel surfaces them verbatim.
+  async function execHlLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || ''),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'hyperliquid');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '');
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    const sr = await hlSpec('futures', sym, route);
+    if (!sr.ok) return _dgLine(sr);
+    // reads key the MASTER address (agent creds see an empty account);
+    // a failed probe is a hard error — never silently read the wrong user.
+    // `user` is a READ key ONLY — the updateLeverage SET below signs via
+    // hlExchange(creds, …) whose identity comes from creds.secret alone
+    // (hlSignAction takes no address; agent keys keep their own identity).
+    let user;
+    try { user = await hlMasterResolve(String(creds.key).trim(), route); }
+    catch (e) { return _dgLine({ ok: false, message: (e && e.message) || 'userRole probe failed' }); }
+    if (intent.what === 'set') {
+      const lev = parseInt(intent.leverage, 10);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      // preserve the account's current cross/isolated mode unless the intent
+      // names one — updateLeverage always states isCross explicitly.
+      let isCross;
+      if (intent.marginMode != null && intent.marginMode !== '') {
+        isCross = String(intent.marginMode) !== 'isolated';
+      } else {
+        const ra = await hlInfo({ type: 'activeAssetData', user: user, coin: sr.spec.wire }, route);
+        if (!ra.ok) return _dgLine(ra);
+        isCross = String((((ra.data || {}).leverage) || {}).type || '') !== 'isolated';
+      }
+      const r = await hlExchange(creds, { type: 'updateLeverage',
+        asset: parseInt(sr.spec.asset, 10), isCross: !!isCross, leverage: lev }, route);
+      if (!r.ok) return _dgLine(r);
+      return _dgLine({ ok: true, symbol: sym, leverage: String(lev),
+                       marginMode: isCross ? 'cross' : 'isolated' });
+    }
+    const ra = await hlInfo({ type: 'activeAssetData', user: user, coin: sr.spec.wire }, route);
+    if (!ra.ok) return _dgLine(ra);
+    const lv = ((ra.data || {}).leverage) || {};
+    const mx = Number(((ra.data || {}).maxLeverage != null ? ra.data.maxLeverage : NaN));
+    return _dgLine({ ok: true, symbol: sym,
+             leverage: lv.value != null ? String(lv.value) : null,
+             marginMode: String(lv.type || '') === 'isolated' ? 'isolated' : 'cross',
+             maxLeverage: isFinite(mx) ? mx : undefined });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -10633,6 +10881,7 @@ function createTradeNative(opts) {
     // panel falls back to the server path (never a dead chip).
     if (intent && typeof intent === 'object' && intent.op === 'leverage') {
       if (intent.venue === 'kraken') return await execKrakenLeverage(intent);
+      if (intent.venue === 'hyperliquid') return await execHlLeverage(intent);   // #2000
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -10707,7 +10956,16 @@ function createTradeNative(opts) {
       if (intent.venue === 'kucoin') return await execKucoin(creds, intent, route);
       if (intent.venue === 'bitmex') return await execBitmex(creds, intent, route);
       if (intent.venue === 'mexc') return await execMexc(creds, intent, route);
-      if (intent.venue === 'hyperliquid') return await execHyperliquid(creds, intent, route);
+      if (intent.venue === 'hyperliquid') {
+        const r = await execHyperliquid(creds, intent, route);
+        // #2000: a successful trade ack kicks the HL push lane awake (no-op
+        // while the loop runs) so the fill/order lands push-fast.
+        if (r && r.ok) {
+          try { hlPushEnsure(intent.credSlot || 'hyperliquid', creds, route); }
+          catch (e) { /* REST path */ }
+        }
+        return r;
+      }
       if (intent.venue === 'asterdex') return await execAster(creds, intent, route);
       if (intent.venue === 'arcus') return await execArcus(creds, intent, route);
       if (intent.venue === 'lighter') return await execLighter(creds, intent, route);
@@ -10872,6 +11130,19 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'binance') continue;
             const c = credsGet(k);
             if (c) { try { bnUdsEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2000: same one-time kick for the Hyperliquid account push lane
+      // (address-keyed info WS — userFills + orderUpdates); self-maintains.
+      if (venue === 'hyperliquid') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'hyperliquid') continue;
+            const c = credsGet(k);
+            if (c) { try { hlPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
