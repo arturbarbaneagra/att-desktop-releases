@@ -11474,7 +11474,8 @@ function hlInfoTier(t) {
   if (t === 'clearinghouseState' || t === 'spotClearinghouseState' ||
       t === 'frontendOpenOrders' || t === 'activeAssetData' ||
       t === 'userRole' || t === 'orderStatus' || t === 'openOrders' ||
-      t === 'userFills' || t === 'userFillsByTime' || t === 'historicalOrders')
+      t === 'userFills' || t === 'userFillsByTime' || t === 'historicalOrders' ||
+      t === 'userAbstraction')             // #2017: unified-mode probe (10-min cached)
     return 0;
   if (t === 'candleSnapshot') return 1;
   if (t === 'meta' || t === 'spotMeta' || t === 'perpDexs' ||
