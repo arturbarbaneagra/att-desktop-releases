@@ -767,6 +767,22 @@ function venueClkOffset(serverMs, t0, t1) {
   return Number(serverMs) - (Number(t0) + Number(t1)) / 2;
 }
 
+// #2012 clock-probe 429 backoff (Aster field test: 113 probes, 54× 429 —
+// force=true warm-up bursts kept hammering a rate-limited /time endpoint
+// every ~60s). On a 429 the probe backs off exponentially (≥5 min, capped
+// 60 min) and signed calls REUSE the last known offset — venue clocks drift
+// slowly, a stale offset beats hammering. Any successful probe resets the
+// ladder. Pure (node-tested); no behavior change for venues that never 429.
+const CLK_BO_BASE_MS = 5 * 60 * 1000;
+const CLK_BO_MAX_MS = 60 * 60 * 1000;
+function clkProbe429(st, now) {
+  st.boN = Math.min((st.boN | 0) + 1, 6);
+  st.boUntil = now + Math.min(CLK_BO_MAX_MS, CLK_BO_BASE_MS * Math.pow(2, st.boN - 1));
+  return st.boUntil - now;
+}
+function clkProbeOk(st) { st.boN = 0; st.boUntil = 0; }
+function clkProbeBlocked(st, now) { return now < ((st && st.boUntil) || 0); }
+
 // Offset-corrected timestamp stampers (offset 0 → byte-identical to the old
 // raw Date.now() stamps — Date.now() is already an integer).
 function venueStampMs(offsetMs, nowMs) {
@@ -4472,28 +4488,42 @@ function createTradeNative(opts) {
     if (!key) return 0;
     const spec = VENUE_TIME_PROBES[key];
     const st = venueClk[key] || (venueClk[key] = { offsetMs: 0, ts: 0 });
+    // #2012 single-flight per probe key: warm-up bursts fire force=true for
+    // several signed calls at once — they all share ONE wire probe.
+    if (st.inflight) return st.inflight;
+    // #2012 429 backoff: while backing off, even force=true reuses the last
+    // known offset (venue clocks drift slowly — stale beats hammering).
+    if (clkProbeBlocked(st, Date.now())) return st.offsetMs;
     if (!force && Date.now() - st.ts < TIMESYNC_TTL_MS) return st.offsetMs;
     st.ts = Date.now();                // stamp first — one probe per TTL even on failure
-    try {
-      const t0 = Date.now();
-      const r = await httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
-      const t1 = Date.now();
-      let sv = null;
-      if (spec.dateHeader) {
-        // HTTP Date header (BitMEX — no time endpoint): second resolution,
-        // centered by +500ms.
-        const p = r.date ? Date.parse(r.date) : NaN;
-        if (isFinite(p)) sv = p + 500;
-      } else {
-        sv = spec.ext(JSON.parse(r.text));
+    st.inflight = (async () => {
+      try {
+        const t0 = Date.now();
+        const r = await httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
+        const t1 = Date.now();
+        if ((r.status | 0) === 429) {
+          const boMs = clkProbe429(st, Date.now());
+          tdiag('clk', 'probe-429', { k: key, venue: venue, boMs: boMs, n: st.boN });
+          return st.offsetMs;          // keep last offset through the backoff
+        }
+        let sv = null;
+        if (spec.dateHeader) {
+          // HTTP Date header (BitMEX — no time endpoint): second resolution,
+          // centered by +500ms.
+          const p = r.date ? Date.parse(r.date) : NaN;
+          if (isFinite(p)) sv = p + 500;
+        } else {
+          sv = spec.ext(JSON.parse(r.text));
+        }
+        if (isFinite(sv) && sv > 1e12) { st.offsetMs = venueClkOffset(sv, t0, t1); clkProbeOk(st); }
+        tdiag('clk', 'probe', { k: key, venue: venue, offsetMs: st.offsetMs, ms: t1 - t0 });
+      } catch (e) {
+        tdiag('clk', 'probe-fail', { k: key, venue: venue, msg: (e && e.message) || 'error' });
+        /* keep last offset (0 initially — engine-parity behavior) */
       }
-      if (isFinite(sv) && sv > 1e12) st.offsetMs = venueClkOffset(sv, t0, t1);
-      tdiag('clk', 'probe', { k: key, venue: venue, offsetMs: st.offsetMs, ms: t1 - t0 });
-    } catch (e) {
-      tdiag('clk', 'probe-fail', { k: key, venue: venue, msg: (e && e.message) || 'error' });
-      /* keep last offset (0 initially — engine-parity behavior) */
-    }
-    return st.offsetMs;
+      return st.offsetMs;
+    })();
+    try { return await st.inflight; } finally { st.inflight = null; }
   }
 
   // --- products cache (spot base valueScale) -------------------------------
@@ -8089,7 +8119,7 @@ function createTradeNative(opts) {
     return { ok: false, message: 'Rate limited by Hyperliquid — retry shortly' };
   }
 
-  async function hlExchange(creds, action, route) {
+  async function hlExchangeOnce(creds, action, route) {
     // #2008: order sends never queue — debit the shared bucket so background
     // /info pauses while order flow is hot (never the reverse).
     try { hlBudgetSpend(_hlBudget, 1, Date.now()); _hlBudgetPump(); } catch (e) {}
@@ -8102,14 +8132,56 @@ function createTradeNative(opts) {
     try {
       r = await httpJson(HL_HOST, 'POST', '/exchange', '', JSON.stringify(payload), {}, route);
     } catch (e) { return transportFail(e, 'Hyperliquid'); }
-    if (r.status === 429) return { ok: false, message: 'Rate limited by Hyperliquid — retry shortly' };
+    if (r.status === 429) return { ok: false, alim: true, message: 'Rate limited by Hyperliquid — retry shortly' };
     let data;
     try { data = JSON.parse(r.text); } catch (e) {
       return { ok: false, message: 'Hyperliquid returned HTTP ' + r.status };
     }
     const res = dexSign.hlExchangeResult(data);
-    if (!res.ok) return { ok: false, message: res.message };
+    if (!res.ok) {
+      // in-band per-ADDRESS action-budget reject (HTTP 200) — flagged so the
+      // paced retry lane below re-signs and re-sends at 1/s.
+      if (hlAlimHit(0, res.message)) return { ok: false, alim: true, message: res.message };
+      return { ok: false, message: res.message };
+    }
     return { ok: true, st: res.st };
+  }
+  // #2012 per-ADDRESS rate-limit retry lane: every /exchange action (order/
+  // cancel/modify — they share the address budget) rides one paced 1/s
+  // single-flight lane per creds slot. Each retry re-signs (fresh nonce);
+  // newest gesture wins — superseded waiters drop with `superseded:true` so
+  // the panel rolls their optimistic badges back. `alim:true` on any final
+  // limited result drives the panel's "addr limit — 1/s" chip.
+  const hlAlimLanes = {};
+  async function hlExchange(creds, action, route) {
+    const laneK = String((creds && (creds.key || creds.secret)) || 'hl');
+    const lane = hlAlimLanes[laneK] || (hlAlimLanes[laneK] = hlAlimLane());
+    const mySeq = hlAlimBegin(lane);
+    for (let attempt = 1; ; attempt++) {
+      const r = await hlExchangeOnce(creds, action, route);
+      if (!(r && r.alim)) {
+        if (r && r.ok && lane.limited) { lane.limited = false; tdiag('alim', 'clear', { tries: attempt }); }
+        return r;
+      }
+      lane.limited = true;
+      const nx = hlAlimNext(lane, mySeq, attempt, Date.now(), HL_ALIM_MAX_TRIES);
+      if (!nx.retry) {
+        if (nx.superseded) {
+          tdiag('alim', 'superseded', { attempt: attempt });
+          return { ok: false, alim: true, superseded: true,
+                   message: 'Superseded by a newer order action' };
+        }
+        tdiag('alim', 'give_up', { tries: attempt });
+        return r;
+      }
+      tdiag('alim', 'retry', { attempt: attempt, delayMs: nx.delay });
+      await new Promise((rs) => setTimeout(rs, nx.delay));
+      if (mySeq !== lane.seq) {
+        tdiag('alim', 'superseded', { attempt: attempt });
+        return { ok: false, alim: true, superseded: true,
+                 message: 'Superseded by a newer order action' };
+      }
+    }
   }
 
   // Product-spec cache: main meta + spotMeta parsed once per TTL; HIP-3
@@ -10625,6 +10697,20 @@ function createTradeNative(opts) {
           if (f) fills.push(f);
         }
       }
+    } else if (venue === 'hyperliquid') {
+      // #2012: the push session caches RAW userFills rows (account-level —
+      // spot + main-dex + HIP-3 all ride one stream). Spot wire coins map
+      // via hlProds.wireMap when warm, else pass through raw (engine
+      // parity); the drain is idempotent so a later drain re-normalizes
+      // nothing — rows merged once by exec_id stay merged.
+      const sess = hlPushSessions[slot];
+      if (sess) {
+        const wm = hlProds.wireMap || {};
+        for (const r of ((sess.acct.fills && sess.acct.fills.rows) || [])) {
+          const f = lbNormHlFill(r, wm);
+          if (f) fills.push(f);
+        }
+      }
     }
     if (aid) for (const f of fills) f.aid = aid;
     // #1973 field-test diag: pre-compute which drained rows are NEW (the WS
@@ -10652,11 +10738,19 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid'; }
+  // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
+  // an unmapped '@N' spot coin stores raw this drain and self-heals on the
+  // next one (drain re-normalizes the cached raw rows every poll).
+  async function lbHlWarm(venue, route) {
+    if (venue !== 'hyperliquid') return;
+    try { await hlEnsureProducts(routeNorm(route)); } catch (e) { /* best-effort */ }
+  }
   async function execLblotRead(intent) {
     const venue = String(intent.venue || '');
     if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
     const slot = String(intent.credSlot || venue);
+    await lbHlWarm(venue, intent.route);
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     return {
@@ -10740,6 +10834,7 @@ function createTradeNative(opts) {
     const venue = String(intent.venue || '');
     if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
     const slot = String(intent.credSlot || venue);
+    await lbHlWarm(venue, intent.route);
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     let trades;
@@ -10822,6 +10917,67 @@ function createTradeNative(opts) {
         for (const e of (r.spot || [])) { const f = lbNormKrWsSpot(e); if (f) fills.push(f); }
         for (const e of (r.futures || [])) { const f = lbNormKrWsFut(e); if (f) fills.push(f); }
         _dgFetched = fills.length;   // #1973
+        added = lbScopeMerge(sc, fills);
+      } else if (venue === 'hyperliquid') {
+        // #2012: ONE account-wide userFillsByTime pager covers spot +
+        // main-dex futures + HIP-3 (fills are account-level on HL). The
+        // subscribe/read address is the MASTER (agent keys get no history) —
+        // a failed userRole probe is an honest backfill failure, never a
+        // silent agent-address fetch that returns empty.
+        let addr;
+        try { addr = await hlMasterResolve(String(creds.key).trim(), route); }
+        catch (e) {
+          const msg = 'Hyperliquid master resolve failed: ' + ((e && e.message) || 'error');
+          sc.bf = { ts: now, ok: false, msg: msg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: msg });
+          return { ok: false, message: msg };
+        }
+        // spot symbol map: best-effort — missing map stores wire names
+        // (engine parity) but coverage stays honest via a note.
+        const wmErr = await hlEnsureProducts(route);
+        if (wmErr) notes.push('spot symbol map unavailable — spot fills keep wire names until it loads');
+        const frm = Math.min(bfFrm('spot', 'spot'), bfFrm('futures', 'futures'));
+        // HL caps userFillsByTime at 2000 rows/page — page forward by time,
+        // bounded pages; hitting the bound = explicit possible-gap verdict.
+        const HL_BF_PAGE_CAP = 8;
+        const raw = [];
+        const seen = {};   // exec-id dedupe for boundary-ms overlap pages
+        let cur = Math.max(0, Math.floor(frm));
+        let pages = 0;
+        for (;;) {
+          const rp = await hlInfo({ type: 'userFillsByTime', user: addr,
+                                    startTime: cur, endTime: now,
+                                    aggregateByTime: false }, route);
+          if (!rp.ok) {
+            const msg = rp.message || 'Hyperliquid fills fetch failed';
+            sc.bf = { ts: now, ok: false, msg: msg };
+            lbSaveSoon();
+            tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(msg) });
+            return { ok: false, message: msg };
+          }
+          const rows = Array.isArray(rp.data) ? rp.data : [];
+          const stp = lbHlPageStep(rows, cur, seen, raw);
+          pages++;
+          if (stp.gap) {
+            // a FULL page whose rows all share the start millisecond: paging
+            // by time cannot prove progress — honest possible-gap verdict,
+            // never a silent success (fills past this ms would be skipped).
+            gap = true;
+            notes.push('fill page stalled on one timestamp — a gap is possible');
+          }
+          if (stp.done) break;
+          cur = stp.next;
+          if (pages >= HL_BF_PAGE_CAP) {
+            gap = true;
+            notes.push('fill history page cap reached — a gap is possible');
+            break;
+          }
+        }
+        const fills = [];
+        const wm = hlProds.wireMap || {};
+        for (const f of raw) { const n = lbNormHlFill(f, wm); if (n) fills.push(n); }
+        _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
@@ -11306,7 +11462,8 @@ function hlInfoTier(t) {
     return 0;
   if (t === 'candleSnapshot') return 1;
   if (t === 'meta' || t === 'spotMeta' || t === 'perpDexs' ||
-      t === 'metaAndAssetCtxs' || t === 'spotMetaAndAssetCtxs') return 3;
+      t === 'metaAndAssetCtxs' || t === 'spotMetaAndAssetCtxs' ||
+      t === 'perpDexLimits') return 3;
   return 2;
 }
 function hlBudgetMake(capPerMin, now) {
@@ -11337,6 +11494,90 @@ function hlBudgetOk(B) { B.bkN = 0; }
 function hlBudgetSpend(B, w, now) {
   hlBudgetRefill(B, now);
   B.tokens = Math.max(-B.cap, B.tokens - w);
+}
+
+// ── PURE — HL per-ADDRESS action rate-limit retry lane (#2012) ──────────────
+// HL budgets ACTIONS per address (cumulative 1 action / 1 USDC traded +
+// initial buffer) — tiny scalp clips exhaust it fast and no /info pacing
+// helps. HL always allows 1 action/s even when the address budget is spent,
+// so a limited send auto-retries on a paced 1/s single-flight lane (each
+// retry RE-SIGNS with a fresh nonce — an in-band "Rate limited" status reply
+// is FINAL for that payload). Newest gesture wins: every new exchange call
+// bumps the lane seq, superseded waiters drop with an explicit `superseded`
+// result so the caller's optimistic badges roll back. Twin lives in
+// panel_terminal.js — keep in lockstep.
+const HL_ALIM_MAX_TRIES = 5;    // ~4s of paced retries, then surface the toast
+const HL_ALIM_PACE_MS = 1000;
+function hlAlimHit(status, message) {
+  if ((status | 0) === 429) return true;
+  const m = String(message || '');
+  return /rate limit/i.test(m) || /too many.*(action|request)/i.test(m);
+}
+function hlAlimLane() { return { seq: 0, nextTs: 0, limited: false }; }
+function hlAlimBegin(lane) { return ++lane.seq; }
+// After attempt N (1-based) got an address-limit reject: retry (paced on the
+// shared lane clock), give up, or superseded-by-a-newer-gesture.
+function hlAlimNext(lane, mySeq, attempt, now, maxTries) {
+  if (mySeq !== (lane && lane.seq)) return { retry: false, superseded: true, delay: 0 };
+  if (attempt >= (maxTries || HL_ALIM_MAX_TRIES)) return { retry: false, superseded: false, delay: 0 };
+  const at = Math.max(now, lane.nextTs || 0);
+  lane.nextTs = at + HL_ALIM_PACE_MS;
+  return { retry: true, superseded: false, delay: at - now };
+}
+
+// ── PURE — HL userFills row → local-blotter fill (#2012, engine twin of
+// hl_norm_fill). Spot fee can arrive in the BASE token (feeToken ≠ USDC) →
+// converted ×px so the stored fee is always quote-USD. Spot wire coins
+// ('@107' / 'HYPE/USDC') map via wireMap when known, else pass through
+// raw (engine parity: wire_map.get(coin, coin)).
+// #2012 HL backfill pager step (pure): userFillsByTime caps at 2000
+// rows/page and fills can share a millisecond, so the pager resumes AT the
+// boundary ms (not +1) with exec-id dedupe of the overlap — lossless. A full
+// page whose rows all share the start ms cannot prove progress → honest
+// possible-gap verdict, never a silent success.
+function lbHlPageStep(rows, cur, seen, out) {
+  for (const f of rows) {
+    const eid = String((f && (f.tid != null ? f.tid : f.hash)) || '');
+    if (eid && seen[eid]) continue;
+    if (eid) seen[eid] = 1;
+    out.push(f);
+  }
+  if (rows.length < 2000) return { done: true, gap: false, next: cur };
+  const lastTs = Math.floor(Number(rows[rows.length - 1].time) || 0);
+  if (!(lastTs > cur)) return { done: true, gap: true, next: cur };
+  return { done: false, gap: false, next: lastTs };
+}
+function lbHlCoinIsSpot(coin) {
+  const c = String(coin || '');
+  return c.charAt(0) === '@' || c.indexOf('/') >= 0;
+}
+function lbNormHlFill(f, wireMap) {
+  if (!f || typeof f !== 'object') return null;
+  const px = lbNum(f.px);
+  const qty = lbNum(f.sz);
+  if (!px || !qty || !(Number(px) > 0) || !(Number(qty) > 0)) return null;
+  const coin = String(f.coin || '');
+  if (!coin) return null;
+  const spot = lbHlCoinIsSpot(coin);
+  const sym = spot ? (((wireMap || {})[coin]) || coin) : coin;
+  let fee = Number(lbNum(f.fee) || '0');
+  if (!isFinite(fee)) fee = 0;
+  const feeTok = String(f.feeToken || '');
+  if (feeTok && feeTok !== 'USDC') fee = fee * Number(px);
+  return {
+    venue: 'hyperliquid',
+    market: spot ? 'spot' : 'futures',
+    symbol: sym,
+    side: String(f.side) === 'B' ? 'buy' : 'sell',
+    posSide: '', order_px: '',
+    exec_px: px, qty: qty,
+    value: lbFmt(Number(px) * Number(qty)),
+    fee: fee ? lbFmt(fee) : '0',
+    closed_pnl: lbNum(f.closedPnl) || '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(f.time) || 0),
+    exec_id: String(f.tid != null ? f.tid : (f.hash || '')),
+  };
 }
 
 module.exports = {
@@ -11625,6 +11866,9 @@ module.exports = {
   lbHwm,
   lbPruneRows,
   lbReconstruct,
+  lbHlCoinIsSpot,
+  lbNormHlFill,
+  lbHlPageStep,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
@@ -11640,6 +11884,19 @@ module.exports = {
   hlBudget429,
   hlBudgetOk,
   hlBudgetSpend,
+  // pure — HL per-address action rate-limit retry lane (#2012)
+  HL_ALIM_MAX_TRIES,
+  HL_ALIM_PACE_MS,
+  hlAlimHit,
+  hlAlimLane,
+  hlAlimBegin,
+  hlAlimNext,
+  // pure — clock-probe 429 backoff (#2012)
+  CLK_BO_BASE_MS,
+  CLK_BO_MAX_MS,
+  clkProbe429,
+  clkProbeOk,
+  clkProbeBlocked,
   // runtime
   createTradeNative,
 };
