@@ -699,6 +699,83 @@ const BYBIT_RECV_WINDOW_MS = 5000;
 const ONEWAY_TTL_MS = 600 * 1000;      // Binance position-mode check cache
 const POS_RETRY_DELAY_MS = 400;        // fresh-position REST lag retry
 
+// --- #2026 Binance IP-ban freeze latch (pure) -------------------------------
+// Binance EXTENDS an active IP auto-ban for every request received while
+// banned (observed live: 51 banned requests in one session kept re-arming
+// the ban), so on any 418 — or a 429 that carries a Retry-After / a parsable
+// ban body — the shell latches a per-HOST freeze: ZERO requests leave for
+// that host until the ban expiry (+ a small pad). The 418 body carries
+// "... banned until <epoch-ms> ..."; an unparseable body falls back to a
+// fixed backoff that doubles while 418s continue. Spot (api.binance.com)
+// shares the mechanism — ban semantics are identical. AsterDex is NOT wired
+// in: its observed errors are bare 429s (no body, no Retry-After), already
+// handled by the clock-probe backoff.
+const BN_BAN_HOSTS = {};
+BN_BAN_HOSTS[BINANCE_FUT_HOST] = 1;
+BN_BAN_HOSTS[BINANCE_SPOT_HOST] = 1;
+const BN_BAN_PAD_MS = 3000;                    // past Binance's own expiry stamp
+const BN_BAN_BACKOFF0_MS = 60000;              // unparseable body: fixed backoff…
+const BN_BAN_BACKOFF_MAX_MS = 30 * 60 * 1000;  // …doubling while 418s continue
+
+// "banned until 1786464354696" → epoch ms (only when in the future), else null.
+function bnBanParseUntil(text, nowMs) {
+  const m = /banned\s+until\s+(\d{12,14})/i.exec(String(text || ''));
+  if (!m) return null;
+  const t = Number(m[1]);
+  return (Number.isFinite(t) && t > nowMs) ? t : null;
+}
+
+function bnBanTimeTxt(untilMs) {
+  const d = new Date(untilMs);
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+function bnBanMsgFor(st) {
+  return 'Binance IP banned — requests frozen until ' + bnBanTimeTxt(st.until)
+       + (st.boMs ? ' (backoff — ban expiry unknown)' : '');
+}
+
+// Latch transition on ONE observed response for a Binance host.
+// reg[host] = { until, boMs }. 418 always latches; 429 latches only when it
+// carries a Retry-After hint or a parsable ban body (a plain 429 stays with
+// the existing per-caller rate-limit handling). Any sub-400 status clears
+// the latch (resets the doubling). Returns the active latch entry, or null
+// when cleared / not involved. Pure — the registry object is passed in.
+function bnBanRegNote(reg, host, status, text, raSec, nowMs) {
+  const s = status | 0;
+  const st = reg[host];
+  if (s > 0 && s < 400) { if (st) delete reg[host]; return null; }
+  if (s !== 418 && s !== 429) return (st && st.until > nowMs) ? st : null;
+  const parsed = bnBanParseUntil(text, nowMs);
+  const ra = Number(raSec);
+  let until, boMs = 0;
+  if (parsed) until = parsed + BN_BAN_PAD_MS;
+  else if (Number.isFinite(ra) && ra > 0)
+    until = nowMs + Math.min(ra * 1000, BN_BAN_BACKOFF_MAX_MS) + BN_BAN_PAD_MS;
+  else if (s === 418) {
+    // conservative fixed backoff, doubling while unparseable 418s continue
+    boMs = Math.min(st && st.boMs ? st.boMs * 2 : BN_BAN_BACKOFF0_MS,
+                    BN_BAN_BACKOFF_MAX_MS);
+    until = nowMs + boMs;
+  } else return (st && st.until > nowMs) ? st : null;   // bare 429: not a ban
+  if (st && st.until > until) until = st.until;         // never shorten a ban
+  reg[host] = { until: until, boMs: boMs };
+  return reg[host];
+}
+
+// Freeze gate: the Error to fail a would-be request with while the latch
+// holds, else null. An expired latch is KEPT (not deleted) so the doubling
+// backoff survives across expiries; only a successful response clears it.
+function bnBanGateErr(reg, host, nowMs) {
+  if (!BN_BAN_HOSTS[host]) return null;
+  const st = reg[host];
+  if (!st || st.until <= nowMs) return null;
+  const e = new Error(bnBanMsgFor(st));
+  e.bnBanUntil = st.until;
+  return e;
+}
+
 // --- venue time-probe registry (public time endpoints; pure data) ----------
 // Every HMAC venue signs with "PC clock + offset" where offset comes from a
 // lazy TTL-refreshed probe of that venue's public time endpoint (same
@@ -4388,8 +4465,35 @@ function createTradeNative(opts) {
   // behavior for every existing call); full-catalog GETs (Phemex
   // /public/products is ~2.5 MB and growing) MUST pass a larger cap or the
   // body silently truncates and JSON.parse fails downstream.
+  // #2026 Binance IP-ban freeze registry (host → {until, boMs}) — see the
+  // pure bnBan* helpers. Lives here so EVERY shell request path (time sync,
+  // catalogs, tickers, listenKey keepalive, balance, klines, lblot backfill,
+  // orders) shares one latch per host.
+  const _bnBanReg = {};
+
   function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
+    // #2026: while a Binance ban latch holds for this HOST, no request may
+    // leave — each request during a ban EXTENDS it. Fail fast + fail visible
+    // (order sends surface the ban message immediately, never queue).
+    const banErr = bnBanGateErr(_bnBanReg, host, Date.now());
+    if (banErr) {
+      tdiag('http', 'ban-skip', { k: host, host: host, m: method, p: reqPath,
+                                  until: (_bnBanReg[host] || {}).until });
+      return Promise.reject(banErr);
+    }
+    // #2026: latch transition on every observed Binance-host response —
+    // 418 (and ban-shaped 429) arms/extends the freeze, success clears it.
+    const banNote = (r) => {
+      if (BN_BAN_HOSTS[host]) {
+        const st = bnBanRegNote(_bnBanReg, host, r.status, r.text, r.ra, Date.now());
+        if (st && (r.status === 418 || r.status === 429)) {
+          tdiag('http', 'ban', { k: host, host: host, s: r.status,
+                                 until: st.until, boMs: st.boMs || 0 });
+        }
+      }
+      return r;
+    };
     const attempt = () => new Promise((resolve, reject) => {
       const diagT0 = Date.now();
       // Per-attempt transmit flag: flipped only after the request has fully
@@ -4458,7 +4562,7 @@ function createTradeNative(opts) {
     // body never hit the wire retry for ALL methods (incl. order POSTs — no
     // double-fill risk, nothing reached the venue); post-transmit dead-socket
     // errors keep the strict GET/DELETE-only matrix. See httpRetryAllowed.
-    return attempt().catch((e) => {
+    return attempt().then(banNote, (e) => {
       if (httpRetryAllowed(method, e, !!(e && e.reqSent))) {
         // Stale-socket failure → flush the agent's FREE pool first so the
         // retry is guaranteed a fresh socket (LIFO could otherwise hand it
@@ -4468,7 +4572,7 @@ function createTradeNative(opts) {
           if (ag && ag.agent) evictFreeSockets(ag.agent);
           else if (ag && !ag.refuse) evictFreeSockets(sharedKeepAliveAgent(null, null));
         }
-        return attempt();
+        return attempt().then(banNote);
       }
       throw e;
     });
@@ -4619,6 +4723,10 @@ function createTradeNative(opts) {
 
   function transportFail(e, label) {
     const em = (e && e.message) || 'error';
+    // #2026: a request refused by the Binance ban freeze — fail-visible with
+    // the ban horizon (order attempts fail IMMEDIATELY, never queued).
+    if (e && e.bnBanUntil) return { ok: false, rateLimited: true, banned: true,
+                                    banUntil: e.bnBanUntil, message: em };
     if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable — order NOT sent' };
     if (em === 'timeout') return { ok: false, message: label + ' request timed out' };
     return { ok: false, message: label + ' connection error: ' + em };
@@ -4655,6 +4763,14 @@ function createTradeNative(opts) {
                          { 'X-MBX-APIKEY': creds.key }, route, maxBytes);
     } catch (e) { return transportFail(e, 'Binance'); }
     if (r.status === 429 || r.status === 418) {
+      // #2026: a 418 (or ban-shaped 429) has already armed the per-host
+      // freeze latch inside httpJson — say BANNED, not "retry shortly", and
+      // hand the acct_read guard the true freeze horizon.
+      const bst = _bnBanReg[bnHost(market)];
+      if (bst && bst.until > Date.now()) {
+        return { ok: false, rateLimited: true, banned: true, message: bnBanMsgFor(bst),
+                 code: null, retryInMs: Math.min(bst.until - Date.now(), ACCT_RL_MAX_MS) };
+      }
       // #1724: honor Binance's Retry-After (seconds; 418 = IP ban escalation)
       // as an explicit cool-down hint for the acct_read guard.
       const ras = Number(r.ra);
@@ -4988,6 +5104,12 @@ function createTradeNative(opts) {
       r = await httpJson(BINANCE_FUT_HOST, method || 'POST', '/fapi/v1/listenKey',
                          '', null, { 'X-MBX-APIKEY': creds.key }, route);
     } catch (e) { return { ok: false, message: (e && e.message) || 'transport error' }; }
+    // #2026: 418/429 armed the freeze latch in httpJson — surface the honest
+    // ban message instead of a raw HTTP status line.
+    if (r.status === 418 || r.status === 429) {
+      const bst = _bnBanReg[BINANCE_FUT_HOST];
+      if (bst && bst.until > Date.now()) return { ok: false, message: bnBanMsgFor(bst) };
+    }
     let data = null;
     try { data = JSON.parse(r.text); } catch (e) { /* PUT returns {} */ }
     if (r.status >= 400) {
@@ -11978,6 +12100,16 @@ module.exports = {
   hlAlimDone,
   hlActionUrgent,
   hlAlimNext,
+  // pure — #2026 Binance IP-ban freeze latch
+  BN_BAN_HOSTS,
+  BN_BAN_PAD_MS,
+  BN_BAN_BACKOFF0_MS,
+  BN_BAN_BACKOFF_MAX_MS,
+  bnBanParseUntil,
+  bnBanTimeTxt,
+  bnBanMsgFor,
+  bnBanRegNote,
+  bnBanGateErr,
   // pure — clock-probe 429 backoff (#2012)
   CLK_BO_BASE_MS,
   CLK_BO_MAX_MS,
