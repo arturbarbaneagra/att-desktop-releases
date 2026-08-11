@@ -8103,7 +8103,13 @@ function createTradeNative(opts) {
       await _hlBudgetGate(body && body.type);
       let r;
       try {
-        r = await httpJson(HL_HOST, 'POST', '/info', '', JSON.stringify(body), {}, route);
+        // #2016: hlInfo-wide raised response cap — heavy list types
+        // (userFillsByTime 2000-row pages, historicalOrders, candleSnapshot)
+        // routinely exceed httpJson's 256 KB default; a truncated body made
+        // JSON.parse throw and EVERY backfill page failed as "malformed JSON"
+        // (see shell-httpjson-response-cap). 8 MB = the cat_fetch bridge cap.
+        r = await httpJson(HL_HOST, 'POST', '/info', '', JSON.stringify(body), {}, route,
+                           8 * 1024 * 1024);
       } catch (e) { return transportFail(e, 'Hyperliquid'); }
       if (r.status === 429) {
         hlBudget429(_hlBudget, Date.now(), 0);
@@ -8146,42 +8152,52 @@ function createTradeNative(opts) {
     }
     return { ok: true, st: res.st };
   }
-  // #2012 per-ADDRESS rate-limit retry lane: every /exchange action (order/
-  // cancel/modify — they share the address budget) rides one paced 1/s
-  // single-flight lane per creds slot. Each retry re-signs (fresh nonce);
-  // newest gesture wins — superseded waiters drop with `superseded:true` so
-  // the panel rolls their optimistic badges back. `alim:true` on any final
-  // limited result drives the panel's "addr limit — 1/s" chip.
+  // #2016 per-ADDRESS rate-limit FIFO queue: every /exchange action (order/
+  // cancel/modify — they share the address budget) is its own queue entry on
+  // one paced 1/s lane per creds slot; distinct gestures are NEVER dropped by
+  // newer ones (FIFO, urgent reduce/cancel jumps front). Each retry re-signs
+  // (fresh nonce). Total latency per gesture bounded (~6s) — on expiry the
+  // final result keeps `alim:true` so the panel toasts + rolls back its
+  // optimistic badges. `alimQ` carries the queue depth for the chip.
   const hlAlimLanes = {};
   async function hlExchange(creds, action, route) {
     const laneK = String((creds && (creds.key || creds.secret)) || 'hl');
     const lane = hlAlimLanes[laneK] || (hlAlimLanes[laneK] = hlAlimLane());
-    const mySeq = hlAlimBegin(lane);
-    for (let attempt = 1; ; attempt++) {
-      const r = await hlExchangeOnce(creds, action, route);
-      if (!(r && r.alim)) {
-        if (r && r.ok && lane.limited) { lane.limited = false; tdiag('alim', 'clear', { tries: attempt }); }
-        return r;
-      }
-      lane.limited = true;
-      const nx = hlAlimNext(lane, mySeq, attempt, Date.now(), HL_ALIM_MAX_TRIES);
-      if (!nx.retry) {
-        if (nx.superseded) {
-          tdiag('alim', 'superseded', { attempt: attempt });
-          return { ok: false, alim: true, superseded: true,
-                   message: 'Superseded by a newer order action' };
+    const e = hlAlimBegin(lane, hlActionUrgent(action), Date.now());
+    const myR = e.rseq;
+    let lastR = null;
+    try {
+      for (let attempt = 0; ; ) {
+        // FIFO pace gate: first send goes straight out on an unlimited lane
+        // (zero added latency); once the address is limited — or this gesture
+        // already ate a reject — every send waits for its queue turn.
+        if (lane.limited || attempt > 0) {
+          const nx = hlAlimNext(lane, e, myR, attempt, Date.now(),
+                                HL_ALIM_MAX_TRIES, HL_ALIM_DEADLINE_MS);
+          if (nx.wait) { await new Promise((rs) => setTimeout(rs, nx.wait)); continue; }
+          if (!nx.retry) {
+            if (nx.superseded) {
+              tdiag('alim', 'superseded', { attempt: attempt });
+              return { ok: false, alim: true, superseded: true,
+                       message: 'Superseded by a retry of the same action' };
+            }
+            tdiag('alim', 'give_up', { tries: attempt, ms: Date.now() - e.t0, qd: lane.q.length - 1 });
+            return lastR || { ok: false, alim: true, alimQ: Math.max(0, lane.q.length - 1),
+                              message: 'Hyperliquid address limit — send expired, not placed' };
+          }
+          if (attempt > 0) tdiag('alim', 'retry', { attempt: attempt, delayMs: 0 });
         }
-        tdiag('alim', 'give_up', { tries: attempt });
-        return r;
+        const r = await hlExchangeOnce(creds, action, route);
+        if (!(r && r.alim)) {
+          if (r && r.ok && lane.limited) { lane.limited = false; tdiag('alim', 'clear', { tries: attempt + 1 }); }
+          return r;
+        }
+        lane.limited = true;
+        r.alimQ = Math.max(0, lane.q.length - 1);
+        lastR = r;
+        attempt++;
       }
-      tdiag('alim', 'retry', { attempt: attempt, delayMs: nx.delay });
-      await new Promise((rs) => setTimeout(rs, nx.delay));
-      if (mySeq !== lane.seq) {
-        tdiag('alim', 'superseded', { attempt: attempt });
-        return { ok: false, alim: true, superseded: true,
-                 message: 'Superseded by a newer order action' };
-      }
-    }
+    } finally { hlAlimDone(lane, e); }
   }
 
   // Product-spec cache: main meta + spotMeta parsed once per TTL; HIP-3
@@ -11500,29 +11516,67 @@ function hlBudgetSpend(B, w, now) {
 // HL budgets ACTIONS per address (cumulative 1 action / 1 USDC traded +
 // initial buffer) — tiny scalp clips exhaust it fast and no /info pacing
 // helps. HL always allows 1 action/s even when the address budget is spent,
-// so a limited send auto-retries on a paced 1/s single-flight lane (each
-// retry RE-SIGNS with a fresh nonce — an in-band "Rate limited" status reply
-// is FINAL for that payload). Newest gesture wins: every new exchange call
-// bumps the lane seq, superseded waiters drop with an explicit `superseded`
-// result so the caller's optimistic badges roll back. Twin lives in
+// so a limited send auto-retries on a paced 1/s lane (each retry RE-SIGNS
+// with a fresh nonce — an in-band "Rate limited" status reply is FINAL for
+// that payload). #2016: every distinct user GESTURE is its own FIFO queue
+// entry — a newer gesture NEVER drops an older one (the user scales in/out
+// with rapid same-symbol clicks; every click is an intended order).
+// Supersede survives ONLY inside one gesture's own retry chain (bumping
+// e.rseq collapses that gesture's older waiter). Reduce-only/close/cancel
+// gestures jump to the FRONT of the queue (closing risk beats adding).
+// Total retry latency per send is bounded by HL_ALIM_DEADLINE_MS — on
+// expiry the caller gets an honest final `alim` result (toast + optimistic
+// badge rollback), never a 14s silent grind. Twin lives in
 // panel_terminal.js — keep in lockstep.
-const HL_ALIM_MAX_TRIES = 5;    // ~4s of paced retries, then surface the toast
+const HL_ALIM_MAX_TRIES = 5;
 const HL_ALIM_PACE_MS = 1000;
+const HL_ALIM_DEADLINE_MS = 6000;  // hard bound per gesture, queue wait included
+const HL_ALIM_POLL_MS = 120;       // head-of-queue re-check while waiting
 function hlAlimHit(status, message) {
   if ((status | 0) === 429) return true;
   const m = String(message || '');
   return /rate limit/i.test(m) || /too many.*(action|request)/i.test(m);
 }
-function hlAlimLane() { return { seq: 0, nextTs: 0, limited: false }; }
-function hlAlimBegin(lane) { return ++lane.seq; }
-// After attempt N (1-based) got an address-limit reject: retry (paced on the
-// shared lane clock), give up, or superseded-by-a-newer-gesture.
-function hlAlimNext(lane, mySeq, attempt, now, maxTries) {
-  if (mySeq !== (lane && lane.seq)) return { retry: false, superseded: true, delay: 0 };
-  if (attempt >= (maxTries || HL_ALIM_MAX_TRIES)) return { retry: false, superseded: false, delay: 0 };
-  const at = Math.max(now, lane.nextTs || 0);
-  lane.nextTs = at + HL_ALIM_PACE_MS;
-  return { retry: true, superseded: false, delay: at - now };
+function hlAlimLane() { return { q: [], nextTs: 0, limited: false }; }
+// One distinct user gesture = one queue entry, in click order; urgent
+// (reduce-only / close / cancel) entries go to the FRONT.
+function hlAlimBegin(lane, urgent, now) {
+  const e = { rseq: 1, t0: now };
+  if (urgent) lane.q.unshift(e); else lane.q.push(e);
+  return e;
+}
+function hlAlimDone(lane, e) {
+  const i = lane.q.indexOf(e);
+  if (i >= 0) lane.q.splice(i, 1);
+}
+// Urgent = closes risk: any cancel family action, or an order batch with a
+// reduce-only leg.
+function hlActionUrgent(a) {
+  const t = String((a && a.type) || '');
+  if (t.indexOf('cancel') === 0) return true;
+  if (t === 'order') {
+    for (const o of ((a && a.orders) || [])) if (o && o.r) return true;
+  }
+  return false;
+}
+// Decide gesture e's next step at `now`. Returns exactly one of:
+//   { wait }              — not this gesture's turn yet (not head / pace clock
+//                           busy); re-check after `wait` ms, nothing consumed.
+//   { retry: true }       — head of queue + pace slot claimed → send now.
+//   { superseded: true }  — a retry of the SAME gesture superseded this waiter.
+//   { expired: true }     — attempts or the per-gesture deadline ran out.
+function hlAlimNext(lane, e, myRseq, attempt, now, maxTries, deadlineMs) {
+  if (myRseq !== (e && e.rseq)) return { retry: false, superseded: true, delay: 0 };
+  if (attempt >= (maxTries || HL_ALIM_MAX_TRIES) ||
+      now - e.t0 >= (deadlineMs || HL_ALIM_DEADLINE_MS)) {
+    return { retry: false, superseded: false, expired: true, delay: 0 };
+  }
+  if (lane.q[0] !== e) return { retry: false, superseded: false, wait: HL_ALIM_POLL_MS, delay: 0 };
+  if (now < (lane.nextTs || 0)) {
+    return { retry: false, superseded: false, wait: Math.max(1, (lane.nextTs || 0) - now), delay: 0 };
+  }
+  lane.nextTs = now + HL_ALIM_PACE_MS;   // claim the 1/s address slot
+  return { retry: true, superseded: false, delay: 0 };
 }
 
 // ── PURE — HL userFills row → local-blotter fill (#2012, engine twin of
@@ -11890,6 +11944,8 @@ module.exports = {
   hlAlimHit,
   hlAlimLane,
   hlAlimBegin,
+  hlAlimDone,
+  hlActionUrgent,
   hlAlimNext,
   // pure — clock-probe 429 backoff (#2012)
   CLK_BO_BASE_MS,
