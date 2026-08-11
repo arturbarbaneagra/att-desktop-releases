@@ -8492,6 +8492,35 @@ function createTradeNative(opts) {
     const n = Number(px);
     return (px != null && isFinite(n) && n > 0) ? String(px) : null;
   }
+  async function hlMidNow(wireCoin, route) {
+    // #2048 ORDER-CRITICAL allMids read — a market order needs its price
+    // bound NOW. Rides the /exchange lane: NEVER queued behind the budgeter
+    // tiers (rapid order flow debits the shared bucket dry, which starved
+    // the very mid read the next market order needed — field log: 40s /info
+    // hole, "No Hyperliquid price" failed closes). Debit-only spend + the
+    // shared 429 latch stay; weight 2 is negligible. One paced 300ms retry:
+    // a close gesture must not die on a single transient read.
+    const dex = hlDexOfSymbol(wireCoin);
+    const body = dex ? { type: 'allMids', dex: dex } : { type: 'allMids' };
+    for (let a = 0; a < 2; a++) {
+      if (a) await new Promise((res) => setTimeout(res, 300));
+      try { hlBudgetSpend(_hlBudget, hlInfoWeight('allMids'), Date.now()); _hlBudgetPump(); } catch (e) {}
+      let r;
+      try {
+        r = await httpJson(HL_HOST, 'POST', '/info', '', JSON.stringify(body), {}, route,
+                           8 * 1024 * 1024);
+      } catch (e) { continue; }
+      if (r.status === 429) { hlBudget429(_hlBudget, Date.now(), 0); continue; }
+      hlBudgetOk(_hlBudget);
+      if (r.status !== 200) continue;
+      let data;
+      try { data = JSON.parse(r.text); } catch (e) { continue; }
+      const px = (data || {})[wireCoin];
+      const n = Number(px);
+      if (px != null && isFinite(n) && n > 0) return String(px);
+    }
+    return null;
+  }
   async function hlOpenRowsRaw(creds, dex, route) {
     const body = { type: 'frontendOpenOrders', user: String(creds.key).trim() };
     if (dex) body.dex = dex;
@@ -8528,7 +8557,11 @@ function createTradeNative(opts) {
     let mid = null;
     const needMid = t === 'market';
     if (needMid) {
-      mid = await hlMid(spec.wire, route);
+      // #2048: prefer the panel-supplied live book mid (fresh ≤2s — the DOM
+      // already streams the traded symbol's book); otherwise the order-
+      // critical direct read (hlMidNow) — NEVER the queued hlInfo path.
+      mid = hlMidHintFresh(f.midHint, f.midTs, Date.now());
+      if (!mid) mid = await hlMidNow(spec.wire, route);
       if (!mid) return { ok: false, message: 'No Hyperliquid price for the market order bound' };
     }
     let plan;
@@ -8569,7 +8602,8 @@ function createTradeNative(opts) {
     if (intent.op === 'order') {
       return hlPlace(creds, route, market, intent.symbol, intent.side, intent.type,
                      intent.qty, intent.price, intent.clOrdID,
-                     { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger });
+                     { reduceOnly: !!intent.reduceOnly, trigger: intent.trigger,
+                       midHint: intent.midHint, midTs: intent.midTs });
     }
     if (intent.op === 'cancel') {
       const sr = await hlSpec(market, intent.symbol, route);
@@ -8601,7 +8635,9 @@ function createTradeNative(opts) {
       if (!pr.pos) return { ok: false, message: 'Position not found' };
       const side = String(pr.pos.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
       const r = await hlPlace(creds, route, 'futures', pr.pos.symbol, side, 'market',
-                              pr.pos.size, null, intent.clOrdID, { reduceOnly: true });
+                              pr.pos.size, null, intent.clOrdID,
+                              { reduceOnly: true,
+                                midHint: intent.midHint, midTs: intent.midTs });
       if (!r.ok) return r;
       return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
     }
@@ -11717,6 +11753,19 @@ function hlBudgetSpend(B, w, now) {
   hlBudgetRefill(B, now);
   B.tokens = Math.max(-B.cap, B.tokens - w);
 }
+// #2048: freshness gate for the panel-supplied market-order mid hint. The
+// panel stamps the intent with its live book mid + Date.now(); the shell
+// trusts it ONLY within this window (panel + shell share one PC clock — a
+// small abs() pad tolerates IPC scheduling, never a stale book). Returns the
+// mid as a string, or null (→ order-critical direct read).
+const HL_MID_HINT_MAX_AGE_MS = 2000;
+function hlMidHintFresh(mid, ts, now) {
+  const n = Number(mid), t = Number(ts);
+  if (mid == null || mid === '' || !isFinite(n) || n <= 0) return null;
+  if (ts == null || !isFinite(t) || t <= 0) return null;
+  if (Math.abs(now - t) > HL_MID_HINT_MAX_AGE_MS) return null;
+  return String(mid);
+}
 
 // ── PURE — HL per-ADDRESS action rate-limit retry lane (#2012) ──────────────
 // HL budgets ACTIONS per address (cumulative 1 action / 1 USDC traded +
@@ -12147,6 +12196,9 @@ module.exports = {
   hlBudget429,
   hlBudgetOk,
   hlBudgetSpend,
+  // pure — #2048 order-critical mid hint freshness gate
+  HL_MID_HINT_MAX_AGE_MS,
+  hlMidHintFresh,
   // pure — HL per-address action rate-limit retry lane (#2012)
   HL_ALIM_MAX_TRIES,
   HL_ALIM_PACE_MS,
