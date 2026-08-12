@@ -1348,6 +1348,42 @@ function lbNormBnSpotRest(r) {
     exec_id: String(r.id != null ? r.id : ''),
   };
 }
+// #2051 One Bybit V5 execution row (WS `execution` topic and REST
+// /v5/execution/list share field names) → the fill schema. Twin of the
+// engine's norm_byb_fill: only execType=="Trade" rows normalize; linear
+// execFee is USDT (cost-positive, as-is); spot fees are charged in the
+// RECEIVED currency — feeCurrency (or the side when absent) decides
+// base (×price) vs quote (as-is). execPnl (per-fill realized PnL on newer
+// UTA accounts) maps to closed_pnl when carried.
+function lbNormBybFill(f) {
+  if (!f || typeof f !== 'object') return null;
+  if (String(f.execType || 'Trade') !== 'Trade') return null;
+  const qty = lbNum(f.execQty) || '0';
+  if (!(Number(qty) > 0)) return null;
+  const sym = String(f.symbol || '');
+  if (!sym) return null;
+  const market = String(f.category || 'linear') === 'spot' ? 'spot' : 'futures';
+  const px = lbNum(f.execPrice) || '0';
+  const side = String(f.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
+  const feeRaw = lbNum(f.execFee) || '0';
+  let fee = feeRaw;
+  if (market === 'spot') {
+    const fc = String(f.feeCurrency || '');
+    const baseFee = fc ? (sym.indexOf(fc) === 0 && sym.slice(-fc.length) !== fc)
+                       : side === 'buy';
+    if (baseFee) fee = lbFmt(Number(feeRaw) * Number(px));
+  }
+  return {
+    venue: 'bybit', market: market, symbol: sym,
+    side: side, posSide: '',
+    order_px: lbNum(f.orderPrice) || '', exec_px: px, qty: qty,
+    value: lbNum(f.execValue) || lbFmt(Number(px) * Number(qty)),
+    fee: fee, closed_pnl: lbNum(f.execPnl) || '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(f.execTime) || 0),
+    exec_id: String(f.execId || ''),
+  };
+}
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
 function lbFillKey(f) {
@@ -1837,6 +1873,23 @@ function lbReconstruct(fills, displayMap) {
 function bybitSign(secret, tsMs, apiKey, recvWindow, payload) {
   const msg = String(tsMs) + String(apiKey) + String(recvWindow) + String(payload);
   return crypto.createHmac('sha256', String(secret)).update(msg, 'utf8').digest('hex');
+}
+
+// #2051 Bybit private-WS auth signature — HMAC-SHA256 hex over
+// 'GET/realtime<expires>' (engine bybit_ws_auth_sig twin).
+function bybWsAuthSig(secret, expiresMs) {
+  return crypto.createHmac('sha256', String(secret))
+    .update('GET/realtime' + String(expiresMs), 'utf8').digest('hex');
+}
+
+// #2051 Bybit V5 order-topic status → ledger effect (engine
+// _OPEN_ORD_STATUSES twin): open-family statuses upsert the badge row,
+// everything else removes it. Empty status = no effect (malformed row).
+function bybOrdEffect(status) {
+  const s = String(status || '');
+  if (!s) return null;
+  return (s === 'New' || s === 'PartiallyFilled' || s === 'Untriggered' ||
+          s === 'Created') ? 'add' : 'gone';
 }
 
 const BYBIT_ERRORS = {
@@ -4439,6 +4492,7 @@ function createTradeNative(opts) {
     try { if (venue) krWsCloseAll(venue); else for (const k of Object.keys(krWsSessions)) krWsClose(k); } catch (e) { /* no session */ }
     try { if (venue) bnUdsClose(venue); else bnUdsCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) hlPushClose(venue); else hlPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) bybPushClose(venue); else bybPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -5466,6 +5520,238 @@ function createTradeNative(opts) {
       krLseq(B); bnPushSc(B, 'ordgone', String(oid));
     } else {
       krLseq(B); bnPushSc(B, 'order');
+    }
+  }
+
+  // --- #2051 Bybit account push lane -------------------------------------------
+  // Bybit V5 private WS (wss://stream.bybit.com/v5/private): auth per V5
+  // (HMAC over 'GET/realtime<expires>'), then order/execution/position/wallet
+  // topics. Topics have NO snapshot frame — a best-effort REST seed marks
+  // recent exec ids in the seen-set (dedup ONLY, push is truth). ONE 'acct'
+  // scope per slot: V5 topics are account-level (rows carry `category`), so
+  // linear AND spot ride the same socket. Rides the proxy agent like all
+  // shell traffic; reconnect via the shared backoff ladder.
+  const BYB_PUSH_WS_URL = 'wss://stream.bybit.com/v5/private';
+  const BYB_PUSH_FILLS_CAP = 600;
+  const bybPushSessions = {};
+  const bybPushPend = {};
+  let bybPushTimer = null;
+  function bybPushFlush() {
+    bybPushTimer = null;
+    const evs = krPushDrain(bybPushPend, (key) => {
+      const sess = bybPushSessions[key.slice(0, key.indexOf('|'))];
+      return sess ? sess.acct.lseq : 0;
+    }, Date.now(), 'bybit');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      // a mutation observed on the push beat invalidates the acct-read memo
+      // (Binance flush pattern) so the push-kicked read never serves stale.
+      try { execAcctRead.bust('bybit', ev.slot); } catch (e) { /* no memo */ }
+      tdiag('acct', 'byb_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    // push-beat local-blotter drain (HL pattern): fills land in the local
+    // store on the flush itself (idempotent — lbDrain dedups by exec_id).
+    try {
+      for (const ev of evs) {
+        if (ev && ev.kinds && ev.kinds.indexOf('fill') >= 0)
+          lbDrain(String(ev.slot || 'bybit'), 'bybit');
+      }
+    } catch (e) { /* local store off — panel read drains later */ }
+  }
+  function bybPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(bybPushPend, scope._pk, kind, id, row);
+    if (!bybPushTimer) {
+      bybPushTimer = setTimeout(bybPushFlush, KR_PUSH_COALESCE_MS);
+      if (bybPushTimer && typeof bybPushTimer.unref === 'function') bybPushTimer.unref();
+    }
+  }
+  function bybPushClose(slot) {
+    const sess = bybPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    try { if (sess.acct.ws) sess.acct.ws.terminate(); } catch (e) { /* gone */ }
+    sess.acct.ws = null; sess.acct.up = false;
+    delete bybPushSessions[slot];
+  }
+  function bybPushCloseAll() {
+    for (const k of Object.keys(bybPushSessions)) bybPushClose(k);
+  }
+  function bybPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key) return null;
+    slot = String(slot || 'bybit');
+    let sess = bybPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { bybPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = bybPushSessions[slot] = {
+        tail: creds.key, closed: false, route: route, creds: creds,
+        acct: { running: false, up: false, ws: null, err: null, lastMsg: 0,
+                lseq: 0, seeded: false, fills: { rows: [], seen: {} }, _pk: null },
+      };
+      sess.acct._pk = slot + '|acct';
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    if (!sess.acct.running) bybPushLoop(slot, sess);
+    return sess;
+  }
+  async function bybPushSeed(sess) {
+    // dedup-only seed: the private topics have no snapshot frame, so recent
+    // REST exec ids pre-mark the seen-set (a fill recorded by the poll path
+    // milliseconds before the socket came up must not re-push). Best-effort:
+    // a failed seed only risks one duplicate push, which lbScopeMerge and the
+    // panel eid dedupe both absorb.
+    const A = sess.acct;
+    if (A.seeded) return;
+    A.seeded = true;
+    for (const cat of ['linear', 'spot']) {
+      try {
+        const r = await bybRequest(sess.creds, 'GET', '/v5/execution/list',
+          [['category', cat], ['limit', '50']], null, sess.route);
+        if (!r.ok) continue;
+        for (const f of (((r.data || {}).result) || {}).list || []) {
+          const eid = f && f.execId != null ? String(f.execId) : '';
+          if (eid) A.fills.seen[eid] = 1;
+        }
+      } catch (e) { /* best-effort */ }
+    }
+  }
+  function bybPushLoop(slot, sess) {
+    const A = sess.acct;
+    A.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (bybPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          await bybPushSeed(sess);
+          await bybPushConn(slot, sess);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          A.err = 'Bybit push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'byb_push_err', { m: String(A.err).slice(0, 120) });
+        }
+        A.up = false; A.ws = null;
+        if (sess.closed || bybPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      A.running = false;
+    })().catch(() => { A.running = false; });
+  }
+  function bybPushConn(slot, sess) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(BYB_PUSH_WS_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const A = sess.acct;
+      A.ws = ws;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        A.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // Bybit idle-closes quiet conns — app-level {op:'ping'} every 20s keeps
+      // it live; a 90s frame gap tears down for a clean redial.
+      const kaT = setInterval(() => {
+        try { ws.send('{"op":"ping"}'); } catch (e) { /* dying */ }
+        if (Date.now() - (A.lastMsg || 0) > 90000) done(new Error('stream stalled'));
+      }, 20000);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      ws.on('open', () => {
+        A.lastMsg = Date.now();
+        try {
+          const expires = Date.now() + 10000;
+          ws.send(JSON.stringify({ op: 'auth', args: [
+            sess.creds.key, expires, bybWsAuthSig(sess.creds.secret, expires)] }));
+        } catch (e) { done(e); return; }
+      });
+      ws.on('ping', () => { A.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        A.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const op = String((msg && msg.op) || '');
+        if (op === 'auth') {
+          if (msg.success === false) { done(new Error('auth rejected: ' + String(msg.ret_msg || ''))); return; }
+          try {
+            ws.send(JSON.stringify({ op: 'subscribe',
+              args: ['position', 'order', 'execution', 'wallet'] }));
+          } catch (e) { done(e); return; }
+          return;
+        }
+        if (op === 'subscribe') {
+          if (msg.success === false) { done(new Error('subscribe rejected: ' + String(msg.ret_msg || ''))); return; }
+          A.up = true; A.err = null;
+          tdiag('acct', 'byb_push_up', { s: slot });
+          return;
+        }
+        if (op === 'pong' || op === 'ping') return;
+        try { bybPushEvApply(A, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function bybPushEvApply(A, msg) {
+    const topic = String((msg && msg.topic) || '');
+    const rows = Array.isArray(msg && msg.data) ? msg.data : [];
+    if (!topic || !rows.length) return;
+    if (topic === 'execution') {
+      for (const f of rows) {
+        if (String((f && f.execType) || 'Trade') !== 'Trade') continue;
+        const eid = f && f.execId != null ? String(f.execId) : '';
+        if (!eid || A.fills.seen[eid]) continue;
+        A.fills.seen[eid] = 1;
+        // RAW execution row rides the push (category/symbol/side/execPrice/
+        // execQty/execFee/feeCurrency/execPnl/execTime all included — fee
+        // passthrough). Never slim it.
+        A.fills.rows.push(f);
+        if (A.fills.rows.length > BYB_PUSH_FILLS_CAP) {
+          A.fills.rows.splice(0, A.fills.rows.length - BYB_PUSH_FILLS_CAP);
+        }
+        krLseq(A); bybPushSc(A, 'fill', eid, f);
+        krLseq(A); bybPushSc(A, 'pos');   // a fill moves the position — refresh
+      }
+      return;
+    }
+    if (topic === 'order') {
+      for (const o of rows) {
+        const oid = o && o.orderId != null ? String(o.orderId) : '';
+        if (!oid) continue;
+        const eff = bybOrdEffect(o.orderStatus);
+        if (eff === 'add') {
+          // WS order rows are REST /v5/order/realtime-shaped — the panel's
+          // bybAcctOrderRow reads them directly (category routes market).
+          krLseq(A); bybPushSc(A, 'order', null, o);
+        } else if (eff === 'gone') {
+          krLseq(A); bybPushSc(A, 'ordgone', oid);
+        }
+      }
+      return;
+    }
+    if (topic === 'position') {
+      for (const p of rows) { krLseq(A); bybPushSc(A, 'pos', null, p); }
+      return;
+    }
+    if (topic === 'wallet') {
+      for (const w of rows) { krLseq(A); bybPushSc(A, 'bal', null, w); }
+    }
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
+  // Binance pattern): the WS echo lands ~100ms later, but the local bump
+  // makes the badge/posrow read fire immediately after the REST ack.
+  function bybMutKick(slot, kind, oid) {
+    const sess = bybPushSessions[String(slot || 'bybit')];
+    if (!sess) return;
+    const A = sess.acct;
+    if (kind === 'ordgone' && oid) {
+      krLseq(A); bybPushSc(A, 'ordgone', String(oid));
+    } else {
+      krLseq(A); bybPushSc(A, 'order');
     }
   }
 
@@ -9371,6 +9657,9 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
+    // #2051: acct reads keep the private push socket warm (push-driven
+    // display) — no-op while the loop already runs.
+    try { bybPushEnsure(intent.credSlot || 'bybit', creds, route); } catch (e) { /* REST path */ }
     const bal = await bybRequest(creds, 'GET', '/v5/account/wallet-balance',
                                  [['accountType', 'UNIFIED']], null, route);
     if (!bal.ok) return bal;
@@ -10494,6 +10783,48 @@ function createTradeNative(opts) {
              maxLeverage: isFinite(mx) ? mx : undefined });
   }
 
+  // #2051 Bybit leverage GET/SET — read via /v5/position/list (rows carry
+  // leverage even flat), set via /v5/position/set-leverage (category linear,
+  // buy/sellLeverage same value). retCode 110043 "leverage not modified" IS
+  // success (the chip already shows the requested value). Honest failures —
+  // the panel surfaces them verbatim.
+  async function execBybLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'bybit');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '').toUpperCase();
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    if (intent.what === 'set') {
+      const lev = parseFloat(intent.leverage);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      const r = await bybRequest(creds, 'POST', '/v5/position/set-leverage', null,
+        { category: 'linear', symbol: sym,
+          buyLeverage: String(lev), sellLeverage: String(lev) }, route);
+      if (!r.ok && Number(r.code) !== 110043) return _dgLine(r);
+      return _dgLine({ ok: true, symbol: sym, leverage: String(lev) });
+    }
+    const r = await bybRequest(creds, 'GET', '/v5/position/list',
+      [['category', 'linear'], ['symbol', sym]], null, route);
+    if (!r.ok) return _dgLine(r);
+    let lev = null;
+    for (const p of (((r.data || {}).result) || {}).list || []) {
+      const v = bnNum(p.leverage);
+      if (v && Number(v) > 0) { lev = v; break; }
+    }
+    return _dgLine({ ok: true, symbol: sym, leverage: lev });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -10942,6 +11273,17 @@ function createTradeNative(opts) {
           if (f) fills.push(f);
         }
       }
+    } else if (venue === 'bybit') {
+      // #2051: the push session caches RAW V5 execution rows (account-level —
+      // linear + spot ride one stream, rows carry `category`). The drain is
+      // idempotent: rows merged once by exec_id stay merged.
+      const sess = bybPushSessions[slot];
+      if (sess) {
+        for (const r of ((sess.acct.fills && sess.acct.fills.rows) || [])) {
+          const f = lbNormBybFill(r);
+          if (f) fills.push(f);
+        }
+      }
     }
     if (aid) for (const f of fills) f.aid = aid;
     // #1973 field-test diag: pre-compute which drained rows are NEW (the WS
@@ -10969,7 +11311,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -11219,6 +11561,62 @@ function createTradeNative(opts) {
         for (const f of raw) { const n = lbNormHlFill(f, wm); if (n) fills.push(n); }
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'bybit') {
+        // #2051: cursor-paged /v5/execution/list per category. Bybit caps
+        // each query span at 7 days — the window walks forward in ≤7d chunks
+        // from the per-market watermark, cursor pages inside each chunk.
+        // Bounded pages; hitting the bound = explicit possible-gap verdict.
+        const BYB_BF_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const BYB_BF_PAGE_CAP = 60;   // across both categories
+        let pages = 0;
+        const raw = [];
+        let failMsg = null;
+        for (const cat of ['linear', 'spot']) {
+          const mkt = cat === 'spot' ? 'spot' : 'futures';
+          const frm = bfFrm(mkt, mkt);
+          let w0 = Math.max(0, Math.floor(frm));
+          while (w0 < now && pages < BYB_BF_PAGE_CAP && !failMsg) {
+            const w1 = Math.min(now, w0 + BYB_BF_SPAN_MS);
+            let cursor = '';
+            for (;;) {
+              const params = [['category', cat], ['startTime', String(w0)],
+                              ['endTime', String(w1)], ['limit', '100']];
+              if (cursor) params.push(['cursor', cursor]);
+              const rp = await bybRequest(creds, 'GET', '/v5/execution/list',
+                                          params, null, route);
+              pages++;
+              if (!rp.ok) { failMsg = rp.message || 'Bybit fills fetch failed'; break; }
+              const res = ((rp.data || {}).result) || {};
+              for (const f of res.list || []) {
+                if (f && !f.category) f.category = cat;   // REST rows may omit it
+                raw.push(f);
+              }
+              cursor = String(res.nextPageCursor || '');
+              if (!cursor || !(res.list || []).length) break;
+              if (pages >= BYB_BF_PAGE_CAP) {
+                gap = true;
+                notes.push('fill history page cap reached — a gap is possible');
+                break;
+              }
+            }
+            w0 = w1;
+          }
+          if (failMsg) break;
+          if (w0 < now && pages >= BYB_BF_PAGE_CAP && !gap) {
+            gap = true;
+            notes.push('fill history page cap reached — a gap is possible');
+          }
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        const fills = [];
+        for (const f of raw) { const n = lbNormBybFill(f); if (n) fills.push(n); }
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -11323,6 +11721,7 @@ function createTradeNative(opts) {
     if (intent && typeof intent === 'object' && intent.op === 'leverage') {
       if (intent.venue === 'kraken') return await execKrakenLeverage(intent);
       if (intent.venue === 'hyperliquid') return await execHlLeverage(intent);   // #2000
+      if (intent.venue === 'bybit') return await execBybLeverage(intent);   // #2051
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -11390,7 +11789,22 @@ function createTradeNative(opts) {
     const route = routeNorm(intent.route);
     try {
       if (intent.venue === 'binance') return await execBinance(creds, intent, route);
-      if (intent.venue === 'bybit') return await execBybit(creds, intent, route);
+      if (intent.venue === 'bybit') {
+        const r = await execBybit(creds, intent, route);
+        // #2051: a successful trade ack kicks the push lane awake (no-op
+        // while the loop runs) and stamps an optimistic mutation so the
+        // badge/posrow read fires immediately after the REST ack.
+        if (r && r.ok) {
+          try { bybPushEnsure(intent.credSlot || 'bybit', creds, route); }
+          catch (e) { /* REST path */ }
+          try {
+            if (intent.op === 'cancel' && intent.orderID) {
+              bybMutKick(intent.credSlot || 'bybit', 'ordgone', String(intent.orderID));
+            } else bybMutKick(intent.credSlot || 'bybit', 'order');
+          } catch (e) { /* diag-only */ }
+        }
+        return r;
+      }
       if (intent.venue === 'okx') return await execOkx(creds, intent, route);
       if (intent.venue === 'gate') return await execGate(creds, intent, route);
       if (intent.venue === 'bitget') return await execBitget(creds, intent, route);
@@ -12181,6 +12595,9 @@ module.exports = {
   lbHlCoinIsSpot,
   lbNormHlFill,
   lbHlPageStep,
+  lbNormBybFill,
+  bybWsAuthSig,
+  bybOrdEffect,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
