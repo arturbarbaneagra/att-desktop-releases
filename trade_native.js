@@ -1429,6 +1429,45 @@ function lbScopeMerge(sc, fills) {
   if (added) sc.rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
   return added;
 }
+// #2112 RE-IMPORT merge: rows fetched from the venue for an explicit
+// [frm,to] window are VENUE TRUTH (blotter-reimport principle) — a local
+// tombstone that would silently skip a re-asserted IN-WINDOW fill must
+// YIELD (the sanctioned, window-scoped bypass), so previously pruned or
+// deleted fills come back when the exchange re-asserts them. Out-of-window
+// rows keep normal tombstone respect (an offline delete outside the window
+// stays deleted). Dedup vs already-stored copies is unchanged (lbScopeMerge
+// seen-key), so a second identical run adds 0. PURE (node-tested).
+function lbReimportMerge(sc, fills, frm, to) {
+  let tombCleared = 0;
+  if (sc && sc.del && Array.isArray(fills)) {
+    for (const f of fills) {
+      if (!f) continue;
+      const ts = Number(f.ts) || 0;
+      if (!(ts >= frm && ts <= to)) continue;
+      const k = lbFillKey(f);
+      if (k && sc.del[k]) { delete sc.del[k]; tombCleared++; }
+      const kl = lbFillKeyLegacy(f);
+      if (kl && kl !== k && sc.del[kl]) { delete sc.del[kl]; tombCleared++; }
+    }
+  }
+  const recv = Array.isArray(fills) ? fills.length : 0;
+  const added = lbScopeMerge(sc, fills);
+  return { added: added, skipped: recv - added, tombCleared: tombCleared };
+}
+// #2112 PURE binance window-pager step: decides the next startTime after a
+// page of a myTrades/userTrades time-window walk. A FULL page must PROVE
+// forward progress (lastTs > t0) — when every row of a full page shares the
+// resume timestamp, time paging cannot advance without silently skipping
+// the rest of that millisecond, so the step returns {stuck:true} and the
+// caller must FAIL VISIBLY (venue-truth contract: a truncated fetch never
+// masquerades as complete). Short page ⇒ window chunk covered ⇒ t1+1.
+function lbBnWinStep(rowsLen, lastTs, t0, t1, limit) {
+  if (rowsLen >= limit) {
+    if (lastTs > t0) return { next: lastTs };   // resume AT boundary — dedupe absorbs overlap
+    return { stuck: true };
+  }
+  return { next: t1 + 1 };
+}
 // #2038 SPOT truncated-history quarantine (local twin of the engine's #1849
 // rule): cash spot can never be net short, so a spot scope whose fill replay
 // goes NEGATIVE provably starts mid-position (the backfill window cut off
@@ -1466,6 +1505,18 @@ function lbSpotQuar(rows) {
       if (run < min - EPS) { min = run; minI = i; }
     }
     if (!(min < -EPS) || minI < 0) continue;   // never negative → no proof
+    // #2098 dust-flat guard: kraken deducts spot fees (and sells sized off
+    // the held balance round against the buys), so a flat-closing scalp
+    // session can replay a hair NEGATIVE at its LAST fill — the "minimum"
+    // then lands at/after the final sell and the old rule quarantined the
+    // ENTIRE day's group (WINGS field log). A dip whose worth at the local
+    // exec price is below the spot dust threshold is a CLOSED lot (same
+    // LB_SPOT_DUST_USD rule lbReconstruct applies to remainders), NOT proof
+    // of truncation — return the scope untouched; lbReconstruct's own dust
+    // handling absorbs the oversell.
+    const dipPx = Number(g[minI].exec_px) || 0;
+    if (dipPx > 0 && (-min) * dipPx < LB_SPOT_DUST_USD) continue;
+    if (!(dipPx > 0) && (-min) <= LB_EPS) continue; // no px: EPS-scale noise only
     for (let i = 0; i <= minI; i++) drop.add(g[i]);
     const parts = k.split('\u0000');
     out.quar.push({ venue: parts[0], market: 'spot', symbol: parts[1],
@@ -5738,7 +5789,24 @@ function createTradeNative(opts) {
       return;
     }
     if (topic === 'wallet') {
-      for (const w of rows) { krLseq(A); bybPushSc(A, 'bal', null, w); }
+      // #2072: stamp the wallet FRAME's venue ts (creationTime — falls back
+      // to the envelope ts) onto every shipped coin row. The panel's overlay
+      // consume/skip-arm orders fills vs wallet frames by VENUE truth (exec
+      // execTime vs frame crTs) instead of local arrival clocks — the
+      // same-beat/out-of-order frame race double-counted the spot posrow.
+      // Additive field; bybWalletUpsert/older panels ignore it.
+      const wTs = Number((msg && msg.creationTime) || (msg && msg.ts)) || 0;
+      for (const w of rows) {
+        let wr = w;
+        if (wTs > 0 && w && typeof w === 'object') {
+          const cs = Array.isArray(w.coin)
+            ? w.coin.map((c) => (c && typeof c === 'object')
+                ? Object.assign({}, c, { crTs: wTs }) : c)
+            : w.coin;
+          wr = Object.assign({}, w, { coin: cs });
+        }
+        krLseq(A); bybPushSc(A, 'bal', null, wr);
+      }
     }
   }
   // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
@@ -11186,6 +11254,17 @@ function createTradeNative(opts) {
   // main-process store.
   const LB_ROWS_CAP = 20000;               // per scope, prune is position-aware
   const LB_SAVE_DEBOUNCE_MS = 1500;
+  const _lbQuarSig = {};                   // #2098 per-slot quar-tap dedupe
+  // #2098 silent-drop diag: every cap-triggered prune that actually removes
+  // rows leaves a tap — trade rows must never vanish without a log line.
+  function lbPruneTap(slot, venue, sc) {
+    const before = sc.rows.length;
+    sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP);
+    sc.seen = null;
+    const n = before - sc.rows.length;
+    if (n) tdiag('lblot', 'prune', { k: slot, v: venue, n: n,
+      total: sc.rows.length, reason: 'rows-cap' });
+  }
   const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
   let _lbStore = null, _lbSaveT = null;
   function lbLoad() {
@@ -11306,7 +11385,7 @@ function createTradeNative(opts) {
         first: newIds && newIds.length ? newIds[0] : undefined,
         last: newIds && newIds.length ? newIds[newIds.length - 1] : undefined,
         total: sc.rows.length });
-      if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+      if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
       lbSaveSoon();
     }
     return added;
@@ -11371,7 +11450,7 @@ function createTradeNative(opts) {
     if (slotAid) for (const f of fills) f.aid = slotAid;
     const sc = lbScope(slot);
     const added = lbScopeMerge(sc, fills);
-    if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+    if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
     const saved = lbSaveNow();
     // #1973: explicit ingest flow (panel Import button / supplied rows)
     tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'import', recv: rowsIn.length,
@@ -11419,6 +11498,21 @@ function createTradeNative(opts) {
       const vis = lbSpotQuar(sc.rows);
       quar = vis.quar;
       trades = lbReconstruct(vis.rows, intent.displayMap || null);
+      // #2098 silent-drop diag: any quarantine that hides rows leaves a tap
+      // (once per distinct quar set per slot — reads poll every ~2s).
+      try {
+        const sig = (quar && quar.length)
+          ? JSON.stringify(quar.map((q) => [q.venue, q.symbol, q.aid, q.before, q.hidden]))
+          : '';
+        if (sig !== (_lbQuarSig[slot] || '')) {
+          _lbQuarSig[slot] = sig;
+          for (const q of (quar || [])) {
+            tdiag('lblot', 'quar', { k: slot, v: q.venue, s: q.symbol,
+              aid: q.aid || undefined, n: q.hidden, before: q.before,
+              reason: 'neg-replay' });
+          }
+        }
+      } catch (e) { /* diag only */ }
     }
     catch (e) { return { ok: false, message: 'replay failed: ' + ((e && e.message) || 'error') }; }
     return { ok: true, added: added, count: sc.rows.length, trades: trades,
@@ -11676,7 +11770,7 @@ function createTradeNative(opts) {
         _dgFetched = (r.fills || []).length;   // #1973
         added = lbScopeMerge(sc, r.fills);
       }
-      if (sc.rows.length > LB_ROWS_CAP) { sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP); sc.seen = null; }
+      if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
       sc.bf = { ts: now, ok: true, added: added, gap: gap, covOk: covOk,
                 note: notes.join('; ') };
       const saved = lbSaveNow();
@@ -11691,6 +11785,242 @@ function createTradeNative(opts) {
                note: notes.join('; '), count: sc.rows.length,
                ...(saved ? {} : { persistErr: true }) };
     } finally { delete _lbBfBusy[slot]; }
+  }
+  // #2112 device-source exchange RE-IMPORT into the LOCAL blotter store:
+  // page the venue's own-trade REST/info over an explicit [frm,to] window
+  // with the DEVICE key (HL: master address — no key material leaves the
+  // device) and merge the normalized rows into the scope store as VENUE
+  // TRUTH — in-window tombstones yield (lbReimportMerge, the sanctioned
+  // window-scoped bypass), so previously pruned/quarantine-hidden fills are
+  // re-accepted and the #2038 quarantine markers clear once the missing
+  // prefix is back. Same normalizers + exec-id space as the live drain
+  // lanes → a second run dedupes to added:0. The server/engine archive is
+  // NOT touched here (the panel keeps its own engine POST leg where that
+  // copy exists — engine stays the sole server archive writer). Page-cap
+  // exhaustion FAILS visibly (narrow the window) — a truncated fetch must
+  // never masquerade as complete venue truth; the merge itself is additive,
+  // so a failed run never removes rows.
+  const LB_RI_HL_PAGE_CAP = 12;
+  const LB_RI_BYB_PAGE_CAP = 80;
+  const LB_RI_BN_SPOT_WIN_MS = 24 * 3600 * 1000 - 60000;   // myTrades span cap
+  let _lbRiBusy = {};
+  async function execLblotReimport(intent) {
+    const venue = String(intent.venue || '');
+    if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
+    const slot = String(intent.credSlot || venue);
+    if (_lbRiBusy[slot]) return { ok: false, message: 're-import already in flight', busy: true };
+    _lbRiBusy[slot] = true;
+    const t0run = Date.now();
+    // every failure leaves a c:"lblot" e:"reimp" tap — a device re-import
+    // that restored nothing must be visible in field logs, never silent.
+    const riFail = (msg) => {
+      tdiag('lblot', 'reimp', { k: slot, v: venue, ok: 0, ms: Date.now() - t0run,
+        err: String(msg || 'failed').slice(0, 300) });
+      return { ok: false, message: msg };
+    };
+    try {
+      const creds = credsGet(slot);
+      if (!creds) return riFail('No API key on this device — provision Native trading first');
+      const w = hbWindow(intent);
+      if (!w) return riFail('Bad window (max 92 days)');
+      const route = routeNorm(intent.route);
+      const market = String(intent.market || 'both');
+      const sleep = (ms) => new Promise((rs) => setTimeout(rs, ms));
+      let gap = false;
+      const notes = [];
+      const fills = [];
+      let hb = null;   // kraken: raw WS-shaped rows for the panel's engine POST leg
+      if (venue === 'kraken') {
+        // same walk as the #1844 desktop re-import source (TradesHistory +
+        // /api/history futures fills; fails on page-cap exhaustion inside).
+        const r = await lbKrBackfillRetry(hbKraken,
+          { credSlot: slot, route: intent.route, market: market, frm: w.frm, to: w.to },
+          sleep,
+          (attempt, waitMs) => tdiag('lblot', 'reimp', { k: slot, v: venue,
+            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }));
+        if (!r.ok) return riFail(r.message || 'kraken history fetch failed');
+        if (r.bfTries > 1) notes.push('kraken rate budget deferred — ' + r.bfTries + ' attempts');
+        for (const e of (r.spot || [])) { const f = lbNormKrWsSpot(e); if (f) fills.push(f); }
+        for (const e of (r.futures || [])) { const f = lbNormKrWsFut(e); if (f) fills.push(f); }
+        hb = { spot: r.spot || [], futures: r.futures || [] };
+      } else if (venue === 'hyperliquid') {
+        // account-level userFillsByTime pager (spot + main-dex + HIP-3 ride
+        // one stream) by the MASTER address; rides the hlInfo budgeter.
+        let addr;
+        try { addr = await hlMasterResolve(String(creds.key).trim(), route); }
+        catch (e) { return riFail('Hyperliquid master resolve failed: ' + ((e && e.message) || 'error')); }
+        const wmErr = await hlEnsureProducts(route);
+        if (wmErr) notes.push('spot symbol map unavailable — spot fills keep wire names');
+        const raw = [];
+        const seen = {};   // exec-id dedupe for boundary-ms overlap pages
+        let cur = Math.max(0, Math.floor(w.frm));
+        let pages = 0;
+        for (;;) {
+          const rp = await hlInfo({ type: 'userFillsByTime', user: addr,
+                                    startTime: cur, endTime: w.to,
+                                    aggregateByTime: false }, route);
+          if (!rp.ok) return riFail(rp.message || 'Hyperliquid fills fetch failed');
+          const rows = Array.isArray(rp.data) ? rp.data : [];
+          const stp = lbHlPageStep(rows, cur, seen, raw);
+          pages++;
+          if (stp.gap) {
+            // full page stuck on one ms — time paging cannot prove progress;
+            // honest possible-gap note (merge stays additive → safe).
+            gap = true;
+            notes.push('fill page stalled on one timestamp — a gap is possible');
+          }
+          if (stp.done) break;
+          cur = stp.next;
+          if (pages >= LB_RI_HL_PAGE_CAP) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+        }
+        const wm = hlProds.wireMap || {};
+        for (const f of raw) { const n = lbNormHlFill(f, wm); if (n) fills.push(n); }
+      } else if (venue === 'bybit') {
+        // V5 /v5/execution/list: ≤7d query spans — chain windows over
+        // [frm,to], cursor pages inside each chunk, per requested market.
+        const BYB_RI_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        let pages = 0;
+        const raw = [];
+        const cats = market === 'spot' ? ['spot']
+          : market === 'futures' ? ['linear'] : ['linear', 'spot'];
+        for (const cat of cats) {
+          let w0 = Math.max(0, Math.floor(w.frm));
+          while (w0 < w.to) {
+            const w1 = Math.min(w.to, w0 + BYB_RI_SPAN_MS);
+            let cursor = '';
+            for (;;) {
+              if (pages >= LB_RI_BYB_PAGE_CAP) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+              const params = [['category', cat], ['startTime', String(w0)],
+                              ['endTime', String(w1)], ['limit', '100']];
+              if (cursor) params.push(['cursor', cursor]);
+              if (pages) await sleep(HB_PAGE_GAP_MS);
+              const rp = await bybRequest(creds, 'GET', '/v5/execution/list',
+                                          params, null, route);
+              pages++;
+              if (!rp.ok) return riFail(rp.message || 'Bybit fills fetch failed');
+              const res = ((rp.data || {}).result) || {};
+              for (const f of res.list || []) {
+                if (f && !f.category) f.category = cat;   // REST rows may omit it
+                raw.push(f);
+              }
+              cursor = String(res.nextPageCursor || '');
+              if (!cursor || !(res.list || []).length) break;
+            }
+            w0 = w1;
+          }
+        }
+        for (const f of raw) { const n = lbNormBybFill(f); if (n) fills.push(n); }
+      } else {
+        // binance: shell-signed time-window paging (never a raw host request
+        // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
+        // the #1969 backfill's (big caps for 1000-row pages / exchangeInfo).
+        const bnReq = (mkt, reqPath, params) => {
+          if (mkt === 'spotPub') {
+            return httpJson(bnHost('spot'), 'GET', reqPath, formEnc(params || []),
+                            null, {}, route, 64 * 1024 * 1024)
+              .then((r) => {
+                if (r.tr) return { ok: false, message: 'Binance response truncated at byte cap' };
+                let d = null;
+                try { d = JSON.parse(r.text); } catch (e) { d = null; }
+                return (r.status < 400 && d) ? { ok: true, data: d }
+                  : { ok: false, message: 'Binance returned HTTP ' + r.status };
+              })
+              .catch((e) => transportFail(e, 'Binance'));
+          }
+          return bnRequest(creds, 'GET', mkt, reqPath, params, route, 16 * 1024 * 1024);
+        };
+        let calls = 0;
+        if (market !== 'spot') {
+          // futures userTrades: ≤7d spans, full page continues inside the
+          // same window from the last ts (dedupe absorbs the overlap).
+          let t0 = Math.max(0, Math.floor(w.frm));
+          while (t0 < w.to) {
+            if (++calls > LB_BN_MAX_CALLS) return riFail('Window too large — fill history exceeds the call cap; narrow the date range');
+            const t1 = Math.min(t0 + LB_BN_FUT_WIN_MS, w.to);
+            if (calls > 1) await sleep(HB_PAGE_GAP_MS);
+            const r = await bnReq('futures', '/fapi/v1/userTrades',
+              [['startTime', String(t0)], ['endTime', String(t1)], ['limit', '1000']]);
+            if (!r || !r.ok) return riFail('Binance futures: ' + ((r && r.message) || 'request failed'));
+            const rows = Array.isArray(r.data) ? r.data : [];
+            let lastTs = 0;
+            for (const raw of rows) {
+              const f = lbNormBnFutRest(raw);
+              if (f) { fills.push(f); if (f.ts > lastTs) lastTs = f.ts; }
+            }
+            const stp = lbBnWinStep(rows.length, lastTs, t0, t1, 1000);
+            if (stp.stuck) return riFail('Binance futures: a full trades page could not advance past one timestamp — history too dense for time paging in this window');
+            t0 = stp.next;
+          }
+        }
+        if (market !== 'futures') {
+          // spot myTrades: per-symbol, ≤24h spans. Universe = held assets ×
+          // quotes + open orders + locally known symbols (Binance has no
+          // account-wide spot trades endpoint) — an unknown universe is an
+          // honest failure, never a silently partial restore.
+          const symSet = {};
+          for (const f of lbScope(slot).rows) {
+            if (f.market === 'spot' && f.symbol) symSet[String(f.symbol).toUpperCase()] = 1;
+          }
+          for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
+            if (s) symSet[String(s).toUpperCase()] = 1;
+          }
+          const uni = await lbBnSpotUniverse(bnReq, Object.keys(symSet));
+          if (!uni.ok) return riFail('Binance spot universe: ' + (uni.message || 'account read failed'));
+          const syms = uni.syms.filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
+          if (syms.length > LB_BN_SPOT_SYM_CAP) return riFail('Too many spot pairs (' + syms.length + ') — re-import futures and spot separately or reduce holdings pairs');
+          for (const sym of syms) {
+            let t0 = Math.max(0, Math.floor(w.frm));
+            while (t0 < w.to) {
+              if (++calls > LB_BN_MAX_CALLS) return riFail('Window too large for the pair count — narrow the date range');
+              const t1 = Math.min(t0 + LB_RI_BN_SPOT_WIN_MS, w.to);
+              if (calls > 1) await sleep(HB_PAGE_GAP_MS);
+              const r = await bnReq('spot', '/api/v3/myTrades',
+                [['symbol', sym], ['startTime', String(t0)], ['endTime', String(t1)], ['limit', '1000']]);
+              if (!r || !r.ok) return riFail('Binance spot (' + sym + '): ' + ((r && r.message) || 'request failed'));
+              const rows = Array.isArray(r.data) ? r.data : [];
+              let lastTs = 0;
+              for (const raw of rows) {
+                const f = lbNormBnSpotRest(raw);
+                if (f) { fills.push(f); if (f.ts > lastTs) lastTs = f.ts; }
+              }
+              const stp = lbBnWinStep(rows.length, lastTs, t0, t1, 1000);
+              if (stp.stuck) return riFail('Binance spot (' + sym + '): a full trades page could not advance past one timestamp — history too dense for time paging in this window');
+              t0 = stp.next;
+            }
+          }
+        }
+      }
+      // requested-market scope (kraken/HL walks are venue/account-wide)
+      const use = market === 'both' ? fills
+        : fills.filter((f) => String(f.market || '') === market);
+      // live-cache drain first so the quarantine before/after diff and the
+      // merge both see the full current store.
+      lbDrain(slot, venue);
+      const sc = lbScope(slot);
+      const slotAid = (() => {
+        const m = /#a(\d+)$/.exec(slot);
+        return m ? parseInt(m[1], 10) : 0;
+      })();
+      if (slotAid) for (const f of use) f.aid = slotAid;
+      const quarBefore = lbSpotQuar(sc.rows).quar.length;
+      const m = lbReimportMerge(sc, use, w.frm, w.to);
+      if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
+      const quarAfter = lbSpotQuar(sc.rows).quar.length;
+      const quarCleared = Math.max(0, quarBefore - quarAfter);
+      if (quarCleared) _lbQuarSig[slot] = '';   // re-arm the quar tap dedupe
+      const saved = lbSaveNow();
+      tdiag('lblot', 'reimp', { k: slot, v: venue, ok: 1, mkt: market,
+        frm: w.frm, to: w.to, ms: Date.now() - t0run, fetched: use.length,
+        n: m.added, dedup: m.skipped, tomb: m.tombCleared,
+        quarCleared: quarCleared, gap: gap ? 1 : 0,
+        note: notes.join('; ') || undefined, total: sc.rows.length,
+        persistErr: saved ? undefined : 1 });
+      return { ok: true, added: m.added, skipped: m.skipped,
+               tombCleared: m.tombCleared, quarCleared: quarCleared,
+               count: sc.rows.length, gap: gap, note: notes.join('; '),
+               ...(hb ? { hb: hb } : {}),
+               ...(saved ? {} : { persistErr: true }) };
+    } finally { delete _lbRiBusy[slot]; }
   }
 
   async function execIntent(intent) {
@@ -11746,6 +12076,12 @@ function createTradeNative(opts) {
     }
     if (intent && typeof intent === 'object' && intent.op === 'lblot_backfill') {
       return await execLblotBackfill(intent);
+    }
+    // #2112 device-source exchange re-import → LOCAL store (venue truth,
+    // in-window tombstone yield). Old shells fall through to 'unknown op';
+    // the panel gates the picker option on the 'lblotri' cap.
+    if (intent && typeof intent === 'object' && intent.op === 'lblot_reimport') {
+      return await execLblotReimport(intent);
     }
     // PUBLIC catalog/kline bridge (#1713) — no creds, strict allowlist inside.
     // Generic PUBLIC catalog bridge (#1715) — allowlisted https GETs (+ HL POST /info) inside.
