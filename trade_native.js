@@ -4381,6 +4381,53 @@ const ACCT_RL_COOLDOWN_MS = {
 };
 const ACCT_RL_MAX_MS = 120000;
 const ACCT_READ_MEMO_MS = 1200;
+// #2131 hot-venue priority: a venue where the user JUST traded (own fill /
+// order event / gesture — markHot below, or an intent stamped prio:'hot' by
+// the panel) is HOT for ACCT_HOT_MS. HOT reads jump ahead of routine
+// idle-venue polls at the shared dispatch gate (acctPrioGate) and may bypass
+// a memo entry an idle poll populated — NEVER the venue rate budget: the
+// cool-down gate stays first and unconditional, and single-flight still
+// coalesces concurrent reads, so request volume never exceeds today's caps.
+const ACCT_HOT_MS = 60000;
+// Idle reads yield to pending HOT reads at most this long (bounded — a hung
+// hot read must never starve idle venues forever).
+const ACCT_IDLE_YIELD_MS = 1500;
+// Priority dispatch gate (pure factory, injectable clock — node-tested).
+// hot enter() is immediate; idle enter() waits while any hot read is being
+// dispatched/in flight, capped at yieldMs. Returns the queued-wait ms so the
+// diag line can split queue wait from HTTP time.
+function acctPrioGate(nowFn, yieldMs) {
+  const now = typeof nowFn === 'function' ? nowFn : Date.now;
+  const cap = (Number.isFinite(yieldMs) && yieldMs > 0) ? yieldMs : ACCT_IDLE_YIELD_MS;
+  let hotN = 0;
+  let waiters = [];
+  const release = () => {
+    if (hotN > 0) return;
+    const w = waiters; waiters = [];
+    for (const f of w) { try { f(); } catch (e) { /* resolved */ } }
+  };
+  return {
+    hotPending: () => hotN,
+    // Returns a NUMBER (0) synchronously when there is nothing to wait for —
+    // the guard's uncontended path must stay synchronous (the single-flight
+    // timing existing tests pin) — and a promise only under hot contention.
+    enter: (isHot) => {
+      if (isHot) { hotN++; return 0; }
+      if (hotN === 0) return 0;
+      return (async () => {
+        const t0 = now();
+        while (hotN > 0 && now() - t0 < cap) {
+          await new Promise((res) => {
+            waiters.push(res);
+            setTimeout(res, 50);   // escape hatch — never deadlock
+          });
+        }
+        return now() - t0;
+      })();
+    },
+    exit: (isHot) => { if (isHot) { hotN = hotN > 0 ? hotN - 1 : 0; release(); } },
+  };
+}
 // One read outcome → was it a rate-limit? Explicit flag (wrappers that parse
 // Retry-After) or the uniform "Rate limited by <venue>" message every venue
 // wrapper emits for 429 statuses AND body-code maps (OKX 50011, KuCoin
@@ -4411,12 +4458,21 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   };
   const rlUntil = {};    // venue → cool-down end ts
   const inflight = {};   // venue|credSlot → in-flight promise
-  const memo = {};       // venue|credSlot → { ts, r }
+  const memo = {};       // venue|credSlot → { ts, r, hot }
+  const hotAt = {};      // #2131: venue → last own-trade-activity ts
+  const gate = acctPrioGate(now);   // #2131: hot-first dispatch ordering
   let readSeq = 0;       // #1853: monotonic ISSUANCE seq stamped on results
   const guarded = async function (intent) {
     const venue = String((intent && intent.venue) || '');
     const key = venue + '|' + String((intent && intent.credSlot) || venue);
     const t0 = now();
+    // #2131: HOT = panel-stamped prio:'hot' (gesture/push panel-side) OR a
+    // shell-observed own trade/push event within ACCT_HOT_MS (markHot below).
+    const isHot = (intent && intent.prio === 'hot') ||
+                  (t0 - (hotAt[venue] || 0) < ACCT_HOT_MS);
+    if (intent && intent.prio === 'hot') hotAt[venue] = t0;
+    // Cool-down gate stays FIRST and unconditional — priority never bypasses
+    // the venue rate budget (#2131 rule: reorder, never add volume).
     const left = (rlUntil[venue] || 0) - t0;
     if (left > 0) {
       emit('paced', { venue: venue, retryInMs: left });
@@ -4424,7 +4480,12 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
                message: 'Rate limited — pacing reads, retry in ' + Math.ceil(left / 1000) + 's' };
     }
     const m = memo[key];
-    if (m && t0 - m.ts < ACCT_READ_MEMO_MS) { emit('memo', { venue: venue }); return m.r; }
+    // #2131: a HOT read must not be served a stale memo an IDLE poll just
+    // populated — hot reuses only hot-stamped memo entries; idle reads keep
+    // the full memo window byte-identically.
+    if (m && t0 - m.ts < ACCT_READ_MEMO_MS && (!isHot || m.hot)) {
+      emit('memo', { venue: venue }); return m.r;
+    }
     if (inflight[key]) { emit('coalesced', { venue: venue }); return await inflight[key]; }
     // #1853 snapshot ordering: stamp ISSUANCE order (seq taken BEFORE the
     // request goes out — a read issued earlier captured older venue state
@@ -4435,8 +4496,24 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
     // Memo/coalesced callers share the stamp — same snapshot, same seq.
     const issSeq = ++readSeq;
     const p = (async () => {
-      const r = await runRaw(intent);
-      if (r && typeof r === 'object' && r.readSeq == null) r.readSeq = issSeq;
+      // #2131: idle reads yield (bounded) while hot reads dispatch; the
+      // queued-wait ms is stamped separately from HTTP time for the diag.
+      // gate.enter returns 0 SYNCHRONOUSLY when uncontended so the raw call
+      // keeps firing on the same tick (single-flight timing unchanged).
+      const qe = gate.enter(isHot);
+      const qms = (typeof qe === 'number') ? qe : await qe;
+      let r;
+      try {
+        // __hot rides the intent copy so venue readers can claim priority on
+        // their own internal budgets (kraken rate-points ledger) — additive,
+        // the original intent object is never mutated.
+        r = await runRaw(isHot ? Object.assign({}, intent, { __hot: 1 }) : intent);
+      } finally { gate.exit(isHot); }
+      if (r && typeof r === 'object') {
+        if (r.readSeq == null) r.readSeq = issSeq;
+        if (r.prio == null) r.prio = isHot ? 'hot' : 'idle';   // #2131 diag
+        if (r.qms == null && Number.isFinite(qms)) r.qms = Math.round(qms);
+      }
       if (acctRlHit(r)) {
         const wait = acctRlWaitMs(venue, Number.isFinite(r.retryInMs) ? r.retryInMs : null);
         rlUntil[venue] = now() + wait;
@@ -4448,7 +4525,7 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
     inflight[key] = p;
     try {
       const r = await p;
-      memo[key] = { ts: now(), r: r };
+      memo[key] = { ts: now(), r: r, hot: isHot };
       return r;
     } finally { delete inflight[key]; }
   };
@@ -4458,6 +4535,18 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   guarded.bust = function (venue, credSlot) {
     delete memo[String(venue || '') + '|' + String(credSlot || venue || '')];
     emit('bust', { venue: String(venue || '') });
+  };
+  // #2131: own trade activity observed shell-side (trade ack, push event)
+  // marks the venue HOT for ACCT_HOT_MS — its reads dispatch first and skip
+  // idle-populated memo entries. Never touches cool-downs or single-flight.
+  guarded.markHot = function (venue) {
+    const v = String(venue || '');
+    if (!v) return;
+    hotAt[v] = now();
+    emit('hot', { venue: v });
+  };
+  guarded.isHot = function (venue) {
+    return now() - (hotAt[String(venue || '')] || 0) < ACCT_HOT_MS;
   };
   return guarded;
 }
@@ -5092,6 +5181,7 @@ function createTradeNative(opts) {
     for (const ev of evs) {
       // memo-bust so the push-triggered acct_read observes the mutation
       try { execAcctRead.bust('binance', ev.slot); } catch (e) { /* best-effort */ }
+      try { execAcctRead.markHot('binance'); } catch (e) { /* #2131 hot lane */ }
       try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
       tdiag('acct', 'bn_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
@@ -5385,6 +5475,7 @@ function createTradeNative(opts) {
     }, Date.now(), 'hyperliquid');
     for (const ev of evs) {
       try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      try { execAcctRead.markHot('hyperliquid'); } catch (e) { /* #2131 hot lane */ }
       tdiag('acct', 'hl_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
     // #2020 push-beat local-blotter drain: fills land in the local store on
@@ -5598,6 +5689,7 @@ function createTradeNative(opts) {
       // a mutation observed on the push beat invalidates the acct-read memo
       // (Binance flush pattern) so the push-kicked read never serves stale.
       try { execAcctRead.bust('bybit', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('bybit'); } catch (e) { /* #2131 hot lane */ }
       tdiag('acct', 'byb_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
     // push-beat local-blotter drain (HL pattern): fills land in the local
@@ -7189,7 +7281,7 @@ function createTradeNative(opts) {
   // cancel_all's OpenOrders id-discovery) rides the reserved lane: it never
   // defers/skips at the floor, and a body-level rate limit retries on the
   // bounded cancel deadline instead of failing the cancel silently.
-  async function krRequest(creds, method, market, path, params, route, _nretry, _cxl0, _pri) {
+  async function krRequest(creds, method, market, path, params, route, _nretry, _cxl0, _pri, _hot) {
     const pair = krPairFor(creds, market);
     if (!pair) {
       return { ok: false, message: market === 'futures'
@@ -7204,13 +7296,24 @@ function createTradeNative(opts) {
     if (krCC && _pri) krCC.cls = 'cancel';   // reserved lane + loud retry
     if (krCC && !_nretry && !_cxl0) {
       const led = krLedgerFor(pair.key);
+      const hotT0 = Date.now();   // #2131: bounded hot wait, never unbounded
       for (;;) {
         const g = krLedgerGate(led, krCC.cls, krCC.cost, Date.now());
         if (g.send) break;
         tdiag('trade', 'kr_budget', { k: 'kraken', p: path,
           act: g.skip ? 'skip' : 'defer', waitMs: g.waitMs,
-          pts: Math.round(krLedgerPts(led, Date.now()) * 10) / 10 });
+          pts: Math.round(krLedgerPts(led, Date.now()) * 10) / 10,
+          hot: _hot ? 1 : 0 });
         if (g.skip) {
+          // #2131: a HOT read (user just traded on kraken) gets first claim
+          // on the rate-points ledger — it WAITS for refill instead of being
+          // skipped, bounded to 15s. Routine idle polls keep skipping (their
+          // kr_budget deferrals are fine and stay). The ledger itself is
+          // untouched — no extra points are ever spent.
+          if (_hot && Date.now() - hotT0 < 15000) {
+            await krWsSleep(Math.max(250, Math.min(g.waitMs || 250, 2000)));
+            continue;
+          }
           return { ok: false, skipped: true,
                    message: 'kr_budget: deferred by the rate-points ledger' };
         }
@@ -7270,7 +7373,7 @@ function createTradeNative(opts) {
       if (msg.indexOf('EAPI:Invalid nonce') >= 0 && !_nretry) {
         const bump = Date.now() + KR_NONCE_RETRY_LEAD_MS;
         if (bump > krNonceLast) krNonceLast = bump;
-        return krRequest(creds, method, market, path, params, route, true, _cxl0, _pri);
+        return krRequest(creds, method, market, path, params, route, true, _cxl0, _pri, _hot);
       }
       // #1832: `EAPI:Rate limit` rides an HTTP 200 body — mirror venue truth
       // (drain our ledger so queries back off) and NEVER let a cancel fail
@@ -7286,7 +7389,7 @@ function createTradeNative(opts) {
               act: 'cancel_retry', sinceMs: Date.now() - t0 });
             await krWsSleep(KR_CANCEL_RETRY_GAP_MS);
             return krRequest(creds, method, market, path, params, route,
-                             _nretry, t0, _pri);
+                             _nretry, t0, _pri, _hot);
           }
           return { ok: false, message:
             'CANCEL FAILED — Kraken rate limit persisted ~5s (' + msg
@@ -7439,6 +7542,7 @@ function createTradeNative(opts) {
     }, Date.now());
     for (const ev of evs) {
       try { execAcctRead.bust('kraken', ev.slot); } catch (e) { /* pre-init */ }
+      try { execAcctRead.markHot('kraken'); } catch (e) { /* #2131 hot lane */ }
       try { pushLedgerCb(ev); } catch (e) { /* window gone mid-send */ }
       tdiag('acct', 'kr_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
@@ -10408,9 +10512,11 @@ function createTradeNative(opts) {
       try { prods = await krProducts(route); } catch (e) { prods = null; }
       out.spotOrders = krWsSpotOpenOrders(S.orders, (prods || {}).spot || {});
     } else {
-      const bal = await krRequest(creds, 'POST', 'spot', '/0/private/BalanceEx', null, route);
+      const bal = await krRequest(creds, 'POST', 'spot', '/0/private/BalanceEx', null, route,
+                                  false, 0, false, !!intent.__hot);   // #2131 hot claim
       if (!bal.ok) return bal;
-      const so = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route);
+      const so = await krRequest(creds, 'POST', 'spot', '/0/private/OpenOrders', null, route,
+                                 false, 0, false, !!intent.__hot);   // #2131 hot claim
       if (!so.ok) return so;
       // Flatten the spot OpenOrders map to [{txid, o}] preserving the ids.
       const spotOrders = [];
@@ -12399,6 +12505,17 @@ function createTradeNative(opts) {
       }
       catch (e) { /* non-fatal — label just stays pending */ }
     }
+    // #2131: every ACKed mutating op marks the venue HOT (one choke point for
+    // ALL venues) so its follow-up account reads dispatch ahead of routine
+    // idle-venue polls for ACCT_HOT_MS. Reorders only — budgets untouched.
+    if (intent && typeof intent === 'object' && r && r.ok) {
+      const mop = String(intent.op || '');
+      if (mop === 'order' || mop === 'cancel' || mop === 'cancel_all' ||
+          mop === 'close' || mop === 'close_pos' || mop === 'amend' ||
+          mop === 'sltp') {
+        try { execAcctRead.markHot(String(intent.venue || '')); } catch (e) { /* pre-init */ }
+      }
+    }
     // Diag summaries for the read + order layers (#1786), after the via stamp
     // (test pins slice the handler head). Orders log venue/market/symbol/side/
     // qty ONLY (design rule); reads log status, pacing and row counts.
@@ -12409,6 +12526,9 @@ function createTradeNative(opts) {
                      market: intent.market, ok: !!(r && r.ok),
                      paced: !!(r && r.rateLimited), ms: Date.now() - diagT0,
                      rows: diagRowCounts(r && r.data ? r.data : r) };
+        // #2131: queue wait vs HTTP time at a glance — prio + queued-wait ms
+        // (stamped by the guard's dispatch gate; absent on memo/paced hits).
+        if (r && r.prio) { dd.prio = r.prio; if (Number.isFinite(r.qms)) dd.qms = r.qms; }
         tdiag('acct', op, dd);
       } else if (op === 'order' || op === 'cancel' || op === 'cancel_all' ||
                  op === 'close_pos' || op === 'amend') {
@@ -12940,6 +13060,10 @@ module.exports = {
   acctRlHit,
   acctRlWaitMs,
   acctReadGuard,
+  // pure — #2131 hot-venue acct-read priority
+  ACCT_HOT_MS,
+  ACCT_IDLE_YIELD_MS,
+  acctPrioGate,
   // pure — #2008 HL background REST budgeter
   hlInfoWeight,
   hlInfoTier,
