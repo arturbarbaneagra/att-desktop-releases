@@ -1384,6 +1384,65 @@ function lbNormBybFill(f) {
     exec_id: String(f.execId || ''),
   };
 }
+// #2153 gate fill → normalized blotter row. Engine norm_gate_fill twin —
+// the exec-id space (String(f.id)) and every field rule must stay
+// byte-identical to the engine's so local/server dedup keys agree.
+// Futures rows size in SIGNED CONTRACTS (sign = side; ×quanto_multiplier →
+// base qty; mult unknown ⇒ null — the raw row stays cached and the next
+// drain re-normalizes once the contract map warmed). Spot fee is charged
+// in the RECEIVED currency: base-ccy fee ×price, quote as-is, other (GT
+// deduction) ⇒ 0. Gate hands NO per-fill closed PnL — '0' always (NET
+// comes from local-blotter replay panel-side). ts: create_time_ms
+// preferred, else create_time seconds ×1000.
+function lbNormGateFill(f, market, mult) {
+  if (!f || typeof f !== 'object') return null;
+  const eid = f.id != null ? String(f.id) : '';
+  if (!eid) return null;
+  const px = lbNum(f.price) || '0';
+  if (!(Number(px) > 0)) return null;
+  const msRaw = f.create_time_ms != null ? Number(f.create_time_ms)
+                                         : (Number(f.create_time) || 0) * 1000;
+  const ts = Math.floor(msRaw > 0 ? msRaw : 0);
+  let row = null;
+  if (market === 'futures') {
+    const sz = Number(f.size);
+    if (!Number.isFinite(sz) || sz === 0) return null;
+    const m = Number(mult);
+    if (!(m > 0)) return null;   // contract map cold — re-normalized next drain
+    const qty = lbFmt(Math.abs(sz) * m);
+    if (!(Number(qty) > 0)) return null;
+    const fee = (Number(f.fee) || 0) + (Number(f.point_fee) || 0);
+    row = {
+      venue: 'gate', market: 'futures', symbol: String(f.contract || ''),
+      side: sz > 0 ? 'buy' : 'sell', posSide: '',
+      order_px: '', exec_px: px, qty: qty,
+      value: lbFmt(Number(px) * Number(qty)),
+      fee: lbFmt(fee), closed_pnl: '0',
+      kind: 'trade', funding: '0', ts: ts, exec_id: eid,
+    };
+  } else {
+    const qty = lbNum(f.amount) || '0';
+    if (!(Number(qty) > 0)) return null;
+    const pair = String(f.currency_pair || '');
+    const base = pair.indexOf('_') > 0 ? pair.slice(0, pair.indexOf('_')) : '';
+    const quote = pair.indexOf('_') > 0 ? pair.slice(pair.indexOf('_') + 1) : '';
+    const fc = String(f.fee_currency || '');
+    const feeRaw = Number(f.fee) || 0;
+    let fee = 0;
+    if (fc && fc === base) fee = feeRaw * Number(px);
+    else if (fc && fc === quote) fee = feeRaw;
+    row = {
+      venue: 'gate', market: 'spot', symbol: pair,
+      side: String(f.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell', posSide: '',
+      order_px: '', exec_px: px, qty: qty,
+      value: lbFmt(Number(px) * Number(qty)),
+      fee: lbFmt(fee), closed_pnl: '0',
+      kind: 'trade', funding: '0', ts: ts, exec_id: eid,
+    };
+  }
+  if (!row.symbol || !(row.ts > 0)) return null;
+  return row;
+}
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
 function lbFillKey(f) {
@@ -1594,6 +1653,40 @@ function lbPruneRows(rows, cap) {
 const LB_BN_MAX_CALLS = 90;
 const LB_BN_FUT_WIN_MS = 7 * 86400 * 1000;
 const LB_BN_SPOT_SYM_CAP = 50;
+// #2160 re-import window precheck: the walk needs at least one signed call
+// per futures 7d-chunk plus one per pair × spot day-chunk — a LOWER BOUND
+// of the real call count (full pages re-page inside a chunk). If even the
+// minimum exceeds LB_BN_MAX_CALLS the walk is GUARANTEED to fail, so
+// reject before any trade fetch starts (field case: ~26d × 12 pairs burned
+// 65s / ~580 requests before the mid-fetch cap fired). Returns null when
+// the window may fit; the in-loop cap stays as the honest backstop.
+const LB_RI_BN_SPOT_WIN_MS = 24 * 3600 * 1000 - 60000;   // myTrades span cap
+function lbBnRiEstimate(market, spanMs, pairs) {
+  const fut = market !== 'spot' ? Math.ceil(spanMs / LB_BN_FUT_WIN_MS) : 0;
+  const spotChunks = market !== 'futures' ? Math.ceil(spanMs / LB_RI_BN_SPOT_WIN_MS) : 0;
+  return { fut: fut, spotChunks: spotChunks,
+           total: fut + (pairs | 0) * spotChunks };
+}
+function lbBnRiPrecheck(market, frm, to, pairs) {
+  const est = lbBnRiEstimate(market, Math.max(1, to - frm), pairs);
+  if (est.total <= LB_BN_MAX_CALLS) return null;
+  // largest whole-day window that fits the budget for THIS pair count —
+  // an actionable retry hint (0 = even one day is over).
+  let maxDays = 0;
+  for (let d = 1; d <= 92; d++) {
+    if (lbBnRiEstimate(market, d * 86400 * 1000, pairs).total
+        > LB_BN_MAX_CALLS) break;
+    maxDays = d;
+  }
+  return { pairs: pairs | 0, chunks: est.spotChunks, futChunks: est.fut,
+    reqs: est.total, maxDays: maxDays,
+    msg: 'Window too large: ' + (pairs | 0) + ' pairs × ' + est.spotChunks
+      + ' day-chunks' + (est.fut ? ' + ' + est.fut + ' futures chunks' : '')
+      + ' = ' + est.total + ' requests (budget ' + LB_BN_MAX_CALLS + ').'
+      + (maxDays > 0
+         ? ' Max ~' + maxDays + ' days for your pair count.'
+         : ' Re-import futures and spot separately or reduce the pair count.') };
+}
 const LB_BN_QUOTES = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BTC', 'ETH', 'BNB', 'EUR', 'TRY'];
 // Spot symbol UNIVERSE for backfill: local rows alone miss never-recorded
 // pairs, so derive from the account itself — held assets (spot balances) ×
@@ -2165,6 +2258,13 @@ function gateSign(secret, method, path, query, body, ts) {
   const msg = [String(method).toUpperCase(), String(path), String(query || ''),
                gateBodyHash(body), String(ts)].join('\n');
   return crypto.createHmac('sha512', String(secret)).update(msg, 'utf8').digest('hex');
+}
+// #2153 Gate private WS per-subscribe auth (engine gate_ws_sign twin):
+// HMAC-SHA512 hex over 'channel=<ch>&event=<ev>&time=<t>'.
+function gateWsSign(secret, channel, event, t) {
+  return crypto.createHmac('sha512', String(secret))
+    .update('channel=' + String(channel) + '&event=' + String(event) + '&time=' + String(t), 'utf8')
+    .digest('hex');
 }
 
 const GATE_ERRORS = {
@@ -4633,6 +4733,7 @@ function createTradeNative(opts) {
     try { if (venue) bnUdsClose(venue); else bnUdsCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) hlPushClose(venue); else hlPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bybPushClose(venue); else bybPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) gatePushClose(venue); else gatePushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -6236,6 +6337,302 @@ function createTradeNative(opts) {
                           { reduceOnly: true, trigger: intent.trigger, closeOnTrigger: true });
     if (!r.ok) return r;
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // --- #2153 Gate account push lane ---------------------------------------
+  // Gate splits private data across TWO WS endpoints — spot
+  // (wss://api.gateio.ws/ws/v4/) and USDT futures
+  // (wss://fx-ws.gateio.ws/v4/ws/usdt) — so a session runs one scope per
+  // socket (engine GatePrivateCache twin; Binance two-socket precedent).
+  // Auth is PER-SUBSCRIBE: every private channel's subscribe frame carries
+  // {method:'api_key', KEY, SIGN} with SIGN = HMAC-SHA512 over
+  // 'channel=<ch>&event=subscribe&time=<t>' (gateWsSign). Futures channels
+  // key on the numeric account uid ([uid,'!all']) resolved once per session
+  // from /futures/usdt/accounts — a spot-only key has no futures account:
+  // that loop parks on a long cool-down (fail-visible scope.err, never a
+  // hot retry). usertrades is the ONLY fills source (no order-delta
+  // reconstruction). Pending PRICE ORDERS (stop family, po:<id>) do NOT
+  // ride any WS channel — the ack-time gateMutKick + push-kicked acct read
+  // cover their badge latency (the read's price_orders leg is the truth);
+  // a triggered stop then lands as a plain order on the orders channel.
+  // Rides the proxy agent like all shell traffic (krWsDial).
+  const GATE_PUSH_SPOT_URL = 'wss://api.gateio.ws/ws/v4/';
+  const GATE_PUSH_FUT_URL = 'wss://fx-ws.gateio.ws/v4/ws/usdt';
+  const GATE_PUSH_FILLS_CAP = 600;
+  const gatePushSessions = {};
+  const gatePushPend = {};
+  let gatePushTimer = null;
+  function gatePushFlush() {
+    gatePushTimer = null;
+    const evs = krPushDrain(gatePushPend, (key) => {
+      const sess = gatePushSessions[key.slice(0, key.indexOf('|'))];
+      if (!sess) return 0;
+      return key.slice(key.indexOf('|') + 1) === 'spot' ? sess.sp.lseq : sess.fu.lseq;
+    }, Date.now(), 'gate');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      // a mutation observed on the push beat invalidates the acct-read memo
+      // (Binance flush pattern) so the push-kicked read never serves stale.
+      try { execAcctRead.bust('gate', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('gate'); } catch (e) { /* #2131 hot lane */ }
+      tdiag('acct', 'gate_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    // push-beat local-blotter drain (HL pattern): fills land in the local
+    // store on the flush itself (idempotent — lbDrain dedups by exec_id).
+    try {
+      for (const ev of evs) {
+        if (ev && ev.kinds && ev.kinds.indexOf('fill') >= 0)
+          lbDrain(String(ev.slot || 'gate'), 'gate');
+      }
+    } catch (e) { /* local store off — panel read drains later */ }
+  }
+  function gatePushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(gatePushPend, scope._pk, kind, id, row);
+    if (!gatePushTimer) {
+      gatePushTimer = setTimeout(gatePushFlush, KR_PUSH_COALESCE_MS);
+      if (gatePushTimer && typeof gatePushTimer.unref === 'function') gatePushTimer.unref();
+    }
+  }
+  function gatePushScope(pk) {
+    return { running: false, up: false, ws: null, err: null, lastMsg: 0,
+             lseq: 0, seeded: false, fills: { rows: [], seen: {} }, _pk: pk };
+  }
+  function gatePushClose(slot) {
+    const sess = gatePushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    for (const sc of [sess.sp, sess.fu]) {
+      try { if (sc.ws) sc.ws.terminate(); } catch (e) { /* gone */ }
+      sc.ws = null; sc.up = false;
+    }
+    delete gatePushSessions[slot];
+  }
+  function gatePushCloseAll() {
+    for (const k of Object.keys(gatePushSessions)) gatePushClose(k);
+  }
+  function gatePushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key) return null;
+    slot = String(slot || 'gate');
+    let sess = gatePushSessions[slot];
+    if (sess && sess.tail !== creds.key) { gatePushClose(slot); sess = null; }
+    if (!sess) {
+      sess = gatePushSessions[slot] = {
+        tail: creds.key, closed: false, route: route, creds: creds,
+        uid: null, tOff: 0,
+        sp: gatePushScope(slot + '|spot'),
+        fu: gatePushScope(slot + '|fut'),
+      };
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    if (!sess.sp.running) gatePushLoop(slot, sess, 'spot');
+    if (!sess.fu.running) gatePushLoop(slot, sess, 'fut');
+    return sess;
+  }
+  async function gatePushSeed(sess, which) {
+    // dedup-only seed: the usertrades channels have no snapshot frame, so
+    // recent REST exec ids pre-mark the seen-set (a fill recorded by the
+    // poll path milliseconds before the socket came up must not re-push).
+    // Best-effort: a failed seed never blocks the stream (push is truth).
+    const sc = which === 'fut' ? sess.fu : sess.sp;
+    if (sc.seeded) return;
+    sc.seeded = true;
+    try {
+      const reqPath = which === 'fut' ? '/futures/usdt/my_trades' : '/spot/my_trades';
+      const r = await gateRequest(sess.creds, 'GET', reqPath,
+                                  [['limit', '100']], null, sess.route);
+      if (!r.ok) return;
+      for (const f of (Array.isArray(r.data) ? r.data : [])) {
+        const eid = f && f.id != null ? String(f.id) : '';
+        if (eid) sc.fills.seen[eid] = 1;
+      }
+    } catch (e) { /* best-effort */ }
+  }
+  function gatePushLoop(slot, sess, which) {
+    const sc = which === 'fut' ? sess.fu : sess.sp;
+    sc.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (gatePushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          // signer clock discipline (native-venue-time-sync): subscribe
+          // frames stamp venue-synced seconds, never raw Date.now().
+          sess.tOff = await ensureVenueTime('gate', null, sess.route);
+          if (which === 'fut' && sess.uid == null) {
+            const r = await gateRequest(sess.creds, 'GET', '/futures/usdt/accounts',
+                                        null, null, sess.route);
+            if (!r.ok) throw new Error(r.message || 'futures account read failed');
+            const uid = Number((r.data || {}).user);
+            if (!Number.isFinite(uid) || uid <= 0) throw new Error('futures account uid missing');
+            sess.uid = uid;
+          }
+          await gatePushSeed(sess, which);
+          await gatePushConn(slot, sess, which);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          sc.err = 'Gate push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'gate_push_err', { s: which, m: String(sc.err).slice(0, 120) });
+          // spot-only key: no futures account is a STATE, not a transient —
+          // park on a long cool-down (picks up a later futures opening
+          // without hammering the endpoint at the hot ladder).
+          if (which === 'fut' && String((e && e.message) || '').indexOf('futures account') >= 0) {
+            backoff = 600000;
+          }
+        }
+        sc.up = false; sc.ws = null;
+        if (sess.closed || gatePushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, backoff >= 600000 ? 600000 : 60000);
+      }
+      sc.running = false;
+    })().catch(() => { sc.running = false; });
+  }
+  function gatePushConn(slot, sess, which) {
+    return new Promise((resolve, reject) => {
+      const mk = which === 'fut' ? 'futures' : 'spot';
+      const ws = krWsDial(which === 'fut' ? GATE_PUSH_FUT_URL : GATE_PUSH_SPOT_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const sc = which === 'fut' ? sess.fu : sess.sp;
+      sc.ws = ws;
+      let settled = false;
+      let acked = 0;
+      const expect = which === 'fut' ? 4 : 3;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        sc.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // Gate idle-closes quiet conns — app-level <mkt>.ping every 20s keeps
+      // it live; a 90s frame gap tears down for a clean redial.
+      const kaT = setInterval(() => {
+        try { ws.send(JSON.stringify({ time: Number(venueStampSec(sess.tOff)), channel: mk + '.ping' })); }
+        catch (e) { /* dying */ }
+        if (Date.now() - (sc.lastMsg || 0) > 90000) done(new Error('stream stalled'));
+      }, 20000);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      const sub = (channel, payload) => {
+        const tsec = Number(venueStampSec(sess.tOff));
+        const fr = { time: tsec, channel: channel, event: 'subscribe',
+                     auth: { method: 'api_key', KEY: sess.creds.key,
+                             SIGN: gateWsSign(sess.creds.secret, channel, 'subscribe', tsec) } };
+        if (payload != null) fr.payload = payload;
+        ws.send(JSON.stringify(fr));
+      };
+      ws.on('open', () => {
+        sc.lastMsg = Date.now();
+        try {
+          if (which === 'fut') {
+            const uid = String(sess.uid);
+            sub('futures.orders', [uid, '!all']);
+            sub('futures.usertrades', [uid, '!all']);
+            sub('futures.positions', [uid, '!all']);
+            sub('futures.balances', [uid]);
+          } else {
+            sub('spot.orders', ['!all']);
+            sub('spot.usertrades', ['!all']);
+            sub('spot.balances');
+          }
+        } catch (e) { done(e); return; }
+      });
+      ws.on('ping', () => { sc.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        sc.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const ev = String((msg && msg.event) || '');
+        if (ev === 'subscribe') {
+          if (msg.error) {
+            done(new Error('subscribe rejected: ' + String((msg.error && msg.error.message) || msg.error)));
+            return;
+          }
+          acked++;
+          if (acked >= expect && !sc.up) {
+            sc.up = true; sc.err = null;
+            tdiag('acct', 'gate_push_up', { s: slot + '|' + which });
+          }
+          return;
+        }
+        if (ev !== 'update') return;   // pong/other control frames
+        try { gatePushEvApply(sc, mk, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function gatePushEvApply(sc, mk, msg) {
+    const ch = String((msg && msg.channel) || '');
+    const res = msg && msg.result;
+    const rows = Array.isArray(res) ? res
+      : (res && typeof res === 'object' ? [res] : []);
+    if (!ch || !rows.length) return;
+    if (ch === mk + '.usertrades') {
+      for (const f of rows) {
+        const eid = f && f.id != null ? String(f.id) : '';
+        if (!eid || sc.fills.seen[eid]) continue;
+        sc.fills.seen[eid] = 1;
+        // RAW usertrades row rides the push (contract/currency_pair, size/
+        // amount+side, price, fee/fee_currency/point_fee, create_time_ms all
+        // included — fee passthrough). Never slim it; the scope key routes
+        // the market panel-side (spot vs fut sockets never mix).
+        sc.fills.rows.push(f);
+        if (sc.fills.rows.length > GATE_PUSH_FILLS_CAP) {
+          sc.fills.rows.splice(0, sc.fills.rows.length - GATE_PUSH_FILLS_CAP);
+        }
+        krLseq(sc); gatePushSc(sc, 'fill', eid, f);
+        if (mk === 'futures') { krLseq(sc); gatePushSc(sc, 'pos'); }   // a fill moves the position
+      }
+      return;
+    }
+    if (ch === mk + '.orders') {
+      // engine gate_order_apply twin: spot rows carry `event`
+      // (put/update=open, finish=gone); futures rows carry `status`
+      // (open vs finished). Open rows ride as REST-shaped order rows —
+      // the panel's gateAcctOrderRow reads both shapes directly.
+      for (const o of rows) {
+        const oid = o && o.id != null ? String(o.id) : '';
+        if (!oid) continue;
+        let isOpen;
+        if (mk === 'futures') {
+          isOpen = String((o && o.status) || 'open') === 'open';
+        } else {
+          const oev = String((o && o.event) || '');
+          isOpen = oev ? (oev === 'put' || oev === 'update')
+                       : String((o && o.status) || 'open') === 'open';
+        }
+        if (isOpen) { krLseq(sc); gatePushSc(sc, 'order', null, o); }
+        else { krLseq(sc); gatePushSc(sc, 'ordgone', oid); }
+      }
+      return;
+    }
+    if (ch === 'futures.positions' && mk === 'futures') {
+      // flat rows (size 0) ride too — the panel's gateAcctPosRow returns
+      // null for them and the upsert removes the posrow that beat.
+      for (const p of rows) { krLseq(sc); gatePushSc(sc, 'pos', null, p); }
+      return;
+    }
+    if (ch === mk + '.balances') {
+      for (const b of rows) { krLseq(sc); gatePushSc(sc, 'bal', null, b); }
+    }
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
+  // Binance/Bybit pattern): the WS echo lands ~100ms later, but the local
+  // bump makes the badge/posrow read fire immediately after the REST ack.
+  // Market-scoped — gate order ids are per-market sequences (spot and
+  // futures id spaces may collide; the scope key keeps tombstones honest).
+  function gateMutKick(slot, kind, oid, market) {
+    const sess = gatePushSessions[String(slot || 'gate')];
+    if (!sess) return;
+    const sc = market === 'spot' ? sess.sp : sess.fu;
+    if (kind === 'ordgone' && oid) {
+      krLseq(sc); gatePushSc(sc, 'ordgone', String(oid));
+    } else {
+      krLseq(sc); gatePushSc(sc, 'order');
+    }
   }
 
   // --- Gate --------------------------------------------------------------------
@@ -10111,6 +10508,10 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'gate');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
+    // #2153: acct reads keep the private push sockets warm (push-driven
+    // display) — no-op while the loops already run. The read then RE-ATTACHES
+    // push fills to the fresh snapshot panel-side (binance-shell-push rule).
+    try { gatePushEnsure(intent.credSlot || 'gate', creds, route); } catch (e) { /* REST-only */ }
     const spotAcc = await gateRequest(creds, 'GET', '/spot/accounts', null, null, route);
     if (!spotAcc.ok) return spotAcc;
     const pos = await gateRequest(creds, 'GET', '/futures/usdt/positions', null, null, route);
@@ -10999,6 +11400,60 @@ function createTradeNative(opts) {
     return _dgLine({ ok: true, symbol: sym, leverage: lev });
   }
 
+  // #2153 Gate futures leverage GET/POST (device-signed; engine
+  // leverage_config/set_leverage twins). Gate convention: leverage '0'
+  // means CROSS mode — the magnitude rides cross_leverage_limit; the set
+  // path always selects cross (leverage=0&cross_leverage_limit=N), server
+  // POST parity. A never-touched contract reads as null (chip shows the
+  // venue default). DUAL position mode is fail-visible: the one-way
+  // endpoints error there and the message surfaces verbatim — never a
+  // silent default (gate-unified-detection rule).
+  async function execGateLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'gate');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '');
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    const levOf = (p) => {
+      let v = bnNum((p || {}).leverage);
+      if (v == null || v === '0') v = bnNum((p || {}).cross_leverage_limit) || null;
+      return v != null && Number(v) > 0 ? v : null;
+    };
+    if (intent.what === 'set') {
+      const lev = parseFloat(intent.leverage);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      if (Math.floor(lev) !== lev) return _dgLine({ ok: false, message: 'Leverage must be a whole number' });
+      const r = await gateRequest(creds, 'POST',
+        '/futures/usdt/positions/' + encodeURIComponent(sym) + '/leverage',
+        [['leverage', '0'], ['cross_leverage_limit', String(lev)]], null, route);
+      if (!r.ok) return _dgLine(r);
+      const row = Array.isArray(r.data) ? r.data[0] : r.data;
+      return _dgLine({ ok: true, symbol: sym, leverage: levOf(row) || String(lev) });
+    }
+    const r = await gateRequest(creds, 'GET',
+      '/futures/usdt/positions/' + encodeURIComponent(sym), null, null, route);
+    if (!r.ok) {
+      // engine twin: a never-touched contract 404s POSITION_NOT_FOUND —
+      // that is "no configured leverage", not an error.
+      if (/not found|not_found|does not exist/i.test(String(r.message || ''))) {
+        return _dgLine({ ok: true, symbol: sym, leverage: null });
+      }
+      return _dgLine(r);
+    }
+    return _dgLine({ ok: true, symbol: sym, leverage: levOf(r.data) });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -11469,6 +11924,30 @@ function createTradeNative(opts) {
           if (f) fills.push(f);
         }
       }
+    } else if (venue === 'gate') {
+      // #2153: two per-market raw rings (spot/futures sockets never mix).
+      // Futures rows size in CONTRACTS — quanto_multiplier from the shell
+      // contract cache; a cold entry skips the row THIS drain and fires a
+      // best-effort warm (HL wireMap recipe: the raw row stays cached, the
+      // next drain re-normalizes it once the multiplier landed).
+      const sess = gatePushSessions[slot];
+      if (sess) {
+        for (const r of ((sess.sp.fills && sess.sp.fills.rows) || [])) {
+          const f = lbNormGateFill(r, 'spot', null);
+          if (f) fills.push(f);
+        }
+        for (const r of ((sess.fu.fills && sess.fu.fills.rows) || [])) {
+          const sym = String((r && r.contract) || '');
+          const mc = gateMultCache[sym];
+          const mult = mc ? mc.v : null;
+          if (!(Number(mult) > 0)) {
+            if (sym) gateMult(sym, sess.route).catch(() => { /* warm */ });
+            continue;
+          }
+          const f = lbNormGateFill(r, 'futures', mult);
+          if (f) fills.push(f);
+        }
+      }
     }
     if (aid) for (const f of fills) f.aid = aid;
     // #1973 field-test diag: pre-compute which drained rows are NEW (the WS
@@ -11496,7 +11975,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -11817,6 +12296,101 @@ function createTradeNative(opts) {
         for (const f of raw) { const n = lbNormBybFill(f); if (n) fills.push(n); }
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'gate') {
+        // #2153: futures /futures/usdt/my_trades_timerange (from/to SECONDS,
+        // offset paging, account-wide — engine _fut_fills_walk twin) + spot
+        // /spot/my_trades windowed walk (docs: a no-param call serves 7d
+        // only; explicit windows ≤30d; the range filters by ORDER END time;
+        // page cap limit×(page-1) ≤ 1000 ⇒ at limit=1000 only two pages — a
+        // full second page HALVES the window; ≥1h floor = honest gap note).
+        // Futures rows size in contracts → per-contract quanto_multiplier
+        // warms before normalize (engine ct_map parity).
+        const GATE_BF_PAGE_CAP = 60;
+        let pages = 0;
+        let failMsg = null;
+        const rawFut = [];
+        const rawSpot = [];
+        const futFrm = bfFrm('futures', 'futures');
+        let off = 0;
+        for (;;) {
+          if (pages >= GATE_BF_PAGE_CAP) { gap = true; notes.push('futures fill page cap reached — a gap is possible'); break; }
+          if (pages) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+          const rp = await gateRequest(creds, 'GET', '/futures/usdt/my_trades_timerange',
+            [['from', String(Math.floor(futFrm / 1000))], ['to', String(Math.ceil(now / 1000))],
+             ['limit', '100'], ['offset', String(off)]], null, route);
+          pages++;
+          if (!rp.ok) {
+            // spot-only key: no futures account is a normal state (the spot
+            // leg still runs); anything else is an honest fetch failure.
+            if (String(rp.message || '').indexOf('futures account') >= 0) break;
+            failMsg = rp.message || 'Gate futures fills fetch failed';
+            break;
+          }
+          const rows = Array.isArray(rp.data) ? rp.data : [];
+          for (const f of rows) rawFut.push(f);
+          if (rows.length < 100) break;
+          off += rows.length;
+        }
+        if (!failMsg) {
+          const spotFrm = bfFrm('spot', 'spot');
+          const GATE_SPOT_SPAN_MAX = 29 * 86400 * 1000;
+          let w0 = Math.max(0, Math.floor(spotFrm));
+          let span = GATE_SPOT_SPAN_MAX;
+          while (w0 < now) {
+            if (pages >= GATE_BF_PAGE_CAP) { gap = true; notes.push('spot fill page cap reached — a gap is possible'); break; }
+            const w1 = Math.min(now, w0 + span);
+            let full2 = false;
+            for (let pg = 1; pg <= 2; pg++) {
+              if (pages) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+              const rp = await gateRequest(creds, 'GET', '/spot/my_trades',
+                [['from', String(Math.floor(w0 / 1000))], ['to', String(Math.ceil(w1 / 1000))],
+                 ['limit', '1000'], ['page', String(pg)]], null, route);
+              pages++;
+              if (!rp.ok) { failMsg = rp.message || 'Gate spot fills fetch failed'; break; }
+              const rows = Array.isArray(rp.data) ? rp.data : [];
+              for (const f of rows) rawSpot.push(f);
+              if (rows.length < 1000) break;
+              if (pg === 2) full2 = true;
+            }
+            if (failMsg) break;
+            if (full2) {
+              // window truncated at the venue page cap — halve until it fits
+              // (already-fetched rows re-normalize; the merge dedups them)
+              if (w1 - w0 <= 3600 * 1000) {
+                gap = true;
+                notes.push('spot fills denser than the page cap in one hour — a gap is possible');
+                w0 = w1 + 1;
+              } else span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        const mset = {};
+        for (const f of rawFut) { const cs = String((f && f.contract) || ''); if (cs) mset[cs] = 1; }
+        for (const cs of Object.keys(mset)) { try { await gateMult(cs, route); } catch (e) { /* noted below */ } }
+        let multMiss = 0;
+        const fills = [];
+        for (const f of rawFut) {
+          const cs = String((f && f.contract) || '');
+          const mc = gateMultCache[cs];
+          const n = lbNormGateFill(f, 'futures', mc ? mc.v : null);
+          if (n) fills.push(n);
+          else if (cs && !(mc && Number(mc.v) > 0)) multMiss++;
+        }
+        if (multMiss) {
+          gap = true;
+          notes.push('contract spec unavailable for ' + multMiss + ' futures fill(s) — they retry next backfill');
+        }
+        for (const f of rawSpot) { const n = lbNormGateFill(f, 'spot', null); if (n) fills.push(n); }
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -11908,7 +12482,8 @@ function createTradeNative(opts) {
   // so a failed run never removes rows.
   const LB_RI_HL_PAGE_CAP = 12;
   const LB_RI_BYB_PAGE_CAP = 80;
-  const LB_RI_BN_SPOT_WIN_MS = 24 * 3600 * 1000 - 60000;   // myTrades span cap
+  // (binance spot span cap LB_RI_BN_SPOT_WIN_MS is module-level — the #2160
+  // precheck shares it with the walk so the two can never drift.)
   let _lbRiBusy = {};
   async function execLblotReimport(intent) {
     const venue = String(intent.venue || '');
@@ -12016,6 +12591,75 @@ function createTradeNative(opts) {
           }
         }
         for (const f of raw) { const n = lbNormBybFill(f); if (n) fills.push(n); }
+      } else if (venue === 'gate') {
+        // #2153: same walks as the gate backfill, over the explicit window.
+        // Venue-truth contract: a truncated or unsizable fetch fails VISIBLY
+        // (riFail), never a silent partial import.
+        const GATE_RI_PAGE_CAP = 80;
+        let pages = 0;
+        const rawFut = [];
+        const rawSpot = [];
+        if (market !== 'spot') {
+          let off = 0;
+          for (;;) {
+            if (pages >= GATE_RI_PAGE_CAP) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            if (pages) await sleep(HB_PAGE_GAP_MS);
+            const rp = await gateRequest(creds, 'GET', '/futures/usdt/my_trades_timerange',
+              [['from', String(Math.floor(w.frm / 1000))], ['to', String(Math.ceil(w.to / 1000))],
+               ['limit', '100'], ['offset', String(off)]], null, route);
+            pages++;
+            if (!rp.ok) {
+              // spot-only key: no futures account is a normal state
+              if (String(rp.message || '').indexOf('futures account') >= 0) break;
+              return riFail(rp.message || 'Gate futures fills fetch failed');
+            }
+            const rows = Array.isArray(rp.data) ? rp.data : [];
+            for (const f of rows) rawFut.push(f);
+            if (rows.length < 100) break;
+            off += rows.length;
+          }
+        }
+        if (market !== 'futures') {
+          const GATE_SPOT_SPAN_MAX = 29 * 86400 * 1000;
+          let w0 = Math.max(0, Math.floor(w.frm));
+          let span = GATE_SPOT_SPAN_MAX;
+          while (w0 < w.to) {
+            if (pages >= GATE_RI_PAGE_CAP) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            const w1 = Math.min(w.to, w0 + span);
+            let full2 = false;
+            for (let pg = 1; pg <= 2; pg++) {
+              if (pages) await sleep(HB_PAGE_GAP_MS);
+              const rp = await gateRequest(creds, 'GET', '/spot/my_trades',
+                [['from', String(Math.floor(w0 / 1000))], ['to', String(Math.ceil(w1 / 1000))],
+                 ['limit', '1000'], ['page', String(pg)]], null, route);
+              pages++;
+              if (!rp.ok) return riFail(rp.message || 'Gate spot fills fetch failed');
+              const rows = Array.isArray(rp.data) ? rp.data : [];
+              for (const f of rows) rawSpot.push(f);
+              if (rows.length < 1000) break;
+              if (pg === 2) full2 = true;
+            }
+            if (full2) {
+              if (w1 - w0 <= 3600 * 1000) return riFail('Spot fills denser than the page cap in one hour — narrow the date range');
+              span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+        }
+        const mset = {};
+        for (const f of rawFut) { const cs = String((f && f.contract) || ''); if (cs) mset[cs] = 1; }
+        for (const cs of Object.keys(mset)) { try { await gateMult(cs, route); } catch (e) { /* checked below */ } }
+        for (const f of rawFut) {
+          const cs = String((f && f.contract) || '');
+          const mc = gateMultCache[cs];
+          const n = lbNormGateFill(f, 'futures', mc ? mc.v : null);
+          if (n) fills.push(n);
+          else if (cs && !(mc && Number(mc.v) > 0)) {
+            return riFail('Gate contract spec unavailable for ' + cs + ' — cannot size its fills; retry shortly');
+          }
+        }
+        for (const f of rawSpot) { const n = lbNormGateFill(f, 'spot', null); if (n) fills.push(n); }
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -12036,6 +12680,26 @@ function createTradeNative(opts) {
           return bnRequest(creds, 'GET', mkt, reqPath, params, route, 16 * 1024 * 1024);
         };
         let calls = 0;
+        // #2160 precheck BEFORE any trade fetch: enumerate the spot pair
+        // universe first (the same source the walk uses — a few cheap
+        // account/exchangeInfo reads, no trade paging) and reject when the
+        // minimum call count for this window is already over budget.
+        let bnSyms = [];
+        if (market !== 'futures') {
+          const symSet = {};
+          for (const f of lbScope(slot).rows) {
+            if (f.market === 'spot' && f.symbol) symSet[String(f.symbol).toUpperCase()] = 1;
+          }
+          for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
+            if (s) symSet[String(s).toUpperCase()] = 1;
+          }
+          const uni = await lbBnSpotUniverse(bnReq, Object.keys(symSet));
+          if (!uni.ok) return riFail('Binance spot universe: ' + (uni.message || 'account read failed'));
+          bnSyms = uni.syms.filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
+          if (bnSyms.length > LB_BN_SPOT_SYM_CAP) return riFail('Too many spot pairs (' + bnSyms.length + ') — re-import futures and spot separately or reduce holdings pairs');
+        }
+        const pcRi = lbBnRiPrecheck(market, w.frm, w.to, bnSyms.length);
+        if (pcRi) return riFail(pcRi.msg);
         if (market !== 'spot') {
           // futures userTrades: ≤7d spans, full page continues inside the
           // same window from the last ts (dedupe absorbs the overlap).
@@ -12061,20 +12725,10 @@ function createTradeNative(opts) {
         if (market !== 'futures') {
           // spot myTrades: per-symbol, ≤24h spans. Universe = held assets ×
           // quotes + open orders + locally known symbols (Binance has no
-          // account-wide spot trades endpoint) — an unknown universe is an
-          // honest failure, never a silently partial restore.
-          const symSet = {};
-          for (const f of lbScope(slot).rows) {
-            if (f.market === 'spot' && f.symbol) symSet[String(f.symbol).toUpperCase()] = 1;
-          }
-          for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
-            if (s) symSet[String(s).toUpperCase()] = 1;
-          }
-          const uni = await lbBnSpotUniverse(bnReq, Object.keys(symSet));
-          if (!uni.ok) return riFail('Binance spot universe: ' + (uni.message || 'account read failed'));
-          const syms = uni.syms.filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
-          if (syms.length > LB_BN_SPOT_SYM_CAP) return riFail('Too many spot pairs (' + syms.length + ') — re-import futures and spot separately or reduce holdings pairs');
-          for (const sym of syms) {
+          // account-wide spot trades endpoint) — enumerated up front by the
+          // #2160 precheck above; an unknown universe is an honest failure,
+          // never a silently partial restore.
+          for (const sym of bnSyms) {
             let t0 = Math.max(0, Math.floor(w.frm));
             while (t0 < w.to) {
               if (++calls > LB_BN_MAX_CALLS) return riFail('Window too large for the pair count — narrow the date range');
@@ -12158,6 +12812,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'kraken') return await execKrakenLeverage(intent);
       if (intent.venue === 'hyperliquid') return await execHlLeverage(intent);   // #2000
       if (intent.venue === 'bybit') return await execBybLeverage(intent);   // #2051
+      if (intent.venue === 'gate') return await execGateLeverage(intent);   // #2153
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -12248,7 +12903,24 @@ function createTradeNative(opts) {
         return r;
       }
       if (intent.venue === 'okx') return await execOkx(creds, intent, route);
-      if (intent.venue === 'gate') return await execGate(creds, intent, route);
+      if (intent.venue === 'gate') {
+        const r = await execGate(creds, intent, route);
+        // #2153: a successful trade ack kicks the push lane awake (no-op
+        // while the loops run) and stamps an optimistic mutation so the
+        // badge/posrow read fires immediately after the REST ack. Market-
+        // scoped — gate order id spaces are per-market (spot vs futures).
+        if (r && r.ok) {
+          try { gatePushEnsure(intent.credSlot || 'gate', creds, route); }
+          catch (e) { /* REST path */ }
+          try {
+            const gmk = intent.market === 'spot' ? 'spot' : 'futures';
+            if (intent.op === 'cancel' && intent.orderID) {
+              gateMutKick(intent.credSlot || 'gate', 'ordgone', String(intent.orderID), gmk);
+            } else gateMutKick(intent.credSlot || 'gate', 'order', null, gmk);
+          } catch (e) { /* diag-only */ }
+        }
+        return r;
+      }
       if (intent.venue === 'bitget') return await execBitget(creds, intent, route);
       if (intent.venue === 'kucoin') return await execKucoin(creds, intent, route);
       if (intent.venue === 'bitmex') return await execBitmex(creds, intent, route);
@@ -12440,6 +13112,19 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'hyperliquid') continue;
             const c = credsGet(k);
             if (c) { try { hlPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2153: same one-time kick for the Gate private push sockets (spot +
+      // futures orders/usertrades/positions/balances); loops self-maintain.
+      if (venue === 'gate') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'gate') continue;
+            const c = credsGet(k);
+            if (c) { try { gatePushEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
