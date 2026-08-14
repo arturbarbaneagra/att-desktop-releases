@@ -860,6 +860,37 @@ function clkProbe429(st, now) {
 function clkProbeOk(st) { st.boN = 0; st.boUntil = 0; }
 function clkProbeBlocked(st, now) { return now < ((st && st.boUntil) || 0); }
 
+// #2192 probe hygiene — a slow round-trip poisons the midpoint math: the
+// error can reach ~rtt/2 when the delay is one-sided (field 2026-08-14: a
+// 5082ms cold-proxy-tunnel boot probe latched binance:spot offset +2622ms,
+// true ~+150ms → every spot-signed call -1021 for the whole session).
+// Never latch a sample whose rtt exceeds CLK_RTT_SANE_MS: re-sample on the
+// now-warm socket (bounded by tries AND wall budget), keep the min-rtt
+// sample, and when EVERY sample is slow keep the last offset and retry
+// after CLK_SLOW_RETRY_MS instead of waiting out the 10-min TTL. Pure.
+const CLK_RTT_SANE_MS = 1500;
+const CLK_PROBE_TRIES = 3;
+const CLK_SLOW_RETRY_MS = 30 * 1000;
+const CLK_PROBE_BUDGET_MS = 8000;
+function clkProbeFold(samples) {
+  let best = null;
+  for (const s of (samples || [])) {
+    const rtt = Number((s || {}).t1) - Number((s || {}).t0);
+    const sv = Number((s || {}).sv);
+    if (!isFinite(rtt) || rtt < 0 || !isFinite(sv) || sv <= 1e12) continue;
+    if (!best || rtt < best.rtt) best = { rtt: rtt, off: venueClkOffset(sv, s.t0, s.t1) };
+  }
+  if (!best) return { accept: false, offsetMs: null, rtt: null };
+  return { accept: best.rtt <= CLK_RTT_SANE_MS, offsetMs: best.off, rtt: best.rtt };
+}
+// #2192 timestamp-rejection classifier (-1021 class): numeric Binance code
+// or the message text — the ws-api subscribe error surfaces TEXT only
+// ("spot subscribe failed: Timestamp for this request was 1000ms ahead…").
+function clkTsReject(code, msg) {
+  if (Number(code) === -1021) return true;
+  return /ahead of the server|outside of the recv ?window/i.test(String(msg || ''));
+}
+
 // Offset-corrected timestamp stampers (offset 0 → byte-identical to the old
 // raw Date.now() stamps — Date.now() is already an integer).
 function venueStampMs(offsetMs, nowMs) {
@@ -5057,25 +5088,64 @@ function createTradeNative(opts) {
     st.ts = Date.now();                // stamp first — one probe per TTL even on failure
     st.inflight = (async () => {
       try {
-        const t0 = Date.now();
-        const r = await httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
-        const t1 = Date.now();
-        if ((r.status | 0) === 429) {
-          const boMs = clkProbe429(st, Date.now());
-          tdiag('clk', 'probe-429', { k: key, venue: venue, boMs: boMs, n: st.boN });
-          return st.offsetMs;          // keep last offset through the backoff
+        // #2192 probe hygiene: slow samples re-sample on the now-warm socket
+        // (cold-tunnel connect is one-time — the retry is fast); the fold
+        // keeps the min-rtt sample and refuses to latch past CLK_RTT_SANE_MS.
+        const samples = [];
+        const wt0 = Date.now();
+        for (let i = 0; i < CLK_PROBE_TRIES; i++) {
+          // Budget enforcement (review): extra samples must FIT the remaining
+          // wall budget — gate BEFORE launch and race the await against it so
+          // a stalling retry can never hold signers past CLK_PROBE_BUDGET_MS.
+          // The FIRST sample keeps the plain transport timeout (it is the
+          // only offset source — abandoning it would leave raw clock).
+          const left = CLK_PROBE_BUDGET_MS - (Date.now() - wt0);
+          if (i > 0 && left < 250) break;
+          const t0 = Date.now();
+          let r;
+          if (i === 0) {
+            r = await httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
+          } else {
+            const pr = httpJson(spec.host, 'GET', spec.path, '', null, {}, route);
+            r = await Promise.race([pr,
+              new Promise((rs) => setTimeout(() => rs(null), left))]);
+            if (!r) {
+              pr.catch(() => {});   // stray sample — never an unhandled rejection
+              tdiag('clk', 'probe-slow', { k: key, venue: venue,
+                                           ms: Date.now() - t0, n: i + 1, cut: 1 });
+              break;
+            }
+          }
+          const t1 = Date.now();
+          if ((r.status | 0) === 429) {
+            const boMs = clkProbe429(st, Date.now());
+            tdiag('clk', 'probe-429', { k: key, venue: venue, boMs: boMs, n: st.boN });
+            return st.offsetMs;          // keep last offset through the backoff
+          }
+          let sv = null;
+          if (spec.dateHeader) {
+            // HTTP Date header (BitMEX — no time endpoint): second resolution,
+            // centered by +500ms.
+            const p = r.date ? Date.parse(r.date) : NaN;
+            if (isFinite(p)) sv = p + 500;
+          } else {
+            sv = spec.ext(JSON.parse(r.text));
+          }
+          samples.push({ sv: sv, t0: t0, t1: t1 });
+          if (t1 - t0 <= CLK_RTT_SANE_MS) break;   // sane sample — stop early
+          tdiag('clk', 'probe-slow', { k: key, venue: venue, ms: t1 - t0, n: i + 1 });
         }
-        let sv = null;
-        if (spec.dateHeader) {
-          // HTTP Date header (BitMEX — no time endpoint): second resolution,
-          // centered by +500ms.
-          const p = r.date ? Date.parse(r.date) : NaN;
-          if (isFinite(p)) sv = p + 500;
-        } else {
-          sv = spec.ext(JSON.parse(r.text));
+        const fold = clkProbeFold(samples);
+        if (fold.accept) { st.offsetMs = fold.offsetMs; clkProbeOk(st); }
+        else if (fold.rtt != null) {
+          // every sample slow — DO NOT latch (keep last offset); retry sooner
+          // than the TTL so a recovered network re-syncs quickly.
+          st.ts = Date.now() - TIMESYNC_TTL_MS + CLK_SLOW_RETRY_MS;
+          tdiag('clk', 'probe-reject', { k: key, venue: venue, ms: fold.rtt,
+                                         off: Math.round(fold.offsetMs) });
         }
-        if (isFinite(sv) && sv > 1e12) { st.offsetMs = venueClkOffset(sv, t0, t1); clkProbeOk(st); }
-        tdiag('clk', 'probe', { k: key, venue: venue, offsetMs: st.offsetMs, ms: t1 - t0 });
+        tdiag('clk', 'probe', { k: key, venue: venue, offsetMs: st.offsetMs,
+                                ms: fold.rtt == null ? -1 : fold.rtt, n: samples.length });
       } catch (e) {
         tdiag('clk', 'probe-fail', { k: key, venue: venue, msg: (e && e.message) || 'error' });
         /* keep last offset (0 initially — engine-parity behavior) */
@@ -5083,6 +5153,17 @@ function createTradeNative(opts) {
       return st.offsetMs;
     })();
     try { return await st.inflight; } finally { st.inflight = null; }
+  }
+  // #2192: a timestamp rejection (-1021 class) means the cached offset is
+  // poisoned (bad boot probe / PC clock jump mid-session) — zero the TTL
+  // stamp so the very next ensureVenueTime re-probes (hygiene-guarded).
+  // The 429 backoff state is deliberately RESPECTED: a backed-off probe
+  // keeps serving the last offset instead of hammering /time.
+  function clkInvalidate(venue, market) {
+    const key = venueTimeProbeKey(venue, market);
+    const st = key && venueClk[key];
+    if (st) st.ts = 0;
+    return key || null;
   }
 
   // --- products cache (spot base valueScale) -------------------------------
@@ -5205,7 +5286,7 @@ function createTradeNative(opts) {
   // --- Binance ---------------------------------------------------------------
   function bnHost(market) { return market === 'futures' ? BINANCE_FUT_HOST : BINANCE_SPOT_HOST; }
 
-  async function bnRequest(creds, method, market, reqPath, params, route, maxBytes) {
+  async function bnRequest(creds, method, market, reqPath, params, route, maxBytes, retried) {
     const offMs = await ensureVenueTime('binance', market, route);
     const q = formEnc((params || []).concat([
       ['recvWindow', String(BINANCE_RECV_WINDOW_MS)],
@@ -5236,6 +5317,16 @@ function createTradeNative(opts) {
     try { data = JSON.parse(r.text); } catch (e) { data = null; }
     const code = (data && typeof data.code === 'number') ? data.code : null;
     if (r.status >= 400 || (code != null && code < 0)) {
+      // #2192 -1021 self-heal: a timestamp rejection means the cached clock
+      // offset is poisoned — invalidate it (the retry's ensureVenueTime
+      // re-probes, hygiene-guarded) and retry ONCE. A rejection is a
+      // pre-execution refusal, so retrying mutations is safe; a second
+      // rejection surfaces normally.
+      if (!retried && clkTsReject(code, data && data.msg)) {
+        tdiag('clk', 'inval', { k: clkInvalidate('binance', market),
+                                venue: 'binance', code: code });
+        return bnRequest(creds, method, market, reqPath, params, route, maxBytes, true);
+      }
       const msg = code != null ? binanceErrorMessage(code, String((data && data.msg) || ''))
                                : 'Binance returned HTTP ' + r.status;
       return { ok: false, message: msg, code: code };
@@ -5457,6 +5548,12 @@ function createTradeNative(opts) {
         } catch (e) {
           S.err = 'Binance ' + which + ' stream: ' + ((e && e.message) || 'error');
           tdiag('acct', 'bn_uds_err', { w: which, m: String(S.err).slice(0, 120) });
+          // #2192: a timestamp-rejection on the signed ws-api subscribe =
+          // poisoned clock offset — invalidate so the redial re-probes
+          // instead of re-signing 1000ms ahead for the whole session.
+          if (clkTsReject(null, e && e.message)) {
+            clkInvalidate('binance', which === 'fut' ? 'futures' : 'spot');
+          }
         }
         S.up = false; S.ws = null;
         if (s.closed || bnUdsSessions[slot] !== s) break;
@@ -10405,31 +10502,49 @@ function createTradeNative(opts) {
     const route = routeNorm(intent.route);
     // #1943: acct reads keep the user-data streams warm (push-driven display)
     try { bnUdsEnsure(intent.credSlot || 'binance', creds, route); } catch (e) { /* REST-only */ }
+    // #2192 leg isolation: spot and futures ride SEPARATE hosts and separate
+    // clock offsets — a poisoned spot clock (-1021) must not blank the
+    // futures rows (field 2026-08-14: one bad boot probe hid every position
+    // for a whole session). Within one market the first failure short-
+    // circuits that market's remaining legs (same signer + clock); a
+    // rate-limited/banned leg still fails the WHOLE read so the acct guard
+    // keeps its cool-down hints.
     const sa = await bnRequest(creds, 'GET', 'spot', '/api/v3/account',
                                [['omitZeroBalances', 'true']], route);
-    if (!sa.ok) return sa;
-    const so = await bnRequest(creds, 'GET', 'spot', '/api/v3/openOrders', [], route);
-    if (!so.ok) return so;
+    const so = sa.ok
+      ? await bnRequest(creds, 'GET', 'spot', '/api/v3/openOrders', [], route) : sa;
+    const spotErr = !sa.ok ? sa : (!so.ok ? so : null);
     const fb = await bnRequest(creds, 'GET', 'futures', '/fapi/v2/balance', [], route);
-    if (!fb.ok) return fb;
     // Symbol-less positionRisk returns EVERY listed contract (200KB+) —
     // raise the httpJson byte cap so JSON.parse never sees a truncated body
     // (shell-httpjson convention; the engine twin parses the same payload).
-    const pos = await bnRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk',
-                                [], route, 4 * 1024 * 1024);
-    if (!pos.ok) return pos;
-    const fo = await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openOrders', [], route);
-    if (!fo.ok) return fo;
-    const ao = await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openAlgoOrders', [], route);
-    if (!ao.ok) return ao;
+    const pos = fb.ok
+      ? await bnRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk',
+                        [], route, 4 * 1024 * 1024) : fb;
+    const fo = pos.ok
+      ? await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openOrders', [], route) : pos;
+    const ao = fo.ok
+      ? await bnRequest(creds, 'GET', 'futures', '/fapi/v1/openAlgoOrders', [], route) : fo;
+    const futErr = !fb.ok ? fb : (!pos.ok ? pos : (!fo.ok ? fo : (!ao.ok ? ao : null)));
+    const rl = (e) => e && (e.rateLimited || e.banned);
+    if (rl(spotErr)) return spotErr;
+    if (rl(futErr)) return futErr;
+    if (spotErr && futErr) return spotErr;   // both markets dead — plain failure
     const arr = (r) => (Array.isArray(r.data) ? r.data : []);
-    return { ok: true,
-             spotAcct: sa.data || {},
-             spotOrders: arr(so),
-             futBalance: arr(fb),
-             positions: arr(pos),
-             futOrders: arr(fo),
-             algoOrders: arr(ao) };
+    const out = { ok: true };
+    if (!spotErr) { out.spotAcct = sa.data || {}; out.spotOrders = arr(so); }
+    if (!futErr) {
+      out.futBalance = arr(fb); out.positions = arr(pos);
+      out.futOrders = arr(fo); out.algoOrders = arr(ao);
+    }
+    if (spotErr || futErr) {
+      out.legErr = {};
+      if (spotErr) out.legErr.spot = spotErr.message || 'spot read failed';
+      if (futErr) out.legErr.futures = futErr.message || 'futures read failed';
+      tdiag('acct', 'bn_leg_err', { leg: spotErr ? 'spot' : 'futures',
+        m: String((spotErr || futErr).message || '').slice(0, 90) });
+    }
+    return out;
   }
 
   // Phemex native account read (#1713): signed GETs mirroring the engine's
@@ -13962,6 +14077,13 @@ module.exports = {
   clkProbe429,
   clkProbeOk,
   clkProbeBlocked,
+  // pure — clock-probe hygiene + -1021 self-heal (#2192)
+  CLK_RTT_SANE_MS,
+  CLK_PROBE_TRIES,
+  CLK_SLOW_RETRY_MS,
+  CLK_PROBE_BUDGET_MS,
+  clkProbeFold,
+  clkTsReject,
   // runtime
   createTradeNative,
 };
