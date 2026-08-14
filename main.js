@@ -136,6 +136,16 @@ const CPU_PROBE_DELAY_MS = 120;    // sample just AFTER the trigger — inside t
 // the 6/min cap is exactly the burst-moment sampling we want.
 const CPU_PROBE_PUSH_Q = 8;
 const CPU_PROBE_TRADE_OPS = { order: 1, close_pos: 1, amend: 1 };
+// #2217 off-loop canary for THIS process. mn_gap says "the loop did not run
+// for 400ms" but cannot say WHY: a busy/blocked loop and a descheduled process
+// look identical from inside the loop. A worker THREAD in the same process
+// answers it — if it kept ticking through the gap the process had CPU and the
+// loop was blocked on a call; if it went quiet too, the OS took the process
+// away and no amount of async in here will help.
+const MN_CAN_TICK_MS = 100;        // canary thread period
+const MN_CAN_LAG_MIN_MS = 150;     // loop delivery lag that opens an episode
+const MN_CAN_SETTLE_MS = 250;      // let the queued ticks drain, then verdict
+const MN_CAN_MAX_PER_MIN = 6;      // own cap (diag.log rate-limits again)
 
 // PURE: rolling per-window budget shared by both taps. true = spend one.
 function perfRateTake(st, now, max, winMs) {
@@ -162,6 +172,9 @@ function mnGapEval(prev, now, periodMs, minMs, sleepMs) {
 // the probe's own 'cpu' event OUT of this list (no self-retrigger loop).
 function cpuProbeWhy(cat, ev, data) {
   if (ev === 'mn_gap') return 'gap';
+  // #2217: a canary episode (ours or a renderer's, piped as r:perf/can) is the
+  // freeze itself — sample the machine right then, that is the whole point.
+  if (ev === 'mn_can' || (cat === 'r:perf' && ev === 'can')) return 'can';
   if (cat === 'acct' && ev === 'bn_push' && data && (data.q | 0) >= CPU_PROBE_PUSH_Q) return 'push';
   if (cat === 'trade' && CPU_PROBE_TRADE_OPS[ev] === 1) return 'order';
   return '';
@@ -189,12 +202,90 @@ function cpuSelfPct(prev, cur, dtMs) {
   return Math.round((du / dtMs) * 1000) / 10;
 }
 
+// PURE (#2217): two os.cpus() snapshots → MACHINE-wide busy% (all cores) and
+// the hottest single core%. Per-core tick deltas, which is the only reading
+// that works on Windows: loadavg is a constant 0 there and getAppMetrics only
+// ever sees our own processes, so round 4 could not tell "the machine was
+// saturated" from "we were idle while something else ran". null = unusable
+// pair (different core counts, no elapsed ticks).
+function cpuMachinePct(prev, cur) {
+  if (!Array.isArray(prev) || !Array.isArray(cur)) return null;
+  if (!cur.length || prev.length !== cur.length) return null;
+  let busy = 0, total = 0, hottest = -1;
+  for (let i = 0; i < cur.length; i++) {
+    const a = prev[i] && prev[i].times, b = cur[i] && cur[i].times;
+    if (!a || !b) continue;
+    const idle = b.idle - a.idle;
+    const all = (b.user - a.user) + (b.nice - a.nice) + (b.sys - a.sys) + (b.irq - a.irq) + idle;
+    if (!(all > 0) || idle < 0) continue;
+    const pct = ((all - idle) / all) * 100;
+    if (pct > hottest) hottest = pct;
+    busy += all - idle;
+    total += all;
+  }
+  if (!(total > 0)) return null;
+  return { pct: Math.round((busy / total) * 1000) / 10, max: Math.round(hottest * 10) / 10 };
+}
+
+// PURE (#2217): machine memory pressure → free/total MB + used%. A machine
+// paging hard stalls every process at once, which is exactly the signature
+// round 4 measured, so the probe has to be able to see it.
+function memPressure(freeB, totalB) {
+  if (!(totalB > 0) || !(freeB >= 0) || freeB > totalB) return null;
+  const mb = (x) => Math.round(x / 1048576);
+  return { f: mb(freeB), t: mb(totalB), u: Math.round(((totalB - freeB) / totalB) * 1000) / 10 };
+}
+
+// PURE (#2217): fold one canary tick into the episode + window aggregates.
+// Returns true when this tick OPENS an episode (caller arms the settle flush).
+// Ticks arriving while an episode is open are the ones the block queued — they
+// are the evidence, so they count into ep.n / ep.wd. Mutates st.
+function mnCanFold(st, wT, wd, now, minMs, sleepMs) {
+  const lag = now - wT;
+  if (!(lag >= 0) || (sleepMs > 0 && lag > sleepMs)) { st.ep = null; return false; }
+  if (lag > st.aLag) st.aLag = lag;
+  if (wd > st.aWd) st.aWd = wd;
+  st.aN += 1;
+  const ep = st.ep;
+  if (ep) {
+    if (wT > ep.wT) { ep.n += 1; if (wd > ep.wd) ep.wd = wd; }
+    if (lag > ep.lag) ep.lag = lag;
+    return false;
+  }
+  if (!(lag >= minMs)) return false;
+  st.ep = { wT: wT, t0: now, lag: lag, wd: 0, n: 0 };
+  return true;
+}
+
+// PURE (#2217): the verdict, same vocabulary as the panel's renderer canary.
+//   'thread' — process kept running, the loop was blocked on a call
+//   'proc'   — the whole process was descheduled (canary silent/drifted too)
+//   '?'      — episode too short for the canary period to resolve
+function mnCanVerdict(lagMs, wdMax, n, periodMs) {
+  const exp = Math.floor(lagMs / periodMs);
+  if (exp < 1) return { v: '?', exp: exp };
+  if (n >= Math.max(1, Math.round(exp * 0.6)) && wdMax < lagMs / 2) return { v: 'thread', exp: exp };
+  if (n === 0 || wdMax >= lagMs / 2) return { v: 'proc', exp: exp };
+  return { v: '?', exp: exp };
+}
+
+// PURE (#2217): episode → tap payload (both sides of the comparison, one line).
+function mnCanPay(ep, periodMs) {
+  const r = mnCanVerdict(ep.lag, ep.wd, ep.n, periodMs);
+  return { lag: Math.round(ep.lag), wd: Math.round(ep.wd), n: ep.n, exp: r.exp, v: r.v };
+}
+
 const mnGapRate = { t0: 0, n: 0 };
 const cpuProbeRate = { t0: 0, n: 0 };
 let mnGapTimer = null;
 let cpuProbeT = null;
 let cpuLast = null;
 let cpuCores = 0;
+let cpuMachLast = null;                       // #2217 os.cpus() at arm time
+const mnCanRate = { t0: 0, n: 0 };            // #2217 canary tap budget
+const mnCan = { ep: null, aLag: 0, aWd: 0, aN: 0 };
+let mnCanW = null;                            // #2217 canary worker thread
+let mnLastGap = { ms: 0, t: 0 };              // #2217 watchdog's last stall, for cross-reference
 
 function cpuCoreCount() {
   if (!cpuCores) { try { cpuCores = os.cpus().length; } catch (e) { cpuCores = -1; } }
@@ -205,6 +296,10 @@ function cpuCoreCount() {
 function cpuProbeArm(why) {
   if (!diag || cpuProbeT) return;
   if (!perfRateTake(cpuProbeRate, Date.now(), CPU_PROBE_MAX_PER_MIN, 60 * 1000)) return;
+  // #2217: machine-wide baseline taken NOW and delta'd when the probe fires,
+  // so the busy% covers the burst window itself instead of the minutes since
+  // the previous probe.
+  try { cpuMachLast = os.cpus(); } catch (e) { cpuMachLast = null; }
   cpuProbeT = setTimeout(() => { cpuProbeT = null; cpuProbeRun(why); }, CPU_PROBE_DELAY_MS);
   if (cpuProbeT && typeof cpuProbeT.unref === 'function') cpuProbeT.unref();
 }
@@ -226,6 +321,18 @@ function cpuProbeRun(why) {
   d.n = rows.length;
   d.cores = cpuCoreCount();
   d.p = rows;
+  // #2217 machine-wide load across the probe window + memory pressure: is the
+  // MACHINE saturated, or just busy on our behalf? Round 4 could only sum our
+  // own processes, which cannot answer that question.
+  try {
+    const mp = cpuMachinePct(cpuMachLast, os.cpus());
+    if (mp) { d.mach = mp.pct; d.hot = mp.max; }
+  } catch (e) { /* non-fatal */ }
+  cpuMachLast = null;
+  try {
+    const mm = memPressure(os.freemem(), os.totalmem());
+    if (mm) d.mem = mm;
+  } catch (e) { /* non-fatal */ }
   // loadavg is a constant 0 on Windows — omitted there so a zero can never be
   // misread as "the machine was idle".
   if (process.platform !== 'win32') {
@@ -242,6 +349,7 @@ function mnGapStart() {
     const gap = mnGapEval(last, now, MN_GAP_TICK_MS, MN_GAP_MIN_MS, MN_GAP_SLEEP_MS);
     last = now;
     if (!gap) return;
+    mnLastGap = { ms: gap, t: now };   // #2217: quoted by the canary tap, budget or not
     if (!perfRateTake(mnGapRate, now, MN_GAP_MAX_PER_MIN, 60 * 1000)) return;
     dlog('main', 'perf', 'mn_gap', { gapMs: gap });   // arms the CPU probe via dlog
   }, MN_GAP_TICK_MS);
@@ -252,6 +360,52 @@ function mnGapStop() {
   if (!mnGapTimer) return;
   try { clearInterval(mnGapTimer); } catch (e) { /* non-fatal */ }
   mnGapTimer = null;
+}
+
+// #2217 canary thread: ticks every MN_CAN_TICK_MS and posts [wallClock, ownDrift].
+// The message is handled on the main loop, so the delivery lag IS the time the
+// loop could not run — and the drift the thread measured itself says whether
+// the thread kept getting CPU during that same window. Armed only with a live
+// logger, like every other probe here.
+function mnCanStart() {
+  if (!diag || mnCanW) return;
+  try {
+    const { Worker } = require('worker_threads');
+    const src = 'const {parentPort}=require("worker_threads");const p=' + MN_CAN_TICK_MS + ';let l=0;'
+      + 'setInterval(()=>{const n=Date.now();const d=l?(n-l)-p:0;l=n;parentPort.postMessage([n,d]);},p);';
+    const w = new Worker(src, { eval: true });
+    w.on('message', (m) => { try { mnCanTick(m); } catch (e) { /* non-fatal */ } });
+    w.on('error', () => { mnCanStop(); });
+    if (typeof w.unref === 'function') w.unref();   // never keeps the app alive
+    mnCanW = w;
+  } catch (e) { mnCanW = null; }   // no canary (older runtime) — every other probe unaffected
+}
+
+function mnCanTick(m) {
+  if (!diag || !m) return;
+  if (!mnCanFold(mnCan, +m[0] || 0, +m[1] || 0, Date.now(),
+                 MN_CAN_LAG_MIN_MS, MN_GAP_SLEEP_MS)) return;
+  const t = setTimeout(mnCanFlush, MN_CAN_SETTLE_MS);
+  if (t && typeof t.unref === 'function') t.unref();
+}
+
+// The verdict can only be read once the ticks the block queued have drained,
+// so the tap fires from the settle timer, never from inside the spike.
+function mnCanFlush() {
+  const ep = mnCan.ep;
+  mnCan.ep = null;
+  if (!diag || !ep) return;
+  if (!perfRateTake(mnCanRate, Date.now(), MN_CAN_MAX_PER_MIN, 60 * 1000)) return;
+  const d = mnCanPay(ep, MN_CAN_TICK_MS);
+  if (mnLastGap.ms && ep.t0 - mnLastGap.t < 1000) d.mg = mnLastGap.ms;   // the watchdog's own view
+  dlog('main', 'perf', 'mn_can', d);
+}
+
+function mnCanStop() {
+  if (!mnCanW) return;
+  try { mnCanW.terminate(); } catch (e) { /* non-fatal */ }
+  mnCanW = null;
+  mnCan.ep = null;
 }
 
 let mainWindow = null;
@@ -1151,6 +1305,7 @@ ipcMain.on('att:diag-role', (event, isAdmin) => {
     if (d.admin === true) saveSettings({ diag: Object.assign({}, d, { admin: false }) });
     if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } diag = null; }
     mnGapStop();   // #2212: the watchdog dies with the logger it feeds
+    mnCanStop();   // #2217: and so does the canary thread
     refreshTrayMenu();
   }
 });
@@ -1221,7 +1376,10 @@ ipcMain.on('att:diag-event', (event, payload) => {
   let data = (payload.data && typeof payload.data === 'object') ? payload.data : null;
   const wid = windowIdForSender(event.sender);
   const win = wid === null ? 'main' : (typeof wid === 'string' ? wid : 'wc' + event.sender.id);
-  diag.log(win, 'r:' + cat, ev, data);
+  // #2217: through dlog, not diag.log directly — a renderer canary episode
+  // (r:perf/can) must be able to arm the machine-wide CPU probe, exactly like
+  // this process's own stall does.
+  dlog(win, 'r:' + cat, ev, data);
 });
 
 function openDiagFolder() {
@@ -1370,13 +1528,27 @@ function nativeWsSenderOk(event) {
   } catch (e) { return false; }
 }
 
-function closeNativeSocket(id) {
+function closeNativeSocket(id, why) {
   const rec = nativeSockets.get(id);
   if (!rec) return;
   nativeSockets.delete(id);
   // KuCoin-native sockets carry a main-owned keepalive timer — always stop it.
   if (rec.kaT) { try { clearInterval(rec.kaT); } catch (e) { /* non-fatal */ } rec.kaT = null; }
   const ws = rec.ws;
+  // #2216: write the LOCAL teardown line BEFORE the listeners go. The
+  // removeAllListeners() below strips the 'close' handler that logs the close,
+  // so a socket torn down on this side used to vanish from the diag file
+  // completely — a field log of a redialing conn showed opens with no matching
+  // closes, which reads exactly like a socket LEAK. It never was one: this is
+  // where they die, and now it says so, with the reason and the frame count
+  // that proves whether the socket ever received anything at all.
+  try {
+    dlog('main', 'ws', 'kill', {
+      k: rec.ident || rec.host || '', id, host: rec.host || '', ident: rec.ident || '',
+      why: String(why || 'local'), rx: rec.rx || 0, rs: ws ? ws.readyState : -1,
+      ms: rec.t0 ? Date.now() - rec.t0 : 0,
+    });
+  } catch (e) { /* non-fatal */ }
   // Stop forwarding this socket's frames to the renderer, but keep a no-op
   // 'error' listener attached while we tear it down. Closing/terminating a
   // socket that is still CONNECTING makes `ws` emit an 'error' ("WebSocket was
@@ -1396,19 +1568,24 @@ function closeNativeSocket(id) {
 // Tear down every native socket owned by a webContents (reload / nav / close).
 function closeNativeSocketsFor(wcId) {
   for (const [id, rec] of nativeSockets.entries()) {
-    if (rec.wcId === wcId) closeNativeSocket(id);
+    if (rec.wcId === wcId) closeNativeSocket(id, 'window');
   }
 }
 
 // Tear down ALL native sockets (proxy change → force a clean reconnect through
 // the new agent, mirroring session.closeAllConnections()).
 function closeAllNativeSockets() {
-  for (const id of Array.from(nativeSockets.keys())) closeNativeSocket(id);
+  for (const id of Array.from(nativeSockets.keys())) closeNativeSocket(id, 'proxy-change');
 }
 
 // Open a validated native socket. Returns { ok, id } to the shim; frames stream
 // back over the per-window 'att:ws-event' channel keyed by id.
-ipcMain.handle('att:ws-open', (event, url, route) => {
+// ident (#2216) is an OPTIONAL renderer-supplied conn identity ('venue|market
+// |aid') stamped on every lifecycle line: several venues share a host and one
+// venue runs several boards, so the hostname alone cannot say WHICH conn a
+// socket belongs to. Diagnostics only — never trusted for routing or the URL
+// allowlist, and clipped to a safe charset before it reaches the log.
+ipcMain.handle('att:ws-open', (event, url, route, ident) => {
   if (!WSNative) return { ok: false, error: 'unavailable' };
   if (!nativeWsSenderOk(event)) return { ok: false, error: 'forbidden' };
   if (!nativeWsUrlOk(url)) return { ok: false, error: 'blocked' };
@@ -1430,19 +1607,27 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
   } catch (e) {
     return { ok: false, error: 'open-failed' };
   }
-  nativeSockets.set(id, { ws, wcId });
+  const diagHost = (() => { try { return new URL(String(url)).hostname; } catch (e) { return ''; } })();
+  const diagId = String(ident || '').slice(0, 40).replace(/[^A-Za-z0-9|_.:-]/g, '') || diagHost;
+  const diagT0 = Date.now();
+  // rx counts frames for THIS socket: "opened, received nothing, killed after
+  // 12s" and "opened, received 4k frames, closed 1006" are different bugs.
+  const rec = { ws, wcId, ident: diagId, host: diagHost, t0: diagT0, rx: 0 };
+  nativeSockets.set(id, rec);
   const emit = (msg) => {
     try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
   };
-  const diagHost = (() => { try { return new URL(String(url)).hostname; } catch (e) { return ''; } })();
-  const diagT0 = Date.now();
-  ws.on('open', () => { dlog('main', 'ws', 'open', { k: diagHost, id, host: diagHost, ms: Date.now() - diagT0, route: ag.agent ? 'proxy' : 'direct' }); emit({ id, type: 'open' }); });
+  ws.on('open', () => { dlog('main', 'ws', 'open', { k: diagId, id, host: diagHost, ident: diagId, ms: Date.now() - diagT0, route: ag.agent ? 'proxy' : 'direct' }); emit({ id, type: 'open' }); });
   // via = the path MAIN actually applied (not what the renderer requested):
   // an agent means the tunnel is really in use; no agent means the dial goes
   // over the plain internet (proxy off / explicit Direct). A refused open
   // never reaches here — the panel's confirmed-transport label reads this.
   const via = { transport: 'native', route: ag.agent ? 'proxy' : 'direct' };
   ws.on('message', (data, isBinary) => {
+    // #2216 first-frame marker: one line per socket, then a plain counter.
+    if ((rec.rx = (rec.rx || 0) + 1) === 1) {
+      dlog('main', 'ws', 'rx1', { k: diagId, id, host: diagHost, ident: diagId, ms: Date.now() - diagT0 });
+    }
     // Text feeds forward verbatim as strings. Binary frames (MEXC spot WS
     // is protobuf) forward base64-tagged — the PANEL owns the decode; the
     // shell stays a dumb transport.
@@ -1460,11 +1645,14 @@ ipcMain.handle('att:ws-open', (event, url, route) => {
     nativeSockets.delete(id);
     let r = '';
     try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
-    dlog('main', 'ws', 'close', { k: diagHost, id, host: diagHost, code });
+    dlog('main', 'ws', 'close', { k: diagId, id, host: diagHost, ident: diagId, code, reason: r,
+                                  rx: rec.rx || 0, ms: Date.now() - diagT0 });
     emit({ id, type: 'close', code: code, reason: r });
   });
   ws.on('error', (err) => {
-    dlog('main', 'ws', 'error', { k: diagHost, id, host: diagHost, msg: (err && err.message) || 'error' });
+    dlog('main', 'ws', 'error', { k: diagId, id, host: diagHost, ident: diagId,
+                                  msg: (err && err.message) || 'error', rx: rec.rx || 0,
+                                  ms: Date.now() - diagT0 });
     emit({ id, type: 'error', message: (err && err.message) || 'error' });
   });
   return { ok: true, id, via };
@@ -1538,7 +1726,12 @@ ipcMain.handle('att:ws-open-kucoin', async (event, market, route) => {
   } catch (e) {
     return { ok: false, error: 'open-failed' };
   }
-  const rec = { ws, wcId, kaT: null };
+  // #2216: same lifecycle accounting as att:ws-open. Main builds this URL from
+  // the bullet token, so the renderer cannot name the socket — main does.
+  const diagHost = (() => { try { return new URL(String(bullet.endpoint)).hostname; } catch (e) { return ''; } })();
+  const diagId = 'kucoin|' + mkt;
+  const diagT0 = Date.now();
+  const rec = { ws, wcId, kaT: null, ident: diagId, host: diagHost, t0: diagT0, rx: 0 };
   nativeSockets.set(id, rec);
   const emit = (msg) => {
     try { if (!wc.isDestroyed()) wc.send('att:ws-event', msg); } catch (e) { /* non-fatal */ }
@@ -1549,9 +1742,13 @@ ipcMain.handle('att:ws-open-kucoin', async (event, market, route) => {
     rec.kaT = setInterval(() => {
       try { if (ws.readyState === 1) ws.send(JSON.stringify({ id: 'natka-' + (++kaN), type: 'ping' })); } catch (e) { /* non-fatal */ }
     }, bullet.pingMs);
+    dlog('main', 'ws', 'open', { k: diagId, id, host: diagHost, ident: diagId, ms: Date.now() - diagT0, route: ag.agent ? 'proxy' : 'direct' });
     emit({ id, type: 'open' });
   });
   ws.on('message', (data, isBinary) => {
+    if ((rec.rx = (rec.rx || 0) + 1) === 1) {
+      dlog('main', 'ws', 'rx1', { k: diagId, id, host: diagHost, ident: diagId, ms: Date.now() - diagT0 });
+    }
     if (isBinary) return;
     let s = '';
     try { s = data.toString('utf8'); } catch (e) { return; }
@@ -1570,9 +1767,14 @@ ipcMain.handle('att:ws-open-kucoin', async (event, market, route) => {
     nativeSockets.delete(id);
     let r = '';
     try { r = reason ? reason.toString('utf8') : ''; } catch (e) { r = ''; }
+    dlog('main', 'ws', 'close', { k: diagId, id, host: diagHost, ident: diagId, code, reason: r,
+                                  rx: rec.rx || 0, ms: Date.now() - diagT0 });
     emit({ id, type: 'close', code: code, reason: r });
   });
   ws.on('error', (err) => {
+    dlog('main', 'ws', 'error', { k: diagId, id, host: diagHost, ident: diagId,
+                                  msg: (err && err.message) || 'error', rx: rec.rx || 0,
+                                  ms: Date.now() - diagT0 });
     emit({ id, type: 'error', message: (err && err.message) || 'error' });
   });
   // Same confirmed-path echo as att:ws-open: ag is the agent used at DIAL time.
@@ -1596,7 +1798,7 @@ ipcMain.on('att:ws-close', (event, payload) => {
   const id = payload && payload.id;
   const rec = nativeSockets.get(id);
   if (!rec || rec.wcId !== event.sender.id) return;
-  closeNativeSocket(id);
+  closeNativeSocket(id, 'renderer');
 });
 
 // ---------------------------------------------------------------------------
@@ -2161,6 +2363,7 @@ app.whenReady().then(async () => {
   // Diagnostic logger first, so every subsequent launch step is captured.
   initDiag();
   mnGapStart();   // #2212 main event-loop stall watchdog (no logger = no timer)
+  mnCanStart();   // #2217 off-loop canary (starved process vs blocked loop)
   if (diag) {
     const cfg = getProxyConfig();
     dlog('main', 'app', 'start', {
@@ -2199,6 +2402,7 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
   isQuitting = true;
   mnGapStop();   // #2212
+  mnCanStop();   // #2217
   dlog('main', 'app', 'quit', {});
   if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } }
 });

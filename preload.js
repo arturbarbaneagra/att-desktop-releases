@@ -141,7 +141,11 @@ try {
     // Returns a Promise<{ok, id}> — id keys all later send/close + inbound events.
     // route ('proxy'|'direct') is the optional per-venue×market ROUTE choice;
     // main validates it (anything unknown collapses to 'proxy', fail-closed).
-    open: (url, route) => ipcRenderer.invoke('att:ws-open', String(url || ''), String(route || '')),
+    // ident (#2216) is the panel's conn identity ('venue|market|aid'), logged
+    // with the socket's lifecycle lines in the admin diag file. Diagnostics
+    // only — main validates the URL/route exactly as before and never routes
+    // on this string.
+    open: (url, route, ident) => ipcRenderer.invoke('att:ws-open', String(url || ''), String(route || ''), String(ident || '')),
     // KuCoin direct dial: the renderer names ONLY the market ('spot'|'futures');
     // main does the bullet-public token dance itself and validates the returned
     // wss endpoint (its host varies per token, so the fixed allowlist can't
