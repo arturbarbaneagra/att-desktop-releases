@@ -12333,6 +12333,19 @@ function createTradeNative(opts) {
     return { ok: true, removed: before - sc.rows.length,
              ...(saved ? {} : { persistErr: true }) };
   }
+  // #2193 replay cache: the 2s panel poll re-ran lbSpotQuar + lbReconstruct
+  // over the ENTIRE persisted store on every read even when nothing changed
+  // (added:0) — with a re-import-grown 14k-fill store that full replay per
+  // beat × per window was the ~5s stutter's main-process half. Cache the
+  // reconstructed trades per slot keyed by the rows ARRAY IDENTITY + length
+  // (every mutator either pushes in place — length changes — or reassigns
+  // sc.rows: delete/prune/quarantine-clear all swap the reference), so a
+  // no-news read is O(1). `rev` bumps on every recompute; readers that pass
+  // their known rev back get {unchanged:true} with NO trades payload (skips
+  // the IPC serialization of every trade row per poll per window).
+  // displayMap is only applied at recompute; poll paths pass none.
+  const _lbTrCache = {};
+  let _lbTrRev = 0;
   async function execLblotTrades(intent) {
     // Drain + replay: the local fills → OPEN/CLOSED trade rows via the
     // engine-twin lbReconstruct (grouping parity test-guarded). One replay
@@ -12344,6 +12357,18 @@ function createTradeNative(opts) {
     await lbHlWarm(venue, intent.route);
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
+    const dmSig = intent.displayMap ? JSON.stringify(intent.displayMap) : '';
+    const hit = _lbTrCache[slot];
+    if (hit && hit.rows === sc.rows && hit.len === sc.rows.length &&
+        hit.dmSig === dmSig) {
+      if ((intent.haveRev | 0) === hit.rev) {
+        return { ok: true, unchanged: true, rev: hit.rev, added: added,
+                 count: sc.rows.length, bf: sc.bf || null };
+      }
+      return { ok: true, rev: hit.rev, added: added, count: sc.rows.length,
+               trades: hit.trades, quar: hit.quar,
+               hwm: hit.hwm, bf: sc.bf || null };
+    }
     let trades, quar;
     try {
       // #2038 spot truncated-history quarantine BEFORE the replay: a spot
@@ -12370,9 +12395,14 @@ function createTradeNative(opts) {
       } catch (e) { /* diag only */ }
     }
     catch (e) { return { ok: false, message: 'replay failed: ' + ((e && e.message) || 'error') }; }
-    return { ok: true, added: added, count: sc.rows.length, trades: trades,
+    const hwm = { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') };
+    _lbTrCache[slot] = { rows: sc.rows, len: sc.rows.length, dmSig: dmSig,
+                         rev: ++_lbTrRev, trades: trades, quar: quar || [],
+                         hwm: hwm };
+    return { ok: true, rev: _lbTrCache[slot].rev, added: added,
+             count: sc.rows.length, trades: trades,
              quar: quar || [],
-             hwm: { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') },
+             hwm: hwm,
              bf: sc.bf || null };
   }
   // Startup/arm gap backfill: "all fills since my newest locally-recorded
