@@ -1396,7 +1396,14 @@ function lbNormBybFill(f) {
 // preferred, else create_time seconds ×1000.
 function lbNormGateFill(f, market, mult) {
   if (!f || typeof f !== 'object') return null;
-  const eid = f.id != null ? String(f.id) : '';
+  // #2167: /futures/usdt/my_trades_timerange rows carry `trade_id` — NOT
+  // `id` (MyFuturesTradeTimeRange model). The id-only read silently nulled
+  // EVERY backfill/re-import futures fill (mult>0 so the multMiss guard
+  // never fired → hwmFut stayed 0 forever). WS usertrades + /spot/my_trades
+  // + plain /futures my_trades keep `id`; both name the same venue trade-id
+  // space, so dedup keys stay consistent across lanes.
+  const eid = f.id != null ? String(f.id)
+    : (f.trade_id != null ? String(f.trade_id) : '');
   if (!eid) return null;
   const px = lbNum(f.price) || '0';
   if (!(Number(px) > 0)) return null;
@@ -1734,16 +1741,25 @@ async function lbBnSpotUniverse(bnReq, localSyms) {
 const LB_KR_BF_TRIES = 6;
 const LB_KR_BF_WAIT0_MS = 15000;
 const LB_KR_BF_WAIT_MAX_MS = 120000;
-async function lbKrBackfillRetry(hbFn, intent, sleepFn, diagFn) {
-  let waitMs = LB_KR_BF_WAIT0_MS;
-  for (let attempt = 1; ; attempt++) {
-    const r = await hbFn(intent);
-    if (!r) return { ok: false, message: 'backfill failed', bfTries: attempt };
-    if (r.ok || !r.skipped || attempt >= LB_KR_BF_TRIES)
-      return Object.assign({}, r, { bfTries: attempt });
-    if (diagFn) diagFn(attempt, waitMs);
-    await sleepFn(waitMs);
-    waitMs = Math.min(waitMs * 2, LB_KR_BF_WAIT_MAX_MS);
+// #2168: optional `resv` ({ acquire, release }) — a rate-points ledger
+// reservation held across the WHOLE ladder (attempts AND the refill sleeps
+// between them — releasing during a sleep would let polling eat the refill
+// again). Always released (finally) — success, honest fail, or throw.
+async function lbKrBackfillRetry(hbFn, intent, sleepFn, diagFn, resv) {
+  if (resv && typeof resv.acquire === 'function') resv.acquire();
+  try {
+    let waitMs = LB_KR_BF_WAIT0_MS;
+    for (let attempt = 1; ; attempt++) {
+      const r = await hbFn(intent);
+      if (!r) return { ok: false, message: 'backfill failed', bfTries: attempt };
+      if (r.ok || !r.skipped || attempt >= LB_KR_BF_TRIES)
+        return Object.assign({}, r, { bfTries: attempt });
+      if (diagFn) diagFn(attempt, waitMs);
+      await sleepFn(waitMs);
+      waitMs = Math.min(waitMs * 2, LB_KR_BF_WAIT_MAX_MS);
+    }
+  } finally {
+    if (resv && typeof resv.release === 'function') resv.release();
   }
 }
 async function lbBnBackfill(bnReq, futFrm, to, spotSyms, spotFrom, pageGapMs) {
@@ -4241,6 +4257,40 @@ function krLedgerPts(L, now) {
   return Math.min(KR_LEDGER_MAX, L.pts + dt * KR_LEDGER_DECAY);
 }
 function krIsRateLimited(msg) { return /rate ?limit/i.test(String(msg || '')); }
+
+// --- #2168 re-import reservation on the rate-points ledger (pure) -----------
+// Field evidence (v1.5.97): the re-import walk's polite defer-and-retry
+// ladder (lbKrBackfillRetry) lost EVERY ledger claim to steady-state account
+// polling (now hot-first per #2131) — 6 deferrals / 374s, then an honest
+// fail. An explicit user gesture must out-rank background polling for the
+// SAME key's points WITHOUT exceeding the venue budget: while a walk holds a
+// reservation on a spot key, routine (non-hot, non-priority) QUERY calls for
+// that key skip immediately (no points spent — poll data goes stale-tolerant
+// for a few cycles; WS push keeps live state per the local-ledger design),
+// letting the ledger refill for the walk. Orders/cancels are untouched
+// (priority classes never gate). Counted (nested acquire is fine) +
+// TTL-guarded (a leaked reservation fails SAFE — polls resume; the walk is
+// page-cap bounded far below the TTL). Reservations live in the Electron
+// MAIN process — the same funnel as acctReadGuard — so all windows share one
+// reservation and never fight.
+const KR_RESV_TTL_MS = 10 * 60 * 1000;
+function krResvNew() { return {}; }
+function krResvAcquire(R, key, now) {
+  const e = R[key] || (R[key] = { n: 0, ts: 0 });
+  e.n++; e.ts = Number(now) || 0;
+  return e.n;
+}
+function krResvRelease(R, key) {
+  const e = R[key];
+  if (!e) return 0;
+  e.n--;
+  if (e.n <= 0) { delete R[key]; return 0; }
+  return e.n;
+}
+function krResvHeld(R, key, now) {
+  const e = R[key];
+  return !!(e && e.n > 0 && (Number(now) || 0) - e.ts < KR_RESV_TTL_MS);
+}
 
 // --- #1839 Kraken spot TRADING rate counter (pure) --------------------------
 // SECOND, independent limiter (live diag proof, v1.5.47 REPPO scalp): the
@@ -7644,6 +7694,25 @@ function createTradeNative(opts) {
   function krLedgerFor(key) {
     return krLedgers[key] || (krLedgers[key] = krLedgerNew(Date.now()));
   }
+  // #2168 re-import reservations (runtime map over the pure helpers): while
+  // a re-import walk holds one for a spot key, routine queries on that key
+  // skip so the ledger refills for the walk. Handle factory keyed by CRED
+  // SLOT (what the reimport/backfill intents carry); the ledger itself is
+  // per SPOT key — futures rides a separate limiter with no ledger, so a
+  // futures-only pair yields an inert handle.
+  const krResvs = krResvNew();
+  function krResvFor(slot) {
+    let key = null;
+    try {
+      const creds = credsGet(slot || 'kraken');
+      const p = creds ? krPairFor(creds, 'spot') : null;
+      key = p ? p.key : null;
+    } catch (e) { key = null; }
+    return {
+      acquire: () => { if (key) krResvAcquire(krResvs, key, Date.now()); },
+      release: () => { if (key) krResvRelease(krResvs, key); },
+    };
+  }
   // #1839 per-spot-key TRADING counters + order birth stamps (cancel age
   // penalties key on how old the order is at cancel time). Bounded map —
   // oldest stamps drop past 500 entries; a missing stamp = worst-case
@@ -7693,6 +7762,18 @@ function createTradeNative(opts) {
     if (krCC && _pri) krCC.cls = 'cancel';   // reserved lane + loud retry
     if (krCC && !_nretry && !_cxl0) {
       const led = krLedgerFor(pair.key);
+      // #2168: while a re-import walk holds a reservation on this key's
+      // ledger, routine (non-hot, non-priority) queries skip IMMEDIATELY —
+      // no points spent, no defer loop — so the ledger refills for the
+      // walk. Same skipped:true shape/message the poll paths already
+      // treat as fail-soft (kr_budget deferrals are fine and stay).
+      // Orders/cancels never reach this branch (cls !== 'query').
+      if (krCC.cls === 'query' && !_pri && !_hot
+          && krResvHeld(krResvs, pair.key, Date.now())) {
+        tdiag('trade', 'kr_budget', { k: 'kraken', p: path, act: 'resv_skip' });
+        return { ok: false, skipped: true,
+                 message: 'kr_budget: deferred by the rate-points ledger' };
+      }
       const hotT0 = Date.now();   // #2131: bounded hot wait, never unbounded
       for (;;) {
         const g = krLedgerGate(led, krCC.cls, krCC.cost, Date.now());
@@ -11495,16 +11576,26 @@ function createTradeNative(opts) {
     const route = routeNorm(intent.route);
     const market = String(intent.market || 'both');
     const out = { ok: true, spot: [], futures: [] };
+    // #2168: hold the ledger reservation for the walk itself (covers the
+    // direct desktop re-import call path; the lblot retry ladder holds its
+    // own — counted, nesting is fine). Released in finally, always.
+    const resv = krResvFor(intent.credSlot || 'kraken');
+    resv.acquire();
+    try {
     if (market !== 'futures' && krPairFor(creds, 'spot')) {
       let codeMap = {};
       try { codeMap = ((await krProducts(route)) || {}).spotCode || {}; } catch (e) {}
       let ofs = 0;
       for (let page = 0; page < HB_KR_MAX_PAGES && ofs !== null; page++) {
         if (page) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+        // _hot=true: the walk's own claims ride the bounded hot-wait lane
+        // (wait for refill instead of budget-skip) — with the reservation
+        // pausing routine polls, attempt 1-2 should now win the claim.
         const th = await krRequest(creds, 'POST', 'spot', '/0/private/TradesHistory',
           [['start', String(w.frm / 1000)], ['end', String(w.to / 1000)],
            // #1829: per-execution rows only — never the consolidated synthetic.
-           ['ofs', String(ofs)], ['consolidate_taker', 'false']], route);
+           ['ofs', String(ofs)], ['consolidate_taker', 'false']], route,
+          false, 0, false, true);
         if (!th.ok) return th;   // fail-visible: never a partial snapshot
         const res = ((th.data || {}).result) || {};
         const trades = res.trades || {};
@@ -11537,6 +11628,7 @@ function createTradeNative(opts) {
       if (cursor) return { ok: false, message: 'Window too large — futures history exceeds the page cap; narrow the date range' };
     }
     return out;
+    } finally { resv.release(); }
   }
   async function hbPhemex(intent) {
     const creds = credsGet(intent.credSlot || 'phemex');
@@ -12133,6 +12225,10 @@ function createTradeNative(opts) {
       const _dgHwmS = lbHwm(sc.rows.filter((f) => f.market === 'spot'), null);
       const _dgHwmF = lbHwm(sc.rows.filter((f) => f.market === 'futures'), null);
       let _dgFetched = 0;   // #1973 rows returned by the venue fetch (pre-dedupe)
+      // #2167 gate-only: RAW per-leg row counts (pre-normalize) — `fetched`
+      // counts post-normalize fills, which hid a normalizer that nulled
+      // every futures row. futRows>0 with zero futures fills is now visible.
+      let _dgFutRows, _dgSpotRows;
       let gap = false;
       let covOk = true;
       const notes = [];
@@ -12165,7 +12261,8 @@ function createTradeNative(opts) {
           { credSlot: slot, route: intent.route, market: 'both', frm: frm, to: now },
           (ms) => new Promise((rs) => setTimeout(rs, ms)),
           (attempt, waitMs) => tdiag('lblot', 'backfill', { k: slot, v: venue,
-            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }));
+            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }),
+          krResvFor(slot));   // #2168: reservation spans attempts + sleeps
         if (r.bfTries > 1) notes.push('kraken rate budget deferred — ' + r.bfTries + ' attempts');
         if (!r.ok) {
           sc.bf = { ts: now, ok: false, msg: r.message || 'backfill failed' };
@@ -12389,6 +12486,8 @@ function createTradeNative(opts) {
           notes.push('contract spec unavailable for ' + multMiss + ' futures fill(s) — they retry next backfill');
         }
         for (const f of rawSpot) { const n = lbNormGateFill(f, 'spot', null); if (n) fills.push(n); }
+        _dgFutRows = rawFut.length;
+        _dgSpotRows = rawSpot.length;
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
       } else {
@@ -12457,7 +12556,8 @@ function createTradeNative(opts) {
       // #1973 field-test diag: hwm anchors, fetched vs merged (rest deduped),
       // duration + the explicit gap/coverage verdict and any horizon notes
       tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 1, ms: Date.now() - now,
-        hwmSpot: _dgHwmS, hwmFut: _dgHwmF, fetched: _dgFetched, merged: added,
+        hwmSpot: _dgHwmS, hwmFut: _dgHwmF, fetched: _dgFetched,
+        futRows: _dgFutRows, spotRows: _dgSpotRows, merged: added,
         dedup: _dgFetched - added, gap: gap ? 1 : 0, covOk: covOk ? 1 : 0,
         note: notes.join('; ') || undefined, total: sc.rows.length,
         persistErr: saved ? undefined : 1 });
@@ -12510,6 +12610,9 @@ function createTradeNative(opts) {
       let gap = false;
       const notes = [];
       const fills = [];
+      // #2167 gate-only: RAW per-leg row counts (pre-normalize) for the
+      // reimp diag line — see the backfill twin's rationale.
+      let riFutRows, riSpotRows;
       let hb = null;   // kraken: raw WS-shaped rows for the panel's engine POST leg
       if (venue === 'kraken') {
         // same walk as the #1844 desktop re-import source (TradesHistory +
@@ -12518,7 +12621,8 @@ function createTradeNative(opts) {
           { credSlot: slot, route: intent.route, market: market, frm: w.frm, to: w.to },
           sleep,
           (attempt, waitMs) => tdiag('lblot', 'reimp', { k: slot, v: venue,
-            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }));
+            act: 'kr_budget_defer', attempt: attempt, waitMs: waitMs }),
+          krResvFor(slot));   // #2168: reservation spans attempts + sleeps
         if (!r.ok) return riFail(r.message || 'kraken history fetch failed');
         if (r.bfTries > 1) notes.push('kraken rate budget deferred — ' + r.bfTries + ' attempts');
         for (const e of (r.spot || [])) { const f = lbNormKrWsSpot(e); if (f) fills.push(f); }
@@ -12659,6 +12763,8 @@ function createTradeNative(opts) {
             return riFail('Gate contract spec unavailable for ' + cs + ' — cannot size its fills; retry shortly');
           }
         }
+        riFutRows = rawFut.length;
+        riSpotRows = rawSpot.length;
         for (const f of rawSpot) { const n = lbNormGateFill(f, 'spot', null); if (n) fills.push(n); }
       } else {
         // binance: shell-signed time-window paging (never a raw host request
@@ -12771,6 +12877,7 @@ function createTradeNative(opts) {
       const saved = lbSaveNow();
       tdiag('lblot', 'reimp', { k: slot, v: venue, ok: 1, mkt: market,
         frm: w.frm, to: w.to, ms: Date.now() - t0run, fetched: use.length,
+        futRows: riFutRows, spotRows: riSpotRows,
         n: m.added, dedup: m.skipped, tomb: m.tombCleared,
         quarCleared: quarCleared, gap: gap ? 1 : 0,
         note: notes.join('; ') || undefined, total: sc.rows.length,
@@ -13749,6 +13856,12 @@ module.exports = {
   ACCT_HOT_MS,
   ACCT_IDLE_YIELD_MS,
   acctPrioGate,
+  // pure — #2168 re-import reservation on the kraken rate-points ledger
+  KR_RESV_TTL_MS,
+  krResvNew,
+  krResvAcquire,
+  krResvRelease,
+  krResvHeld,
   // pure — #2008 HL background REST budgeter
   hlInfoWeight,
   hlInfoTier,
