@@ -4,6 +4,7 @@ const { app, BrowserWindow, Tray, Menu, shell, session, nativeImage, ipcMain, sa
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
+const os = require('os');
 
 let autoUpdater = null;
 try {
@@ -88,7 +89,13 @@ function dynFeatureWinCount() {
 const { createDiagLogger } = require('./diag_log');
 let diag = null;
 function dlog(win, cat, ev, data) {
-  if (diag) diag.log(win, cat, ev, data);
+  if (!diag) return;
+  diag.log(win, cat, ev, data);
+  // #2212: dlog is the choke point every tap already rides (incl.
+  // trade_native's), so the burst/stall CPU probe hooks in here — no call
+  // site has to know about it, and it stays fail-closed with the logger.
+  const why = cpuProbeWhy(cat, ev, data);
+  if (why) cpuProbeArm(why);
 }
 function diagDir() {
   return path.join(app.getPath('userData'), 'logs');
@@ -104,6 +111,147 @@ function initDiag() {
   const d = diagSettings();
   if (!(d.admin === true && d.enabled !== false)) return;
   try { diag = createDiagLogger({ dir: diagDir() }); } catch (e) { diag = null; }
+}
+
+// ---------------------------------------------------------------------------
+// #2212 main-process stall + CPU forensics — LOGS ONLY, armed exclusively
+// while the admin diag logger is live (dlog is the fail-closed gate: no
+// logger ⇒ no timers, no samples, no files).
+// ---------------------------------------------------------------------------
+// Round 3 phase timers proved the burst-moment freeze is NOT a renderer lock:
+// all five renderers AND this process stopped emitting for ~400ms at once,
+// with a POSITIVE heap delta (so not GC) and every named phase ≈0. What the
+// next field log has to answer is WHICH process burned the CPU (main, a
+// renderer, GPU, utility) — or whether the whole machine was saturated, in
+// which case the conversation is about the SOCKS proxy client / AV /
+// hardware, not about this code.
+const MN_GAP_TICK_MS = 100;        // watchdog period
+const MN_GAP_MIN_MS = 150;         // report drift at/above this
+const MN_GAP_SLEEP_MS = 30000;     // beyond this = machine suspend, not a stall
+const MN_GAP_MAX_PER_MIN = 10;     // own cap (diag.log rate-limits again)
+const CPU_PROBE_MAX_PER_MIN = 6;
+const CPU_PROBE_DELAY_MS = 120;    // sample just AFTER the trigger — inside the burst
+// bn_push carries the scope's ledger seq as `q`; ≥8 means this scope has been
+// mutating all session (i.e. real order flow, not a first fill), which with
+// the 6/min cap is exactly the burst-moment sampling we want.
+const CPU_PROBE_PUSH_Q = 8;
+const CPU_PROBE_TRADE_OPS = { order: 1, close_pos: 1, amend: 1 };
+
+// PURE: rolling per-window budget shared by both taps. true = spend one.
+function perfRateTake(st, now, max, winMs) {
+  if (!st) return false;
+  if (!st.t0 || now - st.t0 >= winMs) { st.t0 = now; st.n = 1; return true; }
+  if (st.n >= max) return false;
+  st.n += 1;
+  return true;
+}
+
+// PURE: interval drift → stall ms (how long the loop was NOT running, i.e.
+// elapsed beyond the scheduled period), or 0 when this tick is not a stall.
+// Gaps past sleepMs are machine suspend/hibernate artifacts, never JS stalls
+// (same exclusion the panel's rAF freeze gate makes).
+function mnGapEval(prev, now, periodMs, minMs, sleepMs) {
+  if (!prev || !(now > prev)) return 0;
+  const d = (now - prev) - periodMs;
+  if (d < minMs) return 0;
+  if (sleepMs > 0 && d > sleepMs) return 0;
+  return d;
+}
+
+// PURE: which diag events arm the CPU probe → its 'why' tag, else ''. Keep
+// the probe's own 'cpu' event OUT of this list (no self-retrigger loop).
+function cpuProbeWhy(cat, ev, data) {
+  if (ev === 'mn_gap') return 'gap';
+  if (cat === 'acct' && ev === 'bn_push' && data && (data.q | 0) >= CPU_PROBE_PUSH_Q) return 'push';
+  if (cat === 'trade' && CPU_PROBE_TRADE_OPS[ev] === 1) return 'order';
+  return '';
+}
+
+// PURE: app.getAppMetrics() rows → compact hottest-first {t,c} list. Process
+// TYPES and numbers only — never pids, names, command lines or URLs.
+function cpuMetricsRows(metrics, cap) {
+  const out = [];
+  for (const m of (metrics || [])) {
+    if (!m || typeof m !== 'object') continue;
+    const pc = (m.cpu && typeof m.cpu.percentCPUUsage === 'number') ? m.cpu.percentCPUUsage : 0;
+    out.push({ t: String(m.type || '?').slice(0, 12), c: Math.round(pc * 10) / 10 });
+  }
+  out.sort((a, b) => b.c - a.c);
+  return out.slice(0, cap > 0 ? cap : 8);
+}
+
+// PURE: two process.cpuUsage() samples (µs) over a wall window → self CPU%
+// of one core-second. Node's cpuUsage is used rather than Electron's
+// getCPUUsage() because the delta is explicit (and node-testable).
+function cpuSelfPct(prev, cur, dtMs) {
+  if (!prev || !cur || !(dtMs > 0)) return -1;
+  const du = ((cur.user - prev.user) + (cur.system - prev.system)) / 1000;
+  return Math.round((du / dtMs) * 1000) / 10;
+}
+
+const mnGapRate = { t0: 0, n: 0 };
+const cpuProbeRate = { t0: 0, n: 0 };
+let mnGapTimer = null;
+let cpuProbeT = null;
+let cpuLast = null;
+let cpuCores = 0;
+
+function cpuCoreCount() {
+  if (!cpuCores) { try { cpuCores = os.cpus().length; } catch (e) { cpuCores = -1; } }
+  return cpuCores;
+}
+
+// ONE sample per trigger, capped, and never inline with the burst itself.
+function cpuProbeArm(why) {
+  if (!diag || cpuProbeT) return;
+  if (!perfRateTake(cpuProbeRate, Date.now(), CPU_PROBE_MAX_PER_MIN, 60 * 1000)) return;
+  cpuProbeT = setTimeout(() => { cpuProbeT = null; cpuProbeRun(why); }, CPU_PROBE_DELAY_MS);
+  if (cpuProbeT && typeof cpuProbeT.unref === 'function') cpuProbeT.unref();
+}
+
+function cpuProbeRun(why) {
+  if (!diag) return;
+  const now = Date.now();
+  const d = { why: why };
+  try {
+    const cur = process.cpuUsage();
+    if (cpuLast) d.self = cpuSelfPct(cpuLast.u, cur, now - cpuLast.t);
+    cpuLast = { t: now, u: cur };
+  } catch (e) { /* non-fatal */ }
+  let rows = [];
+  try { rows = cpuMetricsRows(app.getAppMetrics(), 8); } catch (e) { rows = []; }
+  let tot = 0;
+  for (const r of rows) tot += r.c;
+  d.tot = Math.round(tot * 10) / 10;
+  d.n = rows.length;
+  d.cores = cpuCoreCount();
+  d.p = rows;
+  // loadavg is a constant 0 on Windows — omitted there so a zero can never be
+  // misread as "the machine was idle".
+  if (process.platform !== 'win32') {
+    try { d.la = Math.round(os.loadavg()[0] * 100) / 100; } catch (e) { /* non-fatal */ }
+  }
+  dlog('main', 'perf', 'cpu', d);
+}
+
+function mnGapStart() {
+  if (!diag || mnGapTimer) return;
+  let last = Date.now();
+  mnGapTimer = setInterval(() => {
+    const now = Date.now();
+    const gap = mnGapEval(last, now, MN_GAP_TICK_MS, MN_GAP_MIN_MS, MN_GAP_SLEEP_MS);
+    last = now;
+    if (!gap) return;
+    if (!perfRateTake(mnGapRate, now, MN_GAP_MAX_PER_MIN, 60 * 1000)) return;
+    dlog('main', 'perf', 'mn_gap', { gapMs: gap });   // arms the CPU probe via dlog
+  }, MN_GAP_TICK_MS);
+  if (mnGapTimer && typeof mnGapTimer.unref === 'function') mnGapTimer.unref();
+}
+
+function mnGapStop() {
+  if (!mnGapTimer) return;
+  try { clearInterval(mnGapTimer); } catch (e) { /* non-fatal */ }
+  mnGapTimer = null;
 }
 
 let mainWindow = null;
@@ -1002,6 +1150,7 @@ ipcMain.on('att:diag-role', (event, isAdmin) => {
   } else {
     if (d.admin === true) saveSettings({ diag: Object.assign({}, d, { admin: false }) });
     if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } diag = null; }
+    mnGapStop();   // #2212: the watchdog dies with the logger it feeds
     refreshTrayMenu();
   }
 });
@@ -1470,10 +1619,23 @@ createTradeNative({
   // ALL panel windows (main + feature pop-outs) the moment the shell applies
   // it — the panel's badges/posrow/fill-sound react to the push while the
   // /state poll stays a background auditor.
+  // #2212 batched fan-out: `ev` is either ONE event (Kraken/HL/Bybit/Gate
+  // lanes) or an ARRAY of the events one drain tick produced (Binance burst
+  // lane). An array ships as ONE structured-clone IPC per window carrying the
+  // whole list, instead of N deliveries × W windows in the same instant; the
+  // panel unpacks and applies them sequentially, in exactly this order. A
+  // one-event array collapses back to the bare single shape, so the common
+  // case stays byte-identical on the wire. The panel tolerates BOTH shapes
+  // (it is always republished before a shell release), so a mixed
+  // panel/shell pair is safe in either direction.
   pushLedger: (ev) => {
+    const evs = Array.isArray(ev) ? ev : null;
+    if (evs && evs.length === 0) return;
+    let msg = ev;
+    if (evs) msg = evs.length === 1 ? evs[0] : { __b: 1, evs: evs };
     for (const w of [mainWindow, ...featureWindows.values()]) {
       if (!w || w.isDestroyed()) continue;
-      try { w.webContents.send('att:ledger-push', ev); } catch (e) { /* window closing */ }
+      try { w.webContents.send('att:ledger-push', msg); } catch (e) { /* window closing */ }
     }
   },
 });
@@ -1998,6 +2160,7 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('com.atraderstool.desktop'); // Windows notifications attribution
   // Diagnostic logger first, so every subsequent launch step is captured.
   initDiag();
+  mnGapStart();   // #2212 main event-loop stall watchdog (no logger = no timer)
   if (diag) {
     const cfg = getProxyConfig();
     dlog('main', 'app', 'start', {
@@ -2035,6 +2198,7 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  mnGapStop();   // #2212
   dlog('main', 'app', 'quit', {});
   if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } }
 });

@@ -5487,9 +5487,16 @@ function createTradeNative(opts) {
       // memo-bust so the push-triggered acct_read observes the mutation
       try { execAcctRead.bust('binance', ev.slot); } catch (e) { /* best-effort */ }
       try { execAcctRead.markHot('binance'); } catch (e) { /* #2131 hot lane */ }
-      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
       tdiag('acct', 'bn_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
+    // #2212 ONE batched fan-out per drain tick (the drain already folds marks
+    // per slot|scope, so this is normally 1-2 events — but a burst that lands
+    // spot AND futures mutations in the same tick used to cost one IPC +
+    // structured clone per event PER WINDOW). main.js unwraps a 1-event array
+    // back to the bare single shape; the panel applies the list in THIS order,
+    // so per-event handling (dedup ids, chime ids, blotter kicks) is
+    // unchanged. The memo bust above still runs before anything ships.
+    if (evs.length) { try { pushLedgerCb(evs); } catch (e) { /* window gone */ } }
   }
   function bnPushSc(scope, kind, id, row) {
     if (!pushLedgerCb || !scope || !scope._pk) return;
