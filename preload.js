@@ -78,6 +78,17 @@ try {
       try { return ipcRenderer.sendSync('att:snd-claim', String(id || '')) === true; }
       catch (e) { return null; }
     },
+    // #2197 non-blocking claim: same serialized first-wins registry in main,
+    // consulted via ASYNC invoke so the renderer never blocks on a busy main
+    // process (the sendSync above froze windows 300-430ms during Binance fill
+    // bursts). Resolves true (won) / false (lost) / null (bridge failure —
+    // panel keeps its optimistic latch decision). String id only.
+    sndClaimAsync: (id) => {
+      try {
+        return ipcRenderer.invoke('att:snd-claim-async', String(id || ''))
+          .then((r) => (r === true ? true : (r === false ? false : null)), () => null);
+      } catch (e) { return Promise.resolve(null); }
+    },
     onLaunchGate: (cb) => { _launchGateCb = (typeof cb === 'function') ? cb : null; },
     // Update-state mirror for the in-titlebar Restart button (#1793): the panel
     // accents the button ("restart to update") when a downloaded update is

@@ -1027,6 +1027,14 @@ ipcMain.on('att:snd-claim', (event, id) => {
   if (proxySenderKind(event) !== 'app') { event.returnValue = false; return; }
   event.returnValue = sndClaimTake(sndClaims, String(id || ''), 800);
 });
+// #2197 async twin of the claim above — SAME registry (mixed old/new panels
+// still race to one first-wins slot per id), but the renderer awaits a
+// promise instead of blocking on sendSync while main is busy with bn push
+// fan-out / acct JSON parsing.
+ipcMain.handle('att:snd-claim-async', (event, id) => {
+  if (proxySenderKind(event) !== 'app') return false;
+  return sndClaimTake(sndClaims, String(id || ''), 800);
+});
 
 // Settings-card state for the admin-only "Diagnostic logging" toggle.
 ipcMain.handle('att:diag-get', (event) => {
