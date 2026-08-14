@@ -1394,6 +1394,39 @@ function lbNormBybFill(f) {
 // deduction) ⇒ 0. Gate hands NO per-fill closed PnL — '0' always (NET
 // comes from local-blotter replay panel-side). ts: create_time_ms
 // preferred, else create_time seconds ×1000.
+// #2177 gate hedge-mode position side from a futures fill's `close_size`
+// (my_trades_timerange / re-import rows carry it; WS usertrades rows do
+// NOT → '' = unknown, replay degrades to legacy one-way netting). Gate
+// semantics: close_size shares the size sign; 0 = opening (side sign IS
+// the position side), <0 closes a LONG, >0 closes a SHORT. A one-way flip
+// row (|size| > |close_size|, close_size ≠ 0) spans BOTH sides → '' —
+// dual mode never produces flips, so ambiguity only exists where legacy
+// netting is correct anyway.
+function lbGatePsd(sz, csRaw) {
+  if (csRaw == null || csRaw === '') return '';
+  const cs = Number(csRaw);
+  if (!Number.isFinite(cs)) return '';
+  if (cs === 0) return sz > 0 ? 'long' : 'short';
+  if (cs < 0 && sz < 0) return sz >= cs ? 'long' : '';
+  if (cs > 0 && sz > 0) return sz <= cs ? 'short' : '';
+  return '';
+}
+// #2177 dual-mode split gate: {long:[],short:[]} iff EVERY trade row in the
+// group carries a derived posSide AND both sides appear — else null (legacy
+// one-way replay stays byte-identical: old rows, WS-only rows and flip rows
+// all lack posSide, and a single-sided group replays the same either way).
+function lbGateDualSplit(tradeRows) {
+  let hasL = false, hasS = false;
+  for (const r of (tradeRows || [])) {
+    const p = r.posSide;
+    if (p === 'long') hasL = true;
+    else if (p === 'short') hasS = true;
+    else return null;
+  }
+  if (!hasL || !hasS) return null;
+  return { long: tradeRows.filter((r) => r.posSide === 'long'),
+           short: tradeRows.filter((r) => r.posSide === 'short') };
+}
 function lbNormGateFill(f, market, mult) {
   if (!f || typeof f !== 'object') return null;
   // #2167: /futures/usdt/my_trades_timerange rows carry `trade_id` — NOT
@@ -1421,7 +1454,7 @@ function lbNormGateFill(f, market, mult) {
     const fee = (Number(f.fee) || 0) + (Number(f.point_fee) || 0);
     row = {
       venue: 'gate', market: 'futures', symbol: String(f.contract || ''),
-      side: sz > 0 ? 'buy' : 'sell', posSide: '',
+      side: sz > 0 ? 'buy' : 'sell', posSide: lbGatePsd(sz, f.close_size),
       order_px: '', exec_px: px, qty: qty,
       value: lbFmt(Number(px) * Number(qty)),
       fee: lbFmt(fee), closed_pnl: '0',
@@ -1631,13 +1664,26 @@ function lbPruneRows(rows, cap) {
     // NOTE: no whole-group ts shortcut here — a stale group that never
     // returned to flat is an OPEN position and must survive in full; the
     // flat-boundary walk below drops fully-flat stale groups by itself.
-    let pos = 0, cut = -1;
+    // #2177 gate hedge-mode: a provably dual group tracks the two position
+    // sides SEPARATELY — a flat boundary requires BOTH sides flat (net-zero
+    // while long+short are concurrently open is NOT flat; two concurrent
+    // open groups on one symbol must survive pruning).
+    const dual = (trade[0] && trade[0].venue === 'gate'
+                  && trade[0].market === 'futures')
+      ? lbGateDualSplit(trade) : null;
+    let pos = 0, posL = 0, posS = 0, cut = -1;
     for (let i = 0; i < trade.length; i++) {
       const r = trade[i];
       if (Number(r.ts) >= cutoff) break;
       const q = Number(r.qty) || 0;
-      pos += (String(r.side) === 'buy') ? q : -q;
-      if (Math.abs(pos) <= 1e-9) cut = i;    // flat boundary inside the stale prefix
+      const signed = (String(r.side) === 'buy') ? q : -q;
+      if (dual) {
+        if (r.posSide === 'long') posL += signed; else posS += signed;
+        if (Math.abs(posL) <= 1e-9 && Math.abs(posS) <= 1e-9) cut = i;
+      } else {
+        pos += signed;
+        if (Math.abs(pos) <= 1e-9) cut = i;  // flat boundary inside the stale prefix
+      }
     }
     for (let i = cut + 1; i < trade.length; i++) keep.push(trade[i]);
   }
@@ -1840,6 +1886,20 @@ function lbReconstruct(fills, displayMap) {
       || { venue: f.venue || 'phemex', market: f.market || '', symbol: f.symbol || '', aid: aid, trade: [], funding: [] };
     (f.kind === 'funding' ? g.funding : g.trade).push(f);
   }
+  // #2177 gate hedge-mode: when a gate futures group is provably dual-mode
+  // (every row posSide-tagged, both sides present) split it into two
+  // independent lot streams — long/short position fills must never net
+  // against each other. Funding rows aren't side-attributable (gate hands
+  // one aggregate row) → they ride the LONG stream only (no double count).
+  for (const key of Object.keys(groups)) {
+    const G = groups[key];
+    if (G.venue !== 'gate' || G.market !== 'futures') continue;
+    const sp = lbGateDualSplit(G.trade);
+    if (!sp) continue;
+    delete groups[key];
+    groups[key + '\u0000l'] = { ...G, trade: sp.long };
+    groups[key + '\u0000s'] = { ...G, trade: sp.short, funding: [] };
+  }
   const out = [];
   for (const key of Object.keys(groups)) {
     const G = groups[key];
@@ -1902,8 +1962,11 @@ function lbReconstruct(fills, displayMap) {
       if (tr.market === 'spot') net = tr.close_notional - tr.open_notional - tr.commission;
       else {
         net = tr.closed_pnl - tr.commission - fund;
+        // #2177 gate: engine stamps per-fill closed PnL '0' by design (Gate
+        // hands none) — NET must come from the matched-notional fallback or
+        // every gate futures round-trip nets −fees.
         if ((tr.venue === 'bybit' || tr.venue === 'kucoin' || tr.venue === 'bitmex'
-             || tr.venue === 'kraken')
+             || tr.venue === 'kraken' || tr.venue === 'gate')
             && tr.closed_pnl === 0 && tr.close_qty > 0) {
           const sign = tr.dir === 'long' ? 1 : -1;
           net = sign * (tr.close_notional - tr.open_notional) - tr.commission - fund;
