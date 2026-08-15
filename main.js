@@ -2425,13 +2425,34 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', () => {
+let lbQuitFlush = null;    // the durable flush this quit is waiting on
+let lbQuitDone = false;    // …and it has finished: let the quit through
+app.on('before-quit', (e) => {
   isQuitting = true;
   mnGapStop();   // #2212
   mnCanStop();   // #2217
   // #2234: the local blotter persists through a journal + a rare snapshot —
-  // force whatever is still only in memory onto disk before the app goes.
-  try { if (tradeNative && tradeNative.lbFlush) tradeNative.lbFlush(); } catch (e) { /* quitting */ }
+  // force whatever is still only in memory onto disk before the app goes. A
+  // synchronous flush can only APPEND to the journal, and an append cannot
+  // carry a delete or an in-place re-import, so if a background snapshot is in
+  // flight hold the quit until the store itself has been written. EVERY quit
+  // request is held while that flush is pending — a second Cmd-Q must not walk
+  // past it — and the flush itself re-issues the quit when it is done. The cap
+  // bounds the WAITING only (a synchronous write already in progress cannot be
+  // interrupted by anything, here or anywhere else), so a quit always ends.
+  if (!lbQuitDone && tradeNative && tradeNative.lbFlushWait) {
+    try {
+      e.preventDefault();
+      if (!lbQuitFlush) {
+        const cap = new Promise((res) => setTimeout(res, 8000));
+        lbQuitFlush = Promise.race(
+          [Promise.resolve(tradeNative.lbFlushWait()).catch(() => {}), cap])
+          .then(() => { lbQuitDone = true; app.quit(); });
+      }
+      return;
+    } catch (err) { /* fall through to the synchronous flush */ }
+  }
+  try { if (tradeNative && tradeNative.lbFlush) tradeNative.lbFlush(); } catch (e2) { /* quitting */ }
   dlog('main', 'app', 'quit', {});
   if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } }
 });

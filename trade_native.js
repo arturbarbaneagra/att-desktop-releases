@@ -12516,6 +12516,7 @@ function createTradeNative(opts) {
   const LB_SNAP_QUIET_MS = 3000;       // ... deferred while fills keep landing
   const LB_SNAP_MAX_MS = 120000;       // ... but never past this hard deadline
   const LB_SNAP_RETRY_MS = 2000;       // failed snapshot ⇒ retry
+  const LB_SNAP_WAIT_MS = 2000;        // explicit op waiting out a fold
   const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
   const lbTmp = () => path.join(userDataDir(), 'local_fills_v1.json.tmp');
   // The journal is a SEQUENCE of segments, never one rewritten file. A
@@ -12533,6 +12534,7 @@ function createTradeNative(opts) {
   let _lbJrnSeq = 0;   // segment appends go to right now
   let _lbSnapT = null, _lbSnapDue = 0, _lbSnapMax = 0, _lbSnapBusy = false;
   let _lbSnapAgain = false, _lbLastFill = 0, _lbPersistErr = null;
+  let _lbSnapWait = [];                // explicit ops waiting out a background fold
   function lbScopeIn(st, slot) {
     let sc = st.scopes[slot];
     if (!sc) sc = st.scopes[slot] = { rows: [], del: {}, bf: null };
@@ -12695,7 +12697,13 @@ function createTradeNative(opts) {
     // A second writer cannot run: the store would be serialized twice into the
     // same tmp file. A caller that needs a DEFINITIVE verdict (explicit ops,
     // quit) still gets durability — its rows go to the journal synchronously.
-    if (_lbSnapBusy) { _lbSnapAgain = true; return sync ? lbJrnFlushSync() : true; }
+    // A second writer cannot run. For a background fold that is fine (the next
+    // one covers it). A caller that wants a VERDICT gets its queued rows into
+    // the journal and an honest `false`: the store was not written, and a
+    // delete or an in-place re-import is not something a journal of appends
+    // can describe. lbSaveNow waits for the in-flight write instead of ever
+    // landing here.
+    if (_lbSnapBusy) { _lbSnapAgain = true; if (!sync) return true; lbJrnFlushSync(); return false; }
     let json = null;
     const t0 = lbT();
     try {
@@ -12730,6 +12738,10 @@ function createTradeNative(opts) {
     _lbSnapDue = 0; _lbSnapMax = 0;
     const done = (err) => {
       _lbSnapBusy = false;
+      // wake anything waiting to write the store itself (explicit ops). These
+      // are promise continuations, so they run after this frame completes —
+      // never re-entrantly inside it.
+      if (_lbSnapWait.length) { const w = _lbSnapWait; _lbSnapWait = []; for (const f of w) f(); }
       if (err) {
         _lbPersistErr = String((err && err.message) || err);
         try { fs.unlinkSync(lbTmp()); } catch (e) { /* best effort */ }
@@ -12779,7 +12791,36 @@ function createTradeNative(opts) {
     });
     return true;
   }
-  function lbSaveNow() { return lbSnapNow(true); }
+  // Explicit ops (import, delete, re-import, backfill) must return a
+  // DEFINITIVE durable verdict, and only some of them are expressible as
+  // journal appends: a delete, a tombstone clear or an in-place re-import is
+  // not. So when a background fold is in flight, WAIT for it and then write
+  // the store — never report success on the strength of a journal that cannot
+  // describe the mutation. The wait is bounded (a filesystem call that never
+  // returns must not hang an op): past it the write is attempted anyway and
+  // its honest verdict — persistErr — reaches the caller.
+  async function lbSaveNow() {
+    for (let i = 0; i < 3 && _lbSnapBusy; i++) await lbSnapSettled(LB_SNAP_WAIT_MS);
+    return lbSnapNow(true);
+  }
+  // Resolve when the in-flight snapshot settles, or after `ms` — and on the
+  // timeout DROP the registration: a filesystem call that never returns must
+  // not leave one closure per explicit op behind, or a late completion would
+  // walk that whole queue in a single frame (the exact stall this round is
+  // about).
+  function lbSnapSettled(ms) {
+    return new Promise((res) => {
+      let t = null, fired = false;
+      const fire = () => { if (fired) return; fired = true; if (t) { clearTimeout(t); t = null; } res(); };
+      const w = () => fire();
+      t = setTimeout(() => {
+        const i = _lbSnapWait.indexOf(w);
+        if (i >= 0) _lbSnapWait.splice(i, 1);
+        fire();
+      }, ms);
+      _lbSnapWait.push(w);
+    });
+  }
   // Last-resort durability: put whatever is still queued into the journal
   // synchronously. Used at quit and whenever a snapshot write failed — the
   // journal sits on top of the last GOOD snapshot, so replaying it recovers
@@ -12811,6 +12852,22 @@ function createTradeNative(opts) {
       if (!ok) { lbJrnFlushSync(); return false; }
       return true;
     } catch (e) { return false; }
+  }
+  // Quit path, same reasoning as lbSaveNow: while a background fold is in
+  // flight a synchronous flush can only APPEND to the journal, and an append
+  // cannot carry a delete, a tombstone clear or an in-place re-import. So hold
+  // the quit for the fold — bounded, because a quit must always finish — and
+  // then write the store itself.
+  async function lbFlushWait() {
+    for (let i = 0; i < 2 && _lbSnapBusy; i++) await lbSnapSettled(LB_SNAP_WAIT_MS);
+    const ok = lbFlushSync();
+    // Past the wait the quit goes ahead either way — an app that refuses to
+    // exit is a worse failure than one that says so — but it never goes ahead
+    // SILENTLY: every fill is still on disk (previous snapshot + journal), and
+    // this line says a mutation the journal cannot express may not be.
+    if (!ok) tdiag('lblot', 'quit-unsafe', { k: 'lb', busy: _lbSnapBusy ? 1 : 0,
+      err: String(_lbPersistErr || 'snapshot in flight') });
+    return ok;
   }
   function lbScope(slot) { return lbScopeIn(lbLoad(), slot); }
   // Drain the live shell fill caches (kraken WS session / binance UDS
@@ -13066,7 +13123,7 @@ function createTradeNative(opts) {
     // makes the import durable (lbSnapNow flushes it synchronously and still
     // reports an honest verdict). A snapshot that does run folds them in.
     if (added) lbJrnQueue(slot, addRows);
-    const saved = lbSaveNow();   // explicit op: snapshot now, journal folded in
+    const saved = await lbSaveNow();   // explicit op: snapshot now, journal folded in
     // #1973: explicit ingest flow (panel Import button / supplied rows)
     tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'import', recv: rowsIn.length,
       n: added, dedup: fills.length - added, total: sc.rows.length,
@@ -13090,7 +13147,7 @@ function createTradeNative(opts) {
     sc.rows = sc.rows.filter((r) => !set[lbFillKey(r)]);
     sc.seen = null;
     lbStoreMut(slot, sc);   // #2234 rows removed from the middle — bust caches
-    const saved = lbSaveNow();
+    const saved = await lbSaveNow();
     return { ok: true, removed: before - sc.rows.length,
              ...(saved ? {} : { persistErr: true }) };
   }
@@ -13554,7 +13611,7 @@ function createTradeNative(opts) {
       if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
       sc.bf = { ts: now, ok: true, added: added, gap: gap, covOk: covOk,
                 note: notes.join('; ') };
-      const saved = lbSaveNow();
+      const saved = await lbSaveNow();
       // #1973 field-test diag: hwm anchors, fetched vs merged (rest deduped),
       // duration + the explicit gap/coverage verdict and any horizon notes
       tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 1, ms: Date.now() - now,
@@ -13880,7 +13937,7 @@ function createTradeNative(opts) {
       // replay cache's group signatures and the drain's ring cursors both have
       // to start over (a cleared tombstone makes ring rows mergeable again).
       lbStoreMut(slot, sc);
-      const saved = lbSaveNow();
+      const saved = await lbSaveNow();
       tdiag('lblot', 'reimp', { k: slot, v: venue, ok: 1, mkt: market,
         frm: w.frm, to: w.to, ms: Date.now() - t0run, fetched: use.length,
         futRows: riFutRows, spotRows: riSpotRows,
@@ -14376,7 +14433,9 @@ function createTradeNative(opts) {
   try {
     process.on('exit', () => { try { lbFlushSync(); } catch (e) { /* exiting */ } });
   } catch (e) { /* no process hooks (tests) — the explicit lbFlush still works */ }
-  return { execIntent, credsStatus, lbFlush: lbFlushSync };   // exposed for shell-internal use/tests
+  // lbFlush stays synchronous (the process-exit hook can use nothing else);
+  // lbFlushWait is what a quit that can still await should call.
+  return { execIntent, credsStatus, lbFlush: lbFlushSync, lbFlushWait };
 }
 
 // ── PURE — HL background REST budgeter (#2008) ──────────────────────────────
