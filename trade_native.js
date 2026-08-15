@@ -1667,6 +1667,35 @@ function lbHwm(rows, market) {
   }
   return hi;
 }
+// #2230 no-news drain gate — pure, node-tested. lbDrain re-normalizes the live
+// WS/UDS fill caches and merges them into the persisted scope on EVERY read,
+// and every open window polls its own read: with a 14k-row store that is a
+// full seen-index rebuild per window per beat on the main-process loop. When
+// neither the source caches NOR the store have changed since the last drain,
+// the drain provably cannot merge anything, so it is skipped — but only for
+// `idleMs`, because a drain also self-heals rows the last pass could not
+// normalize yet (HL '@N' spot wire coins, Gate contracts awaiting a
+// multiplier), and that retry must keep happening.
+const LB_DRAIN_IDLE_MS = 2000;
+function lbDrainSkip(prev, sig, now, idleMs) {
+  if (!prev || prev.sig !== sig) return false;
+  const cap = (Number.isFinite(idleMs) && idleMs > 0) ? idleMs : LB_DRAIN_IDLE_MS;
+  return (now - prev.t) < cap;
+}
+// Ring VERSION for that gate. Every live fill cache is a bounded ring, so row
+// COUNT is not a change detector: at cap a push evicts the oldest row and
+// appends a new one, leaving the length identical while the contents moved on
+// (and, worse, while rows the gate skipped could roll off unseen). Every
+// mutation therefore bumps a monotonic counter instead — O(1), no row touched.
+// Length rides along only as a backstop for a mutation that forgets to touch.
+function lbSrcTouch(F) {
+  if (F) F.rev = (F.rev | 0) + 1;
+  return F;
+}
+function lbSrcVer(F) {
+  if (!F) return '-';
+  return (F.rev | 0) + '.' + (Array.isArray(F.rows) ? F.rows.length : 0);
+}
 // POSITION-AWARE size prune (the blotter-prune rule: NEVER a bare ts
 // cutoff). When the scope exceeds `cap` rows, compute the cutoff ts that
 // keeps ~cap newest rows, then per (venue|market|symbol|aid) group prune
@@ -3415,6 +3444,7 @@ function krFillsCachePush(C, row, cap) {
     const drop = C.rows.splice(0, C.rows.length - cap);
     for (const d of drop) delete C.seen[d.id];
   }
+  lbSrcTouch(C);   // #2230 the ONE Kraken choke point (WS live + REST seed)
   return true;
 }
 // fills_read window filter: RAW rows with ts inside [startMs, endMs].
@@ -4795,6 +4825,75 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   return guarded;
 }
 
+// #2230 PUBLIC-data share guard — pure, node-tested (the catalog twin of
+// acctReadGuard). Every window builds its own catalog/ticker caches, so N open
+// windows used to fetch, read and parse the SAME multi-megabyte payload N
+// times on the ONE main-process loop that serves every window's IPC and WS
+// traffic (field log 2026-08-15: Binance spot exchangeInfo 6.67 MB fetched 5×
+// inside 2 s, Phemex products 2.5 MB 5×, the 30 s 24h-ticker sweep 4× inside
+// 1.1 s — ~96 MB of boot burst). Two rules, both required:
+//   1. single-flight — concurrent callers for the same request JOIN the one
+//      in-flight promise (the app fetches it once, the venue sees one request);
+//   2. freshness window STAMPED AT REQUEST START (not after the body lands and
+//      parses): a window arriving moments later reuses the result, and the
+//      window can never be extended by a slow fetch. This is exactly the bug
+//      in the old phemexProducts TTL — it stamped after the parse, so five
+//      concurrent callers all missed and all fetched.
+// Only sizeable bodies are memoized (small live reads — tape, ticker/price,
+// kline tails — keep byte-identical per-call freshness and merely coalesce),
+// and ONLY successful ones: an error is never cached (fail-open, never a
+// latched failure — memory venue-relay-fallback).
+const CAT_SHARE_MEMO_MS = 10000;
+const CAT_SHARE_MIN_BYTES = 256 * 1024;
+// Body size of a bridge reply, 0 when it must not be memoized.
+function catShareBytes(r) {
+  if (!r || typeof r !== 'object' || r.ok !== true) return 0;
+  if ((r.status | 0) !== 200) return 0;
+  if (typeof r.body === 'string') return r.body.length;
+  if (typeof r.text === 'string') return r.text.length;
+  return 0;
+}
+function catShareGuard(nowFn, onEvent, opts) {
+  const now = typeof nowFn === 'function' ? nowFn : Date.now;
+  const o = opts || {};
+  const memoMs = (Number.isFinite(o.memoMs) && o.memoMs > 0) ? o.memoMs : CAT_SHARE_MEMO_MS;
+  const minBytes = (Number.isFinite(o.minBytes) && o.minBytes >= 0) ? o.minBytes : CAT_SHARE_MIN_BYTES;
+  const sizeOf = (typeof o.sizeOf === 'function') ? o.sizeOf : catShareBytes;
+  const emit = (ev, info) => {
+    if (typeof onEvent !== 'function') return;
+    try { onEvent(ev, info); } catch (e) { /* diagnostics never break reads */ }
+  };
+  const inflight = {};   // key → in-flight promise
+  const memo = {};       // key → { t0 (REQUEST START), r, n }
+  // EVERY caller gets its OWN top-level object. The shared thing is the body
+  // STRING (immutable, so sharing it is free); the wrapper is not, because the
+  // att:trade-exec handler stamps per-call fields onto the reply it returns
+  // (`via`, socket-reuse marker). Handing two windows the same object would
+  // silently give the second one the first one's transport label.
+  const out = (r) => ((r && typeof r === 'object' && !Array.isArray(r)) ? Object.assign({}, r) : r);
+  const share = async function (key, run, info) {
+    const k = String(key || '');
+    const t0 = now();
+    const m = memo[k];
+    if (m) {
+      if (t0 - m.t0 < memoMs) { emit('memo', Object.assign({ k: k, n: m.n }, info)); return out(m.r); }
+      delete memo[k];
+    }
+    if (inflight[k]) { emit('coalesced', Object.assign({ k: k }, info)); return out(await inflight[k]); }
+    const p = (async () => await run())();
+    inflight[k] = p;
+    try {
+      const r = await p;
+      const n = sizeOf(r);
+      // Stamped with t0 — the REQUEST START, never the settle time.
+      if (n >= minBytes) memo[k] = { t0: t0, r: r, n: n };
+      return out(r);
+    } finally { delete inflight[k]; }
+  };
+  share.stats = () => ({ memo: Object.keys(memo).length, inflight: Object.keys(inflight).length });
+  return share;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime wiring (electron main). Everything below touches the network /
 // disk / IPC and is exercised only inside the shell.
@@ -5174,8 +5273,18 @@ function createTradeNative(opts) {
   // The full Phemex catalog measured ~2.5 MB (2026-07); pass an 8 MB cap so
   // the default 256 KB httpJson cap doesn't silently truncate it.
   const products = { spot: null, curScales: null, raw: null, ts: 0 };
+  // #2230 single-flight + START-stamped TTL. The old code stamped products.ts
+  // AFTER the 2.5 MB body landed and parsed, with no in-flight guard: five
+  // windows opening a Phemex board in the same second ALL saw an empty cache,
+  // ALL fetched, and main parsed 12.5 MB (field log 2026-08-15). Concurrent
+  // callers now join one request, and ts marks when that request STARTED so a
+  // slow fetch can never stretch the freshness window.
+  let _phProdInflight = null;
   async function phemexProducts(route) {
-    if (!products.spot || Date.now() - products.ts > PRODUCTS_TTL_MS) {
+    if (products.spot && Date.now() - products.ts <= PRODUCTS_TTL_MS) return products;
+    if (_phProdInflight) return await _phProdInflight;
+    const t0 = Date.now();
+    _phProdInflight = (async () => {
       const r = await httpJson(PHEMEX_HOST, 'GET', '/public/products', '', null, {}, route,
                                8 * 1024 * 1024);
       const d = JSON.parse(r.text);
@@ -5198,9 +5307,10 @@ function createTradeNative(opts) {
       products.spot = spot;
       products.curScales = curScales;
       products.raw = data;
-      products.ts = Date.now();
-    }
-    return products;
+      products.ts = t0;   // REQUEST START — never the post-parse settle time
+      return products;
+    })();
+    try { return await _phProdInflight; } finally { _phProdInflight = null; }
   }
   async function spotSpec(symbol, route) {
     const p = await phemexProducts(route);
@@ -5643,6 +5753,7 @@ function createTradeNative(opts) {
         if (B.fills.rows.length > BN_UDS_FILLS_CAP) {
           B.fills.rows.splice(0, B.fills.rows.length - BN_UDS_FILLS_CAP);
         }
+        lbSrcTouch(B.fills);   // #2230
         krLseq(B); bnPushSc(B, 'fill', fid, ev);
       }
     }
@@ -5756,6 +5867,7 @@ function createTradeNative(opts) {
         if (B.fills.rows.length > BN_UDS_FILLS_CAP) {
           B.fills.rows.splice(0, B.fills.rows.length - BN_UDS_FILLS_CAP);
         }
+        lbSrcTouch(B.fills);   // #2230
         krLseq(B); bnPushSc(B, 'fill', fid, row);
       }
       krLseq(B); bnPushSc(B, 'pos');   // a fill moves the position — refresh
@@ -5944,6 +6056,7 @@ function createTradeNative(opts) {
         if (A.fills.rows.length > HL_PUSH_FILLS_CAP) {
           A.fills.rows.splice(0, A.fills.rows.length - HL_PUSH_FILLS_CAP);
         }
+        lbSrcTouch(A.fills);   // #2230
         krLseq(A); hlPushSc(A, 'fill', tid, f);
         krLseq(A); hlPushSc(A, 'pos');   // a fill moves the position — refresh
       }
@@ -6174,6 +6287,7 @@ function createTradeNative(opts) {
         if (A.fills.rows.length > BYB_PUSH_FILLS_CAP) {
           A.fills.rows.splice(0, A.fills.rows.length - BYB_PUSH_FILLS_CAP);
         }
+        lbSrcTouch(A.fills);   // #2230
         krLseq(A); bybPushSc(A, 'fill', eid, f);
         krLseq(A); bybPushSc(A, 'pos');   // a fill moves the position — refresh
       }
@@ -6800,6 +6914,7 @@ function createTradeNative(opts) {
         if (sc.fills.rows.length > GATE_PUSH_FILLS_CAP) {
           sc.fills.rows.splice(0, sc.fills.rows.length - GATE_PUSH_FILLS_CAP);
         }
+        lbSrcTouch(sc.fills);   // #2230
         krLseq(sc); gatePushSc(sc, 'fill', eid, f);
         if (mk === 'futures') { krLseq(sc); gatePushSc(sc, 'pos'); }   // a fill moves the position
       }
@@ -11944,6 +12059,11 @@ function createTradeNative(opts) {
     }
     return out;
   }
+  // #2230 ONE shared instance for the whole public-data bridge: every window's
+  // catalog/ticker/kline GET rides it, so the app fetches a given payload once
+  // instead of once per open window. Signed/account reads keep their own
+  // acctReadGuard — this guard only ever sees unsigned public GETs.
+  const catShare = catShareGuard(Date.now, (ev, info) => tdiag('cat', ev, info));
   async function execCatHttp(intent) {
     const venue = String(intent.venue || '');
     const hosts = catHttpHostsFor(venue);
@@ -11968,24 +12088,32 @@ function createTradeNative(opts) {
       try { _hlTyp = String((JSON.parse(body) || {}).type || ''); } catch (e) {}
       await _hlBudgetGate(_hlTyp);
     }
-    try {
-      // Catalogs can be huge (full product lists) — same cap as the generic
-      // cat_fetch GET branch; httpJson's default 256 KB would truncate.
-      const r = await httpJson(u.hostname, method, u.pathname, u.search.replace(/^\?/, ''),
-                               body, {}, route, CAT_GET_MAXBYTES);
-      // #1945: a body clipped at the cap is an EXPLICIT failure — the panel
-      // surfaces it in the picker error row instead of a JSON.parse mystery.
-      if (method === 'POST') {
-        if ((r.status | 0) === 429) hlBudget429(_hlBudget, Date.now(), 0);
-        else if ((r.status | 0) === 200) hlBudgetOk(_hlBudget);
+    const run = async () => {
+      try {
+        // Catalogs can be huge (full product lists) — same cap as the generic
+        // cat_fetch GET branch; httpJson's default 256 KB would truncate.
+        const r = await httpJson(u.hostname, method, u.pathname, u.search.replace(/^\?/, ''),
+                                 body, {}, route, CAT_GET_MAXBYTES);
+        // #1945: a body clipped at the cap is an EXPLICIT failure — the panel
+        // surfaces it in the picker error row instead of a JSON.parse mystery.
+        if (method === 'POST') {
+          if ((r.status | 0) === 429) hlBudget429(_hlBudget, Date.now(), 0);
+          else if ((r.status | 0) === 200) hlBudgetOk(_hlBudget);
+        }
+        if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
+        return { ok: true, status: r.status | 0, body: r.text || '' };
+      } catch (e) {
+        const em = (e && e.message) || 'error';
+        if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
+        return { ok: false, message: 'catalog fetch failed: ' + em };
       }
-      if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
-      return { ok: true, status: r.status | 0, body: r.text || '' };
-    } catch (e) {
-      const em = (e && e.message) || 'error';
-      if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
-      return { ok: false, message: 'catalog fetch failed: ' + em };
-    }
+    };
+    // #2230: GETs are shared app-wide (single-flight + start-stamped
+    // freshness). The one POST this bridge allows (HL /info) keeps its
+    // byte-identical path — it already rides the shared HL weight budget.
+    if (method !== 'GET') return await run();
+    return await catShare('h|' + venue + '|' + route + '|' + u.hostname + '|' +
+                          u.pathname + '|' + u.search, run, { v: venue, p: u.pathname });
   }
   async function execCatFetch(intent) {
     const route = routeNorm(intent.route);
@@ -12008,23 +12136,31 @@ function createTradeNative(opts) {
         return { ok: false, message: 'bad path' };
       if (!ent.prefixes.some((p) => pathOnly === p || pathOnly.indexOf(p) === 0))
         return { ok: false, message: 'path not in catalog allowlist' };
-      let r;
-      try {
-        r = await httpJson(ent.host, 'GET', ent.base + pathOnly, query,
-                           null, ent.hdrs || {}, route, CAT_GET_MAXBYTES);
-      } catch (e) {
-        // Surface the REAL transport error (code + message) — "network error"
-        // debugging must never require guessing timeout vs ECONNRESET vs
-        // proxy CONNECT failure (the panel crumb log carries this verbatim).
-        const code = (e && e.code) ? String(e.code) + ' ' : '';
-        return { ok: false, message: 'catalog fetch failed: ' + code + ((e && e.message) || 'error') };
-      }
-      // #1945: truncated-at-cap bodies fail explicitly (never a parse mystery).
-      if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
-      // Non-2xx still returns ok:true with the status so the panel can treat
-      // the reply like a fetch Response (new Response(text, {status})). The
-      // RAW body text goes back untouched — the panel parser owns the shape.
-      return { ok: true, status: (r && r.status) || 0, text: (r && r.text) || '' };
+      const run = async () => {
+        let r;
+        try {
+          r = await httpJson(ent.host, 'GET', ent.base + pathOnly, query,
+                             null, ent.hdrs || {}, route, CAT_GET_MAXBYTES);
+        } catch (e) {
+          // Surface the REAL transport error (code + message) — "network error"
+          // debugging must never require guessing timeout vs ECONNRESET vs
+          // proxy CONNECT failure (the panel crumb log carries this verbatim).
+          const code = (e && e.code) ? String(e.code) + ' ' : '';
+          return { ok: false, message: 'catalog fetch failed: ' + code + ((e && e.message) || 'error') };
+        }
+        // #1945: truncated-at-cap bodies fail explicitly (never a parse mystery).
+        if (r && r.tr) return { ok: false, message: 'catalog response truncated at size cap' };
+        // Non-2xx still returns ok:true with the status so the panel can treat
+        // the reply like a fetch Response (new Response(text, {status})). The
+        // RAW body text goes back untouched — the panel parser owns the shape.
+        return { ok: true, status: (r && r.status) || 0, text: (r && r.text) || '' };
+      };
+      // #2230: shared app-wide — five windows opening the same board fetch the
+      // catalog ONCE (single-flight), and a sixth arriving seconds later reuses
+      // it (freshness stamped at request start).
+      return await catShare('g|' + venue + '|' + hostMarket + '|' + route + '|' +
+                            ent.host + '|' + ent.base + pathOnly + '|' + query,
+                            run, { v: venue, p: pathOnly });
     }
     if (intent.venue !== 'phemex') return { ok: false, message: 'native catalog fetch not supported for this venue' };
     if (intent.what === 'products') {
@@ -12144,8 +12280,46 @@ function createTradeNative(opts) {
   // session) into the scope store — normalize with the engine-twin
   // normalizers, merge exactly-once. Cheap and idempotent: called from
   // every lblot_read/backfill, so panel polling IS the persistence beat.
+  // #2230 cheap source signature: the VERSION of each of the venue's live
+  // push rings (see lbSrcVer — a monotonic per-ring mutation counter, because
+  // these rings are bounded and a push at cap leaves the length unchanged).
+  // O(1) per ring, no row touched.
+  function lbDrainSrcN(slot, venue) {
+    const rn = (sc) => lbSrcVer(sc && sc.fills);
+    if (venue === 'kraken') {
+      const s = krWsSessions[slot];
+      return s ? rn(s.spot) + '/' + rn(s.fut) : '-';
+    }
+    if (venue === 'binance') {
+      const s = bnUdsSessions[slot];
+      return s ? rn(s.spot) + '/' + rn(s.fut) : '-';
+    }
+    if (venue === 'hyperliquid') {
+      const s = hlPushSessions[slot];
+      return s ? rn(s.acct) : '-';
+    }
+    if (venue === 'bybit') {
+      const s = bybPushSessions[slot];
+      return s ? rn(s.acct) : '-';
+    }
+    if (venue === 'gate') {
+      const s = gatePushSessions[slot];
+      return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
+    }
+    return '-';
+  }
+  const _lbDrainAt = {};   // slot → { t, sig } (#2230 no-news gate)
   function lbDrain(slot, venue) {
     const sc = lbScope(slot);
+    // #2230: nothing new upstream AND nothing changed in the store ⇒ this
+    // drain provably merges nothing. Skip the whole normalize+merge pass so
+    // N windows polling the same slot in the same beat cost ONE of them.
+    // The store length is part of the signature, so any mutation (merge,
+    // delete, prune, quarantine clear) forces the next drain to run.
+    const _dsig = lbDrainSrcN(slot, venue) + '|' + sc.rows.length;
+    const _dnow = Date.now();
+    if (lbDrainSkip(_lbDrainAt[slot], _dsig, _dnow, LB_DRAIN_IDLE_MS)) return 0;
+    _lbDrainAt[slot] = { t: _dnow, sig: _dsig };
     const aid = (() => {
       const sn = tnSlotNorm(slot);
       const m = sn && sn.slot !== sn.base ? /#a(\d+)$/.exec(sn.slot) : null;
@@ -12365,6 +12539,22 @@ function createTradeNative(opts) {
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const dmSig = intent.displayMap ? JSON.stringify(intent.displayMap) : '';
+    // #2230 one serialization for the whole app. Every open window polls this
+    // op, and a fill invalidates the rev in all of them at once (push kick) —
+    // so main used to structured-clone the ENTIRE replayed trade list once per
+    // window (measured: ~9 ms × 14 windows ≈ 110 ms of blocked loop per fill,
+    // the recurring 273-444 ms freeze the 2026-08-15 field log caught). With
+    // `wantJson` the shell stringifies the payload ONCE per rev and ships that
+    // one string; cloning a string is ~30× cheaper than cloning the object
+    // graph, and each renderer parses it in ITS OWN process, off this loop.
+    // Opt-in, so an older panel keeps getting the object shape verbatim.
+    const wantJson = !!(intent && intent.wantJson);
+    const pack = (h) => {
+      if (!wantJson) return { trades: h.trades, quar: h.quar };
+      if (h.tj == null) h.tj = JSON.stringify(h.trades || []);
+      if (h.qj == null) h.qj = JSON.stringify(h.quar || []);
+      return { tradesJson: h.tj, quarJson: h.qj };
+    };
     const hit = _lbTrCache[slot];
     if (hit && hit.rows === sc.rows && hit.len === sc.rows.length &&
         hit.dmSig === dmSig) {
@@ -12372,9 +12562,8 @@ function createTradeNative(opts) {
         return { ok: true, unchanged: true, rev: hit.rev, added: added,
                  count: sc.rows.length, bf: sc.bf || null };
       }
-      return { ok: true, rev: hit.rev, added: added, count: sc.rows.length,
-               trades: hit.trades, quar: hit.quar,
-               hwm: hit.hwm, bf: sc.bf || null };
+      return Object.assign({ ok: true, rev: hit.rev, added: added, count: sc.rows.length,
+                             hwm: hit.hwm, bf: sc.bf || null }, pack(hit));
     }
     let trades, quar;
     try {
@@ -12405,12 +12594,10 @@ function createTradeNative(opts) {
     const hwm = { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') };
     _lbTrCache[slot] = { rows: sc.rows, len: sc.rows.length, dmSig: dmSig,
                          rev: ++_lbTrRev, trades: trades, quar: quar || [],
-                         hwm: hwm };
-    return { ok: true, rev: _lbTrCache[slot].rev, added: added,
-             count: sc.rows.length, trades: trades,
-             quar: quar || [],
-             hwm: hwm,
-             bf: sc.bf || null };
+                         hwm: hwm, tj: null, qj: null };
+    return Object.assign({ ok: true, rev: _lbTrCache[slot].rev, added: added,
+                           count: sc.rows.length, hwm: hwm, bf: sc.bf || null },
+                         pack(_lbTrCache[slot]));
   }
   // Startup/arm gap backfill: "all fills since my newest locally-recorded
   // fill", per market, straight from the exchange with the device key.
@@ -14061,6 +14248,16 @@ module.exports = {
   lbNormBybFill,
   bybWsAuthSig,
   bybOrdEffect,
+  // pure — #2230 no-news local-blotter drain gate
+  LB_DRAIN_IDLE_MS,
+  lbDrainSkip,
+  lbSrcTouch,
+  lbSrcVer,
+  // pure — #2230 public-data share guard (single-flight + start-stamped memo)
+  CAT_SHARE_MEMO_MS,
+  CAT_SHARE_MIN_BYTES,
+  catShareBytes,
+  catShareGuard,
   // pure — acct_read rate-limit guard (#1724)
   ACCT_RL_COOLDOWN_MS,
   ACCT_READ_MEMO_MS,
