@@ -12515,6 +12515,7 @@ function createTradeNative(opts) {
   const LB_SNAP_MS = 30000;            // ordinary snapshot debounce
   const LB_SNAP_QUIET_MS = 3000;       // ... deferred while fills keep landing
   const LB_SNAP_MAX_MS = 120000;       // ... but never past this hard deadline
+  const LB_SNAP_RETRY_MS = 2000;       // failed snapshot / journal busy ⇒ retry
   const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
   const lbTmp = () => path.join(userDataDir(), 'local_fills_v1.json.tmp');
   const lbJrnF = () => path.join(userDataDir(), 'local_fills_v1.jrn');
@@ -12581,6 +12582,10 @@ function createTradeNative(opts) {
       lbTap('persist.jrnwrite', t0);
       if (err) {
         _lbPersistErr = String((err && err.message) || err);
+        // the batch never reached the journal: put it back at the FRONT, so
+        // the snapshot that follows covers it (and still has it queued if
+        // that write fails too). Nothing acknowledged is ever dropped here.
+        _lbJrnPend.unshift(txt);
         lbSnapSoon(0);   // journal not taking writes ⇒ fall back to a snapshot
         return;
       }
@@ -12618,6 +12623,11 @@ function createTradeNative(opts) {
   function lbSnapNow(sync) {
     if (!_lbStore) return true;
     if (_lbSnapBusy) { _lbSnapAgain = true; return true; }
+    // Never rotate the journal underneath an append that is still in flight:
+    // the unlink would either drop that write (POSIX) or fail and leave the
+    // byte count lying about the file (Windows). Wait for it — the snapshot
+    // deadline is NOT re-anchored by this, so it still cannot be starved.
+    if (_lbJrnBusy && !sync) { lbSnapSoon(LB_SNAP_RETRY_MS); return true; }
     let json = null;
     const t0 = lbT();
     try {
@@ -12634,8 +12644,17 @@ function createTradeNative(opts) {
     lbTap('persist.stringify', t0);
     // Everything queued for the journal right now is inside `json` (one
     // thread, the stringify just ran) — later appends stay pending and are
-    // flushed to a FRESH journal once the snapshot lands.
+    // flushed to a FRESH journal once the snapshot lands. The queued batches
+    // are only LENT to this write: a failed snapshot puts them straight back
+    // (ahead of anything that arrived meanwhile) so they still reach the
+    // journal, which sits on top of the PREVIOUS snapshot. Dropping them here
+    // would leave those fills in memory only — lost on the next crash.
+    const covered = _lbJrnPend;
     _lbJrnPend = [];
+    // an append still in flight (sync/quit path only, see above): the rows it
+    // carries are inside `json` too, so keeping the journal is harmless —
+    // replay dedupes — while unlinking it under an open handle is not.
+    const keepJrn = _lbJrnBusy;
     if (_lbJrnT) { clearTimeout(_lbJrnT); _lbJrnT = null; }
     if (_lbSnapT) { clearTimeout(_lbSnapT); _lbSnapT = null; }
     _lbSnapDue = 0; _lbSnapMax = 0;
@@ -12644,11 +12663,16 @@ function createTradeNative(opts) {
       if (err) {
         _lbPersistErr = String((err && err.message) || err);
         try { fs.unlinkSync(lbTmp()); } catch (e) { /* best effort */ }
+        if (covered.length) _lbJrnPend = covered.concat(_lbJrnPend);
+        lbJrnArm();                     // durable in the journal instead
+        lbSnapSoon(LB_SNAP_RETRY_MS);   // and try the snapshot again
         return false;
       }
       _lbPersistErr = null;
-      try { fs.unlinkSync(lbJrnF()); } catch (e) { /* no journal is fine */ }
-      _lbJrnBytes = 0;
+      if (!keepJrn) {
+        try { fs.unlinkSync(lbJrnF()); } catch (e) { /* no journal is fine */ }
+        _lbJrnBytes = 0;
+      }
       if (_lbSnapAgain) { _lbSnapAgain = false; lbSnapSoon(LB_SNAP_MS); }
       lbJrnArm();
       return true;
@@ -12685,6 +12709,21 @@ function createTradeNative(opts) {
     return true;
   }
   function lbSaveNow() { return lbSnapNow(true); }
+  // Last-resort durability: put whatever is still queued into the journal
+  // synchronously. Used at quit and whenever a snapshot write failed — the
+  // journal sits on top of the last GOOD snapshot, so replaying it recovers
+  // every acknowledged fill.
+  function lbJrnFlushSync() {
+    if (!_lbJrnPend.length) return true;
+    const txt = _lbJrnPend.join('');
+    try { fs.appendFileSync(lbJrnF(), txt); } catch (e) {
+      _lbPersistErr = String((e && e.message) || e);
+      return false;
+    }
+    _lbJrnPend = [];
+    _lbJrnBytes += Buffer.byteLength(txt);
+    return true;
+  }
   // Quit / exit: get whatever is only in memory onto disk, synchronously.
   function lbFlushSync() {
     try {
@@ -12694,13 +12733,14 @@ function createTradeNative(opts) {
       if (_lbSnapBusy) {
         // a snapshot write is already in flight — never race it with a second
         // writer; just make the pending rows durable in the journal.
-        if (_lbJrnPend.length) {
-          const txt = _lbJrnPend.join(''); _lbJrnPend = [];
-          try { fs.appendFileSync(lbJrnF(), txt); } catch (e) { return false; }
-        }
-        return true;
+        return lbJrnFlushSync();
       }
-      return lbSnapNow(true);
+      const ok = lbSnapNow(true);
+      // the snapshot failed (disk full, permissions): the batches it borrowed
+      // are back in the queue, so get them into the journal before we exit —
+      // the previous snapshot plus this journal still replays every fill.
+      if (!ok) { lbJrnFlushSync(); return false; }
+      return true;
     } catch (e) { return false; }
   }
   function lbScope(slot) { return lbScopeIn(lbLoad(), slot); }
