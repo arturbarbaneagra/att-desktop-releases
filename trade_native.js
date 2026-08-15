@@ -1756,6 +1756,36 @@ function lbScopeMerge(sc, fills, addedOut) {
   }
   return added;
 }
+// #2268 PURE: correct ONE already-stored fill's fee in place. The merge above
+// is exactly-once by fill key, so once a row is in the store NO later drain
+// can ever replace it — a fee that only becomes readable after the row landed
+// (Bitget spot: the fill channel records the execution, the suppressed orders
+// twin carries the fee) has to be written to the STORED row itself, or the
+// device blotter, its replay and every break-even derived from it keep the
+// zero forever. Bounded backward scan: the twin rides the same burst as the
+// fill it completes and rows are appended in ts order, so the target sits at
+// the tail; a row further back than the window is reported as a MISS (0) for
+// the caller to count, never silently left wrong.
+// → 1 patched, -1 already carrying exactly that fee, 0 not found. `out`
+// (optional) receives the STORED row: the caller's cache invalidation has to
+// key on that row, not on the freshly normalized twin — a per-account slot
+// stamps `aid` at drain time and the group key carries it, while the fill key
+// does not.
+const LB_FEEFIX_SCAN = 4000;
+function lbFeeFixIn(sc, key, fee, out) {
+  if (!sc || !Array.isArray(sc.rows) || !key || fee === undefined || fee === null) return 0;
+  const rows = sc.rows;
+  const stop = Math.max(0, rows.length - LB_FEEFIX_SCAN);
+  for (let i = rows.length - 1; i >= stop; i--) {
+    const r = rows[i];
+    if (!r || lbFillKey(r) !== key) continue;
+    if (out) out.row = r;
+    if (String(r.fee) === String(fee)) return -1;
+    r.fee = String(fee);
+    return 1;
+  }
+  return 0;
+}
 // #2112 RE-IMPORT merge: rows fetched from the venue for an explicit
 // [frm,to] window are VENUE TRUTH (blotter-reimport principle) — a local
 // tombstone that would silently skip a re-asserted IN-WINDOW fill must
@@ -7968,6 +7998,211 @@ function createTradeNative(opts) {
     tdiag('acct', 'bitget_push_xlane',
           { s: sess.slot, f: X.f, o: X.o, x: X.x, sup: X.sup, nf: X.nf, lt: X.lt });
   }
+  // #2268 --- cross-lane FEE adoption ---------------------------------------
+  // Ownership (#2262) decides which lane RECORDS an execution. It must not
+  // also decide where that execution's FEE comes from. Bitget's SPOT `fill`
+  // channel carries no flat fee field at all (live shape: tradeId, orderId,
+  // size, amount, priceAvg, side, feeDetail, symbol, cTime, uTime) and its
+  // feeDetail resolves to a ZERO quote cost, while the SUPPRESSED orders-lane
+  // twin of the same execution carries the flat per-fill `fillFee` +
+  // `fillFeeCoin` the venue really charged. A 209s live session recorded nine
+  // spot fills, every one at fee 0, so spot break-even sat exactly on the
+  // average entry — while futures, whose fill rows DO carry a readable
+  // feeDetail, was correct throughout the same session.
+  //
+  // The lanes stamp different tradeIds, so the twin is matched on what they
+  // DO agree on: bgXSig — market|orderId|side|this-fill-qty|price, the same
+  // signature the duplicate census already pairs executions with.
+  //
+  // Both arrival orders are covered (the frames ride ONE burst; either can be
+  // first):
+  //   orders first → the flat fee is stashed and adopted AT ingest, so the
+  //     ring row, the device store and the pushed panel row all carry it;
+  //   fill first  → the row records immediately (never delayed — the chime,
+  //     the blotter and the spot basis ride it) and is remembered; the twin
+  //     then patches that ring row IN PLACE (the store normalizes at drain
+  //     time, so it drains with the fee) and re-pushes the same fid, which
+  //     the panel merges over the fee-less row. One fid = one chime latch, so
+  //     a patched re-push can never ring twice.
+  // Futures is untouched by construction: adoption fires only for a row whose
+  // OWN fee records as zero, and only a spot orders-delta carries a flat fee.
+  const BG_FEE_WAIT_MS = 15000;   // pending/stash lifetime — one burst is ms
+  const BG_FEE_KEYS = 256;
+  // The flat PER-FILL fee, or null. `fillFee` is per-fill by construction
+  // (lbBgFillFee's first rule) — the same delta's feeDetail is the order
+  // CUMULATIVE list and is never what gets adopted.
+  function bgFeeFlat(o) {
+    const v = parseFloat(o && o.fillFee);
+    if (!Number.isFinite(v)) return null;
+    return { fee: String(o.fillFee), ccy: String((o && o.fillFeeCoin) || '') };
+  }
+  // The quote COST this row will actually be recorded with, through the very
+  // readers that record it (lbBgFillFee plus lbNormBitgetFill's sign flip and
+  // base-coin conversion — mirrored verbatim). 0 = "records as free", no
+  // matter which shape the row used to say so.
+  function bgFeeCost(o, mk) {
+    const ff = lbBgFillFee(o || {});
+    let c = -Number(ff.fee || 0);
+    if (!Number.isFinite(c)) return 0;
+    const sym = String((o && (o.symbol || o.instId)) || '').toUpperCase();
+    const ccy = String(ff.ccy || '');
+    if (mk === 'spot' && ccy && sym.slice(-ccy.length) !== ccy) {
+      c = c * (Number(lbNum((o && (o.priceAvg || o.price || o.fillPrice)) || 0)) || 0);
+    }
+    return c > 0 ? c : 0;
+  }
+  function bgFeeX(sess) {
+    if (!sess.fx) sess.fx = { m: {}, keys: [], sp: null, fu: null };
+    return sess.fx;
+  }
+  function bgFeeCnt(X, mk) {
+    const k = mk === 'spot' ? 'sp' : 'fu';
+    if (!X[k]) X[k] = { ad: 0, px: 0, sv: 0, mv: 0, zf: 0, d: 0, t: Date.now() };
+    return X[k];
+  }
+  function bgFeeSlot(sess, sig) {
+    const X = bgFeeX(sess);
+    let e = X.m[sig];
+    if (!e) {
+      e = X.m[sig] = { f: null, p: null, ts: Date.now() };
+      X.keys.push(sig);
+      if (X.keys.length > BG_FEE_KEYS) {
+        for (const k of X.keys.splice(0, X.keys.length - BG_FEE_KEYS)) {
+          const ev = X.m[k];
+          if (ev && ev.p) bgFeeZero(sess, ev.p.mk, ev.p.o);
+          delete X.m[k];
+        }
+      }
+    }
+    return e;
+  }
+  // #2268 a fill recorded at zero fee is NEVER silent. One value-free line
+  // per market names the keys the row did carry (BG_SHAPE_KEYS allowlist —
+  // names only, never values), so the next field log says WHY instead of
+  // being another guess, and the coalesced counter line below says how often.
+  function bgFeeZero(sess, mk, o) {
+    const C = bgFeeCnt(bgFeeX(sess), mk);
+    C.zf++; C.d = 1;
+    if (!sess.nfz) sess.nfz = {};
+    if (sess.nfz[mk]) return;
+    sess.nfz[mk] = 1;
+    const have = [];
+    for (const n of BG_SHAPE_KEYS) {
+      const v = o && o[n];
+      if (v !== undefined && v !== null && v !== '') have.push(n);
+    }
+    tdiag('acct', 'bitget_push_nofee', { s: sess.slot, mk: mk, keys: have.join(',') });
+  }
+  // A fee-less fill row takes the twin's stashed flat fee, before the ring
+  // write, so nothing downstream ever sees the zero.
+  function bgFeeAdopt(sess, mk, o) {
+    const sig = bgXSig(mk, o);
+    if (!sig) return false;
+    const e = bgFeeX(sess).m[sig];
+    const f = e && e.f;
+    if (!f) return false;
+    o.fillFee = f.fee; o.fillFeeCoin = f.ccy;
+    e.f = null;
+    const C = bgFeeCnt(bgFeeX(sess), mk); C.ad++; C.d = 1;
+    return true;
+  }
+  // Recorded, still fee-less: remember the RING's own row object so the twin
+  // can complete it in place. No signature = nothing can ever complete it.
+  function bgFeePend(sess, sc, mk, o) {
+    const sig = bgXSig(mk, o);
+    if (!sig) { bgFeeZero(sess, mk, o); return; }
+    const e = bgFeeSlot(sess, sig);
+    e.ts = Date.now();
+    e.p = { o: o, sc: sc, mk: mk, slot: sess.slot,
+            fid: String(o.tradeId) + ':' + String(o.side || '').toLowerCase() };
+  }
+  // DURABLE half of the in-place patch. Patching the ring row only helps a
+  // row the drain has not reached yet: the device store merges exactly once
+  // per fill key, so a row already drained would keep its zero fee through
+  // every later drain, every replay and every restart (the panel's blotter,
+  // its net and the spot break-even all read the STORE, not the ring). The
+  // stored row is therefore corrected in place — the lbMigrateBgCase recipe:
+  //   • the per-group replay cache keys on (rows, first key, last key), and
+  //     the payload cache on the rows ARRAY IDENTITY — both are blind to an
+  //     in-place field edit, so each is invalidated explicitly (one group,
+  //     never the whole store: a fill must not cost a full-store replay);
+  //   • a snapshot is folded promptly. A snapshot serializes the LIVE rows,
+  //     and journal replay merges exactly-once behind it, so the older
+  //     fee-zero journal line can never win over the corrected snapshot.
+  // The drain cursors are deliberately left alone — nothing vanished, and the
+  // ring row this corrects has already been consumed.
+  // → 1 stored row corrected, 0 nothing to do (not drained yet / deleted),
+  //   -1 the store holds the fill but the correction could not reach it.
+  function bgFeeStoreFix(slot, mk, o) {
+    if (!_lbStore) return 0;        // never loaded ⇒ nothing was drained ⇒ nothing to fix
+    const nf = lbNormBitgetFill(o, mk);
+    if (!nf) return 0;
+    const k = lbFillKey(nf);
+    if (!k) return 0;
+    const sc = lbScopeIn(_lbStore, slot);
+    if (sc.del && sc.del[k]) return 0;            // deleted locally — leave it deleted
+    const hit = {};
+    const n = lbFeeFixIn(sc, k, nf.fee, hit);
+    if (n < 0) return 0;                          // already carries this fee
+    if (!n) return (sc.seen && sc.seen[k]) ? -1 : 0;
+    if (sc._rep && sc._rep.g) delete sc._rep.g[lbGroupKey(hit.row || nf)];
+    delete _lbTrCache[slot];
+    lbSnapSoon(0);
+    return 1;
+  }
+  // The suppressed orders-lane twin offers its flat per-fill fee: adopted by
+  // a fill row still to come, or patched into the one already recorded.
+  function bgFeeOffer(sess, mk, o) {
+    const f = bgFeeFlat(o);
+    if (!f) return;
+    const sig = bgXSig(mk, o);
+    if (!sig) return;
+    const e = bgFeeSlot(sess, sig);
+    e.ts = Date.now();
+    const p = e.p;
+    if (!p) { e.f = f; return; }                  // the fill row is not here yet
+    e.p = null;
+    p.o.fillFee = f.fee; p.o.fillFeeCoin = f.ccy; // ring row, patched in place
+    const C = bgFeeCnt(bgFeeX(sess), mk); C.px++; C.d = 1;
+    // …and the copy the device store already took, which no drain can revisit
+    const st = bgFeeStoreFix(p.slot || sess.slot, p.mk, p.o);
+    if (st > 0) C.sv++; else if (st < 0) C.mv++;
+    krLseq(p.sc); bgPushSc(p.sc, 'fill', p.fid, p.o);
+  }
+  // Coalesced fee-provenance line — sibling of bitget_push_xlane, which stays
+  // byte-identical. ad = fees adopted from the twin at ingest, px = rows
+  // patched afterwards, sv = stored rows corrected with them, mv = stored rows
+  // the correction could not reach, zf = rows that stayed at zero (the honest
+  // failures — mv and zf are what a field log must never see above 0).
+  function bgFeeSum(sess, now) {
+    const X = sess && sess.fx;
+    if (!X) return;
+    for (const mk of ['spot', 'futures']) {
+      const C = X[mk === 'spot' ? 'sp' : 'fu'];
+      if (!C || !C.d) continue;
+      if ((now - (C.t || 0)) < BG_XL_SUM_MS) continue;
+      C.t = now; C.d = 0;
+      tdiag('acct', 'bitget_push_fee',
+            { s: sess.slot, mk: mk, ad: C.ad, px: C.px, sv: C.sv, mv: C.mv, zf: C.zf });
+    }
+  }
+  // Timer-free expiry: every frame sweeps. A pending row whose twin never
+  // came is counted (and named once) rather than passing as a real zero.
+  function bgFeeSweep(sess, now) {
+    const X = sess && sess.fx;
+    if (!X) return;
+    now = now || Date.now();
+    const keep = [];
+    for (const k of X.keys) {
+      const e = X.m[k];
+      if (!e) continue;
+      if ((now - (e.ts || 0)) < BG_FEE_WAIT_MS) { keep.push(k); continue; }
+      if (e.p) bgFeeZero(sess, e.p.mk, e.p.o);
+      delete X.m[k];
+    }
+    X.keys = keep;
+    bgFeeSum(sess, now);
+  }
   // One fill row → ring + push event, shared by BOTH lanes so they can never
   // double-record or double-chime: the ring's side-inclusive tradeId seen-set
   // is the single dedup set, and bgFillPush returns 0 for a row the other
@@ -7979,8 +8214,16 @@ function createTradeNative(opts) {
     // #2262 quantity without a trustworthy fee is not recorded at all — the
     // per-fill payload owns that execution (see bgFeeTrusted).
     if (!bgFeeTrusted(o)) { bgXLane(sess).nf++; return; }
+    // #2268 the lane owns the ROW, never the fee: a row that would record as
+    // free takes the twin's flat per-fill fee (stashed, or patched below).
+    // The cost is re-read AFTER adoption, so a twin whose own fee also reads
+    // as free is still counted and named rather than passing as a real zero.
+    let cost = bgFeeCost(o, mk);
+    if (!(cost > 0) && bgFeeAdopt(sess, mk, o)) cost = bgFeeCost(o, mk);
+    const feeless = !(cost > 0);
     const F = mk === 'spot' ? bgFillRing(sess.slot).sp : bgFillRing(sess.slot).fu;
     if (bgFillPush(F, [o]) <= 0) return;          // already recorded — no event
+    if (feeless) bgFeePend(sess, sc, mk, o);      // the ring holds THIS object
     // Recorded either way; only the EVENT (badge + chime) is age-gated.
     const ts = bgFillTs(o);
     if (ts && ts < ((sess.connT || 0) - BG_PUSH_FRESH_MS)) return;
@@ -8022,6 +8265,7 @@ function createTradeNative(opts) {
         else bgXLane(sess).lt++;
       }
       bgXLaneSum(sess);
+      bgFeeSweep(sess);
       return;
     }
     if (ch === 'orders') {
@@ -8039,7 +8283,9 @@ function createTradeNative(opts) {
           // the census runs on BOTH lanes even where this one no longer
           // records, so a live log can PROVE the overlap is gone
           bgXLaneMark(sess, mk, 'orders', o);
-          if (owned) bgXLane(sess).sup++;
+          // #2268 a suppressed row is not a useless row: its flat per-fill
+          // fee is the one the spot `fill` channel never sends.
+          if (owned) { bgXLane(sess).sup++; bgFeeOffer(sess, mk, o); }
           else bgFillIngest(sess, sc, mk, ch, o);
         }
         const oid = o && o.orderId != null ? String(o.orderId) : '';
@@ -8049,6 +8295,7 @@ function createTradeNative(opts) {
         else { krLseq(sc); bgPushSc(sc, 'ordgone', oid); }
       }
       bgXLaneSum(sess);
+      bgFeeSweep(sess);
       return;
     }
     if (ch === 'positions' && mk === 'futures') {
