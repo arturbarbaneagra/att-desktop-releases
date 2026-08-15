@@ -7678,6 +7678,12 @@ function createTradeNative(opts) {
         //    timestamp instead of by a field the venue mislabels.
         sess.fseen = {};
         sess.connT = Date.now() + (sess.tOff || 0);
+        // #2262 per-CONNECTION, per-market liveness of the dedicated `fill`
+        // channel (see bgFillLaneOwns) and the LOCAL open stamp its pending
+        // grace measures against — connT is venue-clock, this one is not.
+        sess.fillCh = {};
+        sess.openT = Date.now();
+        sess.xl = null;
         try {
           const tsec = String(venueStampSec(sess.tOff));
           ws.send(JSON.stringify({ op: 'login', args: [{
@@ -7698,9 +7704,13 @@ function createTradeNative(opts) {
           // #2251 a refused `fill` subscribe must NOT tear down the socket:
           // that channel is additive, and killing the connection would take
           // orders/positions/account down with it and redial forever.
-          if (String(((msg && msg.arg) || {}).channel || '') === 'fill') {
+          const earg = (msg && msg.arg) || {};
+          if (String(earg.channel || '') === 'fill') {
+            // #2262 …and THIS market's fills go back to the orders lane, so
+            // a refusal costs nothing but the per-fill payload's precision.
+            const emk = bgFillChMark(sess, earg, -1);
             tdiag('acct', 'bitget_push_nofill',
-                  { s: slot, m: String((msg && msg.msg) || '').slice(0, 80) });
+                  { s: slot, mk: emk || '?', m: String((msg && msg.msg) || '').slice(0, 80) });
             return;
           }
           done(new Error('bitget ws: ' + String((msg && msg.msg) || 'error')));
@@ -7724,6 +7734,19 @@ function createTradeNative(opts) {
           return;
         }
         if (evn === 'subscribe') {
+          // #2262 an acked `fill` subscribe takes OWNERSHIP of that market's
+          // fills: the orders lane stops ingesting them (its badge/status
+          // work is untouched), because the two lanes stamp DIFFERENT
+          // tradeIds on one execution and the ring's id set cannot collapse
+          // them — every fill was recorded, and chimed, twice.
+          const sarg = (msg && msg.arg) || {};
+          if (String(sarg.channel || '') === 'fill') {
+            // …unless the ack is LATE, in which case the market has already
+            // fallen back and keeps the orders lane (st reports which).
+            const smk = bgFillChMark(sess, sarg, 1);
+            tdiag('acct', 'bitget_push_fillch',
+                  { s: slot, mk: smk || '?', st: bgFillChSt(sess, smk) });
+          }
           acked++;
           if (acked >= expect && !sess.up) {
             sess.up = true; sess.err = null;
@@ -7777,14 +7800,185 @@ function createTradeNative(opts) {
     const s = parseFloat(o && o.size);
     return (Number.isFinite(s) && s > 0) ? s : 0;
   }
+  // A fill-BEARING row on either lane: a venue trade id plus a positive
+  // THIS-fill quantity (engine bitget_order_apply rule).
+  function bgFillRow(o) {
+    return !!(o && o.tradeId != null && String(o.tradeId) && bgFillQty(o) > 0);
+  }
+  // #2262 --- ONE fill source per market ------------------------------------
+  // The dedicated `fill` channel and the orders channel stamp DIFFERENT
+  // tradeIds on the SAME execution (a live session logged ids two apart at
+  // the same instant, same side), so the ring's side-inclusive tradeId set
+  // can never collapse them: every fill was recorded twice — doubling the
+  // replayed position size and the chime — and the orders-lane copy carried
+  // a suppressed (zero) fee, which is what dragged break-even off. Ownership
+  // is the fix, not more dedup. The `fill` channel is also the streaming
+  // twin of /api/v2/{mix,spot}/…/fills, so its ids are the ones the REST
+  // poll, the backfill and the device store already hold.
+  //
+  // Per-connection, per-market state: 1 = subscribe acked (that channel owns
+  // the market's fills), -1 = the venue refused it (the orders lane ingests,
+  // exactly as before this task), 0 = neither answered yet. A PENDING
+  // channel keeps the orders lane suppressed for a short grace — the ack is
+  // milliseconds behind the login and an ingest inside that window is
+  // precisely the double being removed — and past the grace it is treated as
+  // refused, so a silently-dropped subscribe can never leave the market
+  // without a push fill source.
+  const BG_FILL_ACK_GRACE_MS = 10000;
+  function bgArgMk(arg) {
+    const it = String(((arg || {}).instType) || '').toUpperCase();
+    if (it === 'SPOT') return 'spot';
+    return it ? 'futures' : '';
+  }
+  function bgFillAckLate(sess) {
+    return (Date.now() - ((sess && sess.openT) || 0)) >= BG_FILL_ACK_GRACE_MS;
+  }
+  // Per-market state machine, MONOTONE for the life of one connection:
+  // pending → owned (ack inside the grace) or pending → fallback (refusal, or
+  // a grace that ran out), and NEVER back. A late ack is demoted to fallback
+  // on purpose: the orders lane may already have recorded fills for this
+  // market, and because the two lanes stamp different tradeIds on the same
+  // execution, anything the fill stream then re-delivers (its own replay, or
+  // simply the next fills while the orders lane is still ingesting) records
+  // and chimes a second time — the very defect being fixed. The reconnect,
+  // which resets fillCh and openT, is what re-decides ownership.
+  function bgFillChSet(sess, mk, st) {
+    if (!mk || !sess) return '';
+    if (!sess.fillCh) sess.fillCh = {};
+    if (st > 0 && ((sess.fillCh[mk] | 0) < 0 || bgFillAckLate(sess))) st = -1;
+    sess.fillCh[mk] = st;
+    return mk;
+  }
+  function bgFillChMark(sess, arg, st) {
+    // An unidentifiable market stays PENDING rather than guessing: the grace
+    // resolves it to the orders lane, whereas a wrong guess either re-creates
+    // the double or silences the market for the whole session.
+    return bgFillChSet(sess, bgArgMk(arg), st);
+  }
+  function bgFillChSt(sess, mk) { return (((sess && sess.fillCh) || {})[mk]) | 0; }
+  function bgFillLaneOwns(sess, mk) {
+    const st = bgFillChSt(sess, mk);
+    if (st) return st > 0;
+    if (!bgFillAckLate(sess)) return true;      // pending, inside the grace
+    bgFillChSet(sess, mk, -1);                  // …and the timeout LATCHES
+    return false;
+  }
+  // Can THIS row's fee be read as THIS fill's fee? A row recorded with a
+  // quantity but a suppressed fee is worse than no row: the replay carries
+  // the size while break-even divides the real fees by an inflated net. Two
+  // independent things have to hold, and BOTH failures produce the identical
+  // zero out of the fee readers:
+  //  1. READABLE — the row must actually carry a fee the readers can parse.
+  //     A flat `fillFee` (spot deltas + the spot `fill` channel) is per-fill
+  //     by construction; otherwise `feeDetail` must yield at least one
+  //     numeric entry (list `totalFee`/`fee`, or the object form's
+  //     `totalFee`) exactly as lbBgFillFee/bgPushFillFeeQ read it. Missing,
+  //     empty, non-numeric or unparseable-JSON fee detail is fee UNKNOWN,
+  //     not fee zero. An EXPLICIT zero — or a rebate — parses fine and stays
+  //     admissible: those are real venue values, not a suppression.
+  //  2. PER-FILL — no `accBaseVolume` ⇒ a per-fill payload (the `fill`
+  //     channel, the REST fills endpoints) ⇒ its feeDetail is this fill's
+  //     own. An ORDERS-channel delta carries the running order total and an
+  //     order-CUMULATIVE feeDetail, trustworthy only when this fill is the
+  //     whole order so far.
+  // Condition (2) is the lbBgFillFee / bgPushFillFeeQ suppression itself, and
+  // the pair is test-pinned: an untrusted row must be exactly one those
+  // readers answer 0 for, or a row would be recorded precisely when its fee
+  // is zeroed. A withheld row is not lost — the authoritative per-fill
+  // payload (fill channel / REST fills poll, which writes the ring directly)
+  // carries the same execution with its fee, and `nf` in bitget_push_xlane
+  // counts every withholding so a live log can prove it.
+  function bgFeeTrusted(o) {
+    const r = o || {};
+    if (Number.isFinite(parseFloat(r.fillFee))) return true;
+    let fd = r.feeDetail;
+    if (typeof fd === 'string') { try { fd = JSON.parse(fd); } catch (e) { fd = null; } }
+    let any = false;
+    if (Array.isArray(fd)) {
+      for (const d0 of fd) {
+        const d = d0 || {};
+        if (Number.isFinite(parseFloat(d.totalFee)) || Number.isFinite(parseFloat(d.fee))) {
+          any = true; break;
+        }
+      }
+    } else if (fd && typeof fd === 'object') any = Number.isFinite(parseFloat(fd.totalFee));
+    if (!any) return false;
+    if (r.accBaseVolume === undefined || r.accBaseVolume === null) return true;
+    const bv = parseFloat(r.baseVolume), acc = parseFloat(r.accBaseVolume);
+    return Number.isFinite(bv) && Number.isFinite(acc)
+      && Math.abs(bv - acc) <= 1e-12 * Math.max(1, Math.abs(acc));
+  }
+  // Cross-lane duplicate census. The lanes disagree on tradeId, so the only
+  // previous evidence of the overlap was order-count-versus-fill-count
+  // arithmetic done by hand on a live log. This counts it directly, on the
+  // fields the two lanes DO agree on for one execution: orderId, side, this
+  // fill's quantity and its price (numeric-normalised, so formatting can
+  // never hide a pair). Two identical partials of one order at one price
+  // share a signature, so `x` is an UPPER bound — and an upper bound of zero
+  // is exactly the proof this task needs. Counts only ever leave the
+  // process: a diag never carries venue values.
+  const BG_XL_SUM_MS = 30000;
+  const BG_XL_KEYS = 512;
+  function bgXSig(mk, o) {
+    const oid = String((o && o.orderId) != null ? o.orderId : '');
+    const q = bgFillQty(o);
+    if (!oid || !(q > 0)) return '';
+    const px = parseFloat((o && (o.priceAvg || o.price || o.fillPrice)) || 0) || 0;
+    return mk + '|' + oid + '|' + String((o && o.side) || '').toLowerCase()
+      + '|' + q + '|' + px;
+  }
+  function bgXLane(sess) {
+    // t starts at creation, so the first line lands one interval in rather
+    // than every fresh connection flushing a line on its first frame.
+    if (!sess.xl) sess.xl = { seen: {}, keys: [], f: 0, o: 0, x: 0, sup: 0, nf: 0,
+                              lt: 0, d: 0, t: Date.now() };
+    return sess.xl;
+  }
+  function bgXLaneMark(sess, mk, lane, o) {
+    const X = bgXLane(sess);
+    const fl = lane === 'fill';
+    if (fl) X.f++; else X.o++;
+    X.d = 1;
+    const sig = bgXSig(mk, o);
+    if (!sig) return;
+    let e = X.seen[sig];
+    if (!e) {
+      e = X.seen[sig] = { f: 0, o: 0, p: 0 };
+      X.keys.push(sig);
+      if (X.keys.length > BG_XL_KEYS) {
+        for (const k of X.keys.splice(0, X.keys.length - BG_XL_KEYS)) delete X.seen[k];
+      }
+    }
+    if (fl) e.f++; else e.o++;
+    const pair = Math.min(e.f, e.o);
+    if (pair > e.p) { e.p = pair; X.x++; }
+  }
+  // Coalesced summary (push-apply-latency-diag family): the LINE's ts is the
+  // flush moment, the counters are the connection's running totals —
+  // f/o = fill-bearing rows per lane, x = executions seen on BOTH,
+  // sup = orders-lane rows the fill channel owned, nf = rows withheld for an
+  // untrustworthy fee, lt = fill-channel rows dropped because the market had
+  // already fallen back to the orders lane (a late ack — see bgFillChSet).
+  function bgXLaneSum(sess) {
+    const X = sess && sess.xl;
+    if (!X || !X.d) return;
+    const now = Date.now();
+    if (now - (X.t || 0) < BG_XL_SUM_MS) return;
+    X.t = now; X.d = 0;
+    tdiag('acct', 'bitget_push_xlane',
+          { s: sess.slot, f: X.f, o: X.o, x: X.x, sup: X.sup, nf: X.nf, lt: X.lt });
+  }
   // One fill row → ring + push event, shared by BOTH lanes so they can never
   // double-record or double-chime: the ring's side-inclusive tradeId seen-set
   // is the single dedup set, and bgFillPush returns 0 for a row the other
   // lane (or the REST poll) already took.
   function bgFillIngest(sess, sc, mk, ch, o) {
     const tid = o && o.tradeId != null ? String(o.tradeId) : '';
-    if (!tid || !(bgFillQty(o) > 0)) return;
+    if (!bgFillRow(o)) return;
     bgPushShapeDiag(sess, ch, mk, o);
+    // #2262 quantity without a trustworthy fee is not recorded at all — the
+    // per-fill payload owns that execution (see bgFeeTrusted).
+    if (!bgFeeTrusted(o)) { bgXLane(sess).nf++; return; }
     const F = mk === 'spot' ? bgFillRing(sess.slot).sp : bgFillRing(sess.slot).fu;
     if (bgFillPush(F, [o]) <= 0) return;          // already recorded — no event
     // Recorded either way; only the EVENT (badge + chime) is age-gated.
@@ -7815,22 +8009,46 @@ function createTradeNative(opts) {
     // Dedicated per-fill channel: one unambiguous row per fill, no order
     // bookkeeping to disentangle. Age-gated, not snapshot-gated (see above).
     if (ch === 'fill') {
-      for (const o of rows) bgFillIngest(sess, sc, mk, ch, o);
+      // #2262 ownership is one-way per connection (see bgFillChSet). If this
+      // market's fills already fell back to the orders lane, a fill stream
+      // that starts talking afterwards must NOT record alongside it — the
+      // lanes stamp different tradeIds, so every overlapping execution would
+      // land twice. Count what that costs; the orders lane has it covered.
+      const owns = bgFillLaneOwns(sess, mk);
+      for (const o of rows) {
+        if (!bgFillRow(o)) continue;
+        bgXLaneMark(sess, mk, 'fill', o);
+        if (owns) bgFillIngest(sess, sc, mk, ch, o);
+        else bgXLane(sess).lt++;
+      }
+      bgXLaneSum(sess);
       return;
     }
     if (ch === 'orders') {
+      // #2262 the dedicated `fill` channel owns this market's fills while it
+      // is live; the orders lane then drives ONLY badges and status
+      // transitions, exactly as it does today. A refused (or never-answered)
+      // fill subscribe hands fill ingestion straight back here.
+      const owned = bgFillLaneOwns(sess, mk);
       for (const o of rows) {
         // fill delta (engine bitget_order_apply rule): tradeId present and a
         // positive THIS-fill quantity. The RAW row rides the push —
         // lbNormBitgetFill already reads the WS orders-delta shape, so the
         // panel/local-blotter normalizers need no new case.
-        bgFillIngest(sess, sc, mk, ch, o);
+        if (bgFillRow(o)) {
+          // the census runs on BOTH lanes even where this one no longer
+          // records, so a live log can PROVE the overlap is gone
+          bgXLaneMark(sess, mk, 'orders', o);
+          if (owned) bgXLane(sess).sup++;
+          else bgFillIngest(sess, sc, mk, ch, o);
+        }
         const oid = o && o.orderId != null ? String(o.orderId) : '';
         if (snap || !oid) continue;
         const st = String((o && o.status) || '').toLowerCase();
         if (BG_PUSH_OPEN_ST[st]) { krLseq(sc); bgPushSc(sc, 'order', null, o); }
         else { krLseq(sc); bgPushSc(sc, 'ordgone', oid); }
       }
+      bgXLaneSum(sess);
       return;
     }
     if (ch === 'positions' && mk === 'futures') {
