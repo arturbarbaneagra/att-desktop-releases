@@ -188,7 +188,14 @@ try {
     // ('att:ledger-push') the moment its WS session applies it. Presence of
     // this method is the panel's capability probe — old shells simply lack
     // it and the panel stays on the polled display path.
-    onLedgerPush: (cb) => ipcRenderer.on('att:ledger-push', (e, p) => { try { cb(p); } catch (err) { /* page handler */ } }),
+    // #2234: registering also SUBSCRIBES this window to the lane, so main can
+    // skip windows that never listen (they used to pay a structured clone per
+    // push). The payload arrives pre-serialized — the panel unpacks both the
+    // string and the legacy object shape.
+    onLedgerPush: (cb) => {
+      try { ipcRenderer.send('att:ledger-sub'); } catch (e) { /* old shell */ }
+      ipcRenderer.on('att:ledger-push', (e, p) => { try { cb(p); } catch (err) { /* page handler */ } });
+    },
     // Capability list (#1713): the panel probes this to decide which NEW
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe

@@ -1536,15 +1536,39 @@ function lbFillKeyLegacy(f) {
   if (eid) return String(f.market || '') + ':' + eid;
   return lbFillKey(f);
 }
+// Replay GROUP key — one position stream: venue|market|symbol|account. The
+// ONE definition, shared by lbReconstruct's grouping and the per-group replay
+// cache (#2234): if the two ever disagreed the cache would key groups the
+// replay does not actually produce.
+function lbGroupKey(f) {
+  let aid = 0;
+  try { aid = parseInt(f.aid, 10) || 0; } catch (e) { aid = 0; }
+  return (f.venue || 'phemex') + '\u0000' + (f.market || '') + '\u0000'
+    + (f.symbol || '') + '\u0000' + aid;
+}
 // Merge normalized fills into a scope store EXACTLY-ONCE: seen-key dedupe,
 // tombstone respect (locally deleted fills stay deleted). Returns added n.
-function lbScopeMerge(sc, fills) {
+//
+// #2234 ORDERED INSERTION: the store is kept ts-ordered, and fills arrive in
+// time order, so an append preserves that invariant by itself. The old code
+// re-sorted the ENTIRE row array on every merge — per fill, on the Electron
+// main loop, against a 14k-row store — for an array that was already sorted.
+// The full sort now runs ONLY when a merged row really lands out of order
+// (backfill / re-import / server import), which is exactly when it is needed;
+// the resulting array is identical either way (V8's sort is stable, so
+// equal-ts rows keep insertion order in both paths). `sc._srt` counts the
+// whole-store sorts and `sc._ep` is the replay-cache epoch — a non-append
+// mutation cannot be detected from a group signature alone.
+// `addedOut` (optional) collects the rows actually merged, so the caller can
+// journal exactly those instead of re-deriving them (#2234).
+function lbScopeMerge(sc, fills, addedOut) {
   if (!sc || !Array.isArray(fills)) return 0;
   if (!sc.seen) {
     sc.seen = {};
     for (const r of sc.rows) sc.seen[lbFillKey(r)] = 1;
   }
-  let added = 0;
+  let added = 0, unordered = false;
+  let tail = sc.rows.length ? (Number(sc.rows[sc.rows.length - 1].ts) || 0) : -Infinity;
   for (const f of fills) {
     if (!f || !f.symbol || !(Number(f.qty) > 0) || !(Number(f.ts) > 0)) continue;
     const k = lbFillKey(f);
@@ -1552,11 +1576,18 @@ function lbScopeMerge(sc, fills) {
     // side-less key (older stores' deletes keep suppressing after upgrade)
     if (!k || sc.seen[k]
         || (sc.del && (sc.del[k] || sc.del[lbFillKeyLegacy(f)]))) continue;
+    const ts = Number(f.ts) || 0;
+    if (ts < tail) unordered = true; else tail = ts;
     sc.seen[k] = 1;
     sc.rows.push(f);
+    if (addedOut) addedOut.push(f);
     added++;
   }
-  if (added) sc.rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  if (added && unordered) {
+    sc.rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    sc._srt = (sc._srt | 0) + 1;
+    sc._ep = (sc._ep | 0) + 1;
+  }
   return added;
 }
 // #2112 RE-IMPORT merge: rows fetched from the venue for an explicit
@@ -1695,6 +1726,66 @@ function lbSrcTouch(F) {
 function lbSrcVer(F) {
   if (!F) return '-';
   return (F.rev | 0) + '.' + (Array.isArray(F.rows) ? F.rows.length : 0);
+}
+// INCREMENTAL DRAIN cursor (#2234). lbSrcTouch bumps `rev` exactly once per
+// pushed row at every venue, so `rev` doubles as a total-pushed counter and
+// (rev - prevRev) is how many rows arrived since the last drain. The drain
+// re-normalizes only those, instead of re-walking all 400-600 cached rows of
+// every ring on every poll — and it used to do that TWICE per merge, because
+// the old gate signature carried the store length, so a successful merge
+// invalidated the gate and forced another full pass on the very next poll.
+// Falls back to the whole ring whenever the cursor cannot be trusted: first
+// drain, a ring that reset or reconnected (rev went backwards), more rows
+// pushed than the ring can hold (cap eviction dropped some unseen), or a
+// caller-forced retry sweep for rows a previous pass could not normalize yet.
+function lbRingFrom(prevRev, rev, len, full) {
+  len = len | 0;
+  if (len <= 0) return 0;
+  if (full || prevRev == null || !Number.isFinite(Number(prevRev))) return 0;
+  const pushed = (rev | 0) - (Number(prevRev) | 0);
+  if (!(pushed >= 0) || pushed >= len) return 0;
+  return len - pushed;
+}
+// --- Local-blotter persistence journal (#2234) -------------------------------
+// The store used to be persisted by stringifying the WHOLE thing (3.4 MB) and
+// writing it with a synchronous writeFileSync on the Electron main thread,
+// debounced 1.5 s — i.e. landing right inside an order burst, repeatedly. The
+// hot path now appends only the newly merged rows to a journal, and the full
+// snapshot is written rarely, atomically, and out of the burst.
+// PURE: one journal line (newline-delimited JSON, one batch per line).
+function lbJrnLine(slot, rows) {
+  return JSON.stringify({ s: String(slot), r: rows || [] }) + '\n';
+}
+// PURE: parse an append-only journal. A crash or force-quit mid-append leaves
+// a TRUNCATED final line — it is counted and dropped, never guessed at; the
+// fills it carried come back from the exchange through the startup gap
+// backfill. Every surviving batch is replayed through lbScopeMerge on load,
+// so duplicates and tombstoned rows are absorbed by the normal dedupe.
+function lbJrnParse(text) {
+  const out = [];
+  let bad = 0;
+  for (const ln of String(text || '').split('\n')) {
+    if (!ln) continue;
+    let v = null;
+    try { v = JSON.parse(ln); } catch (e) { bad++; continue; }
+    if (!v || typeof v !== 'object' || !v.s || !Array.isArray(v.r)) { bad++; continue; }
+    out.push({ slot: String(v.s), rows: v.r });
+  }
+  return { batches: out, bad: bad };
+}
+// --- Main-loop phase timers (#2234, admin diag gate) -------------------------
+// Freeze round 6 could only say a stall began 30-100 ms after "a push flush, a
+// memo bust and a blotter ingest" — a neighbourhood, not a phase. These name
+// each phase of the fill path separately so the next field log attributes a
+// stall to one of them. PURE accumulators; the runtime only feeds them when
+// the admin diag gate is live.
+function lbPerfNew() { return { n: 0, ms: {}, mx: {}, t: 0 }; }
+function lbPerfAdd(P, phase, ms) {
+  if (!P || !phase || !(ms >= 0)) return P;
+  P.ms[phase] = Math.round(((P.ms[phase] || 0) + ms) * 1000) / 1000;
+  if (!(P.mx[phase] >= ms)) P.mx[phase] = Math.round(ms * 1000) / 1000;
+  P.n++;
+  return P;
 }
 // POSITION-AWARE size prune (the blotter-prune rule: NEVER a bare ts
 // cutoff). When the scope exceeds `cap` rows, compute the cutoff ts that
@@ -1940,8 +2031,7 @@ function lbReconstruct(fills, displayMap) {
   for (const f of (fills || [])) {
     let aid = 0;
     try { aid = parseInt(f.aid, 10) || 0; } catch (e) { aid = 0; }
-    const key = (f.venue || 'phemex') + '\u0000' + (f.market || '') + '\u0000'
-      + (f.symbol || '') + '\u0000' + aid;
+    const key = lbGroupKey(f);
     const g = groups[key] = groups[key]
       || { venue: f.venue || 'phemex', market: f.market || '', symbol: f.symbol || '', aid: aid, trade: [], funding: [] };
     (f.kind === 'funding' ? g.funding : g.trade).push(f);
@@ -1972,6 +2062,13 @@ function lbReconstruct(fills, displayMap) {
       open_qty: 0, open_notional: 0, close_qty: 0, close_notional: 0,
       commission: 0, closed_pnl: 0, fee_alt: {}, fills: [], keys: [],
     });
+    // #2234 contributing-key dedupe index. `tr.keys.indexOf(k)` is a LINEAR
+    // scan per fill, so a long-lived position (thousands of fills in one
+    // trade) made the whole replay quadratic — measured 130 ms for a 14.4k
+    // store, 28 ms with this index, byte-identical output. Kept OUT of the
+    // trade row (a Map keyed by the row object) so the emitted payload is
+    // unchanged.
+    const kseen = new Map();
     const add = (tr, row, portion, kind) => {
       const px = Number(row.exec_px) || 0;
       const val = px * portion;
@@ -2002,7 +2099,11 @@ function lbReconstruct(fills, displayMap) {
       }
       tr.fills.push(entry);
       const k = lbFillKey(row);
-      if (k && tr.keys.indexOf(k) < 0) tr.keys.push(k);
+      if (k) {
+        let ks = kseen.get(tr);
+        if (!ks) { ks = new Set(); kseen.set(tr, ks); }
+        if (!ks.has(k)) { ks.add(k); tr.keys.push(k); }
+      }
     };
     const feeAltOut = (tr) => {
       const parts = [];
@@ -2135,13 +2236,7 @@ function lbReconstruct(fills, displayMap) {
       || dm[tr.market + '|' + tr.symbol];
     if (d) tr.display = d;
   }
-  out.sort((a, b) => {
-    const ka = a.open ? 0 : 1, kb = b.open ? 0 : 1;
-    if (ka !== kb) return ka - kb;
-    const ta = a.open ? (a.open_ts || 0) : (a.close_ts || 0);
-    const tb = b.open ? (b.open_ts || 0) : (b.close_ts || 0);
-    return tb - ta;
-  });
+  lbTradeOrder(out);
   const seen = {};
   for (const tr of out) {
     const base = tr.id;
@@ -2150,6 +2245,110 @@ function lbReconstruct(fills, displayMap) {
     seen[base] = n + 1;
   }
   return out;
+}
+// The ONE trade ordering: OPEN rows first, then newest ts. Sorts in place and
+// is STABLE (V8), so equal-key rows keep their incoming order. Shared by
+// lbReconstruct and the per-group replay cache (#2234) — a second copy of
+// this comparator would let the cached and uncached paths order ties
+// differently, which is exactly the kind of silent reordering the local
+// blotter must never do.
+function lbTradeOrder(out) {
+  out.sort((a, b) => {
+    const ka = a.open ? 0 : 1, kb = b.open ? 0 : 1;
+    if (ka !== kb) return ka - kb;
+    const ta = a.open ? (a.open_ts || 0) : (a.close_ts || 0);
+    const tb = b.open ? (b.open_ts || 0) : (b.close_ts || 0);
+    return tb - ta;
+  });
+  return out;
+}
+// PURE (#2234) PER-GROUP MEMOIZED REPLAY — the fix for the per-fill freeze.
+//
+// lbReconstruct is O(store): 130 ms measured over a 14.4k-row store, and
+// `execLblotTrades` re-ran it on EVERY fill (a merge changes rows.length,
+// which invalidates the whole-store cache), so one 14-order Binance burst
+// cost thirteen full replays on the Electron main loop — the recurring
+// 292-408 ms stalls of the 2026-08-15 field log. A fill only ever touches ONE
+// (venue|market|symbol|aid) group, so the replay is split per group, memoized
+// by a group signature, and only the groups that actually changed are
+// recomputed. Unchanged groups reuse their trade rows AND their serialized
+// JSON fragment verbatim, so the once-per-rev payload stringify stops being
+// O(store) too.
+//
+// Output is IDENTICAL to lbReconstruct(fills, displayMap):
+//   • every group is still replayed by lbReconstruct itself (same lot machine,
+//     same gate hedge split, same within-group id dedupe),
+//   • groups are concatenated in lbReconstruct's own group order — including
+//     its re-keying of a dual-mode gate futures group to the END,
+//   • the concatenation goes through the same stable lbTradeOrder, so ties
+//     break the same way,
+//   • cross-group id collisions cannot exist (the trade id carries
+//     venue+market+symbol+aid), so the global dedupe pass has nothing left to
+//     do and is not repeated (it would double-suffix cached rows).
+// `cache` is caller-owned ({} to start) and is pruned of vanished groups.
+function lbReplay(cache, fills, displayMap, dmSig, wantJson) {
+  const order = [], map = Object.create(null);
+  for (const f of (fills || [])) {
+    if (!f) continue;
+    const k = lbGroupKey(f);
+    let g = map[k];
+    if (!g) { g = map[k] = []; order.push(k); }
+    g.push(f);
+  }
+  const g0 = cache.g || (cache.g = Object.create(null));
+  const dsig = String(dmSig || '');
+  const keep = Object.create(null);
+  const front = [], back = [];
+  let recomputed = 0, replayed = 0;
+  for (const k of order) {
+    const rows = map[k];
+    const sig = rows.length + '|' + lbFillKey(rows[0]) + '|'
+      + lbFillKey(rows[rows.length - 1]) + '|' + dsig;
+    let e = g0[k];
+    if (!e || e.sig !== sig) {
+      const first = rows[0];
+      // mirror lbReconstruct's gate hedge re-keying (a split group is deleted
+      // and re-added, i.e. moved to the end of the group order)
+      let dual = false;
+      if (first.venue === 'gate' && first.market === 'futures') {
+        dual = !!lbGateDualSplit(rows.filter((r) => r.kind !== 'funding'));
+      }
+      e = g0[k] = { sig: sig, dual: dual, tj: null,
+                    trades: lbReconstruct(rows, displayMap || null) };
+      recomputed++; replayed += rows.length;
+    }
+    if (wantJson && !e.tjs) e.tjs = e.trades.map((t) => JSON.stringify(t));
+    keep[k] = 1;
+    (e.dual ? back : front).push(e);
+  }
+  for (const k of Object.keys(g0)) if (!keep[k]) delete g0[k];
+  const all = front.concat(back);
+  const trades = [];
+  for (const e of all) for (const t of e.trades) trades.push(t);
+  lbTradeOrder(trades);
+  // The once-per-rev serialized payload is assembled from PER-TRADE fragments
+  // cached with their group (the sorted array interleaves groups, so only a
+  // per-trade fragment can be reused). A whole-payload JSON.stringify measured
+  // 6.2 MB/6.2 ms per rev on the field store — now only the changed group's
+  // rows are re-stringified. Any lookup miss falls back to the plain stringify,
+  // which is the identical string by construction.
+  let tj;
+  if (wantJson) {
+    const m = new Map();
+    for (const e of all) {
+      for (let i = 0; i < e.trades.length; i++) m.set(e.trades[i], e.tjs[i]);
+    }
+    let ok = true;
+    const parts = new Array(trades.length);
+    for (let i = 0; i < trades.length; i++) {
+      const s = m.get(trades[i]);
+      if (s == null) { ok = false; break; }
+      parts[i] = s;
+    }
+    tj = ok ? '[' + parts.join(',') + ']' : JSON.stringify(trades);
+  }
+  return { trades: trades, tj: tj, groups: order.length,
+           recomputed: recomputed, replayed: replayed };
 }
 
 // --- Bybit pure builders ----------------------------------------------------
@@ -4916,6 +5115,41 @@ function createTradeNative(opts) {
     if (!diagTap) return;
     try { diagTap(cat, ev, data); } catch (e) { /* diagnostics never break trading */ }
   }
+  // --- main-loop phase timers (#2234) ---------------------------------------
+  // Freeze round 6 could only place a stall in a NEIGHBOURHOOD ("30-100 ms
+  // after a push flush, an account memo bust and a blotter ingest"). These
+  // taps name each phase of the fill/push path separately so the next field
+  // log attributes a stall to one phase. Costs one boolean test when the
+  // admin diag gate is off, which is every non-admin run.
+  const perfNow = (typeof performance !== 'undefined' && performance && performance.now)
+    ? () => performance.now() : () => Date.now();
+  const LB_PERF_FLUSH_MS = 2500;   // under the diag limiter's 30/min per cat|ev|k
+  let _lbPerf = null, _lbPerfT = 0;
+  function lbT() { return diagTap ? perfNow() : 0; }
+  function lbTap(phase, t0) {
+    if (!diagTap || !t0) return;
+    const ms = perfNow() - t0;
+    if (!_lbPerf) { _lbPerf = lbPerfNew(); _lbPerfT = Date.now(); }
+    lbPerfAdd(_lbPerf, phase, ms);
+    if (Date.now() - _lbPerfT >= LB_PERF_FLUSH_MS) lbPerfFlush();
+  }
+  function lbPerfFlush() {
+    if (!_lbPerf || !_lbPerf.n) { _lbPerf = null; return; }
+    const P = _lbPerf;
+    _lbPerf = null; _lbPerfT = Date.now();
+    // `srt` = whole-store sorts in this window. It must stay 0 in steady
+    // state: fills arrive in time order, so a merge appends (#2234).
+    tdiag('lblot', 'phase', { k: 'lb', n: P.n, ms: P.ms, mx: P.mx,
+                              srt: P.srt || undefined });
+  }
+  // A store sort is a COUNT, not a duration (its time already lands in
+  // drain.merge) — the field log needs to see whether it happens at all.
+  function lbPerfSort() {
+    if (!diagTap) return;
+    if (!_lbPerf) { _lbPerf = lbPerfNew(); _lbPerfT = Date.now(); }
+    _lbPerf.srt = (_lbPerf.srt | 0) + 1;
+    _lbPerf.n++;
+  }
 
   const credsFile = () => path.join(userDataDir(), 'trade_creds.json');
 
@@ -5593,12 +5827,14 @@ function createTradeNative(opts) {
       const sc = s && (key.slice(ix + 1) === 'fut' ? s.fut : s.spot);
       return sc ? sc.lseq : 0;
     }, Date.now(), 'binance');
+    const tBust = lbT();
     for (const ev of evs) {
       // memo-bust so the push-triggered acct_read observes the mutation
       try { execAcctRead.bust('binance', ev.slot); } catch (e) { /* best-effort */ }
       try { execAcctRead.markHot('binance'); } catch (e) { /* #2131 hot lane */ }
       tdiag('acct', 'bn_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
     }
+    lbTap('push.bust', tBust);
     // #2212 ONE batched fan-out per drain tick (the drain already folds marks
     // per slot|scope, so this is normally 1-2 events — but a burst that lands
     // spot AND futures mutations in the same tick used to cost one IPC +
@@ -5606,7 +5842,11 @@ function createTradeNative(opts) {
     // back to the bare single shape; the panel applies the list in THIS order,
     // so per-event handling (dedup ids, chime ids, blotter kicks) is
     // unchanged. The memo bust above still runs before anything ships.
-    if (evs.length) { try { pushLedgerCb(evs); } catch (e) { /* window gone */ } }
+    if (evs.length) {
+      const tB = lbT();
+      try { pushLedgerCb(evs); } catch (e) { /* window gone */ }
+      lbTap('push.bcast', tB);
+    }
   }
   function bnPushSc(scope, kind, id, row) {
     if (!pushLedgerCb || !scope || !scope._pk) return;
@@ -12236,46 +12476,234 @@ function createTradeNative(opts) {
     sc.rows = lbPruneRows(sc.rows, LB_ROWS_CAP);
     sc.seen = null;
     const n = before - sc.rows.length;
-    if (n) tdiag('lblot', 'prune', { k: slot, v: venue, n: n,
-      total: sc.rows.length, reason: 'rows-cap' });
+    if (n) {
+      // #2234: rows vanished — the replay cache's per-group signatures cannot
+      // see that on their own, and the drain cursors must re-scan from the
+      // ring head (a pruned row may still sit in a live ring). A prune also
+      // has to reach the snapshot, or a journal replay would resurrect the
+      // pruned rows on the next launch.
+      lbStoreMut(slot, sc);
+      lbSnapSoon(0);
+      tdiag('lblot', 'prune', { k: slot, v: venue, n: n,
+        total: sc.rows.length, reason: 'rows-cap' });
+    }
   }
+  // Every NON-APPEND mutation of a scope (delete, prune, tombstone clear,
+  // re-import) goes through here (#2234): it busts the per-group replay cache
+  // wholesale — a group signature is (rows, first key, last key) and cannot
+  // detect "one row removed from the middle and one inserted" — and drops the
+  // incremental drain cursors so the next drain re-reads its rings in full.
+  function lbStoreMut(slot, sc) {
+    if (sc) { sc._ep = (sc._ep | 0) + 1; sc._rep = null; }
+    _lbDrainAt[slot] = null;
+    _lbDrainCur[slot] = null;
+  }
+  // --- persistence: append-only journal + rare atomic snapshot (#2234) -----
+  // WAS: every merged fill scheduled a save that stringified the WHOLE store
+  // (3.4 MB) and wrote it with a SYNCHRONOUS writeFileSync on the Electron
+  // main thread, 1.5 s after the fill — i.e. landing squarely inside the next
+  // order burst, over and over, and scaling with every week of trading.
+  // NOW: the hot path appends ONLY the newly merged rows to a journal
+  // (coalesced, async, bytes proportional to the batch), and the full
+  // snapshot is written rarely, asynchronously, atomically (tmp + rename) and
+  // out of the burst. Recovery = snapshot + journal replay through the normal
+  // exactly-once merge, so an interrupted write can lose nothing that was
+  // already durable: the snapshot is never overwritten in place, and a
+  // half-written journal line is dropped by lbJrnParse.
+  const LB_JRN_FLUSH_MS = 250;         // journal coalescing window
+  const LB_JRN_MAX_BYTES = 1 << 20;    // journal past this ⇒ fold into a snapshot
+  const LB_SNAP_MS = 30000;            // ordinary snapshot debounce
+  const LB_SNAP_QUIET_MS = 3000;       // ... deferred while fills keep landing
+  const LB_SNAP_MAX_MS = 120000;       // ... but never past this hard deadline
   const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
-  let _lbStore = null, _lbSaveT = null;
-  function lbLoad() {
-    if (_lbStore) return _lbStore;
-    let d = null;
-    try { d = JSON.parse(fs.readFileSync(lbFile(), 'utf8')); } catch (e) { d = null; }
-    _lbStore = (d && typeof d === 'object' && d.scopes && typeof d.scopes === 'object')
-      ? d : { v: 1, scopes: {} };
-    return _lbStore;
-  }
-  function lbSaveSoon() {
-    if (_lbSaveT) return;
-    _lbSaveT = setTimeout(() => {
-      _lbSaveT = null;
-      lbSaveNow();
-    }, LB_SAVE_DEBOUNCE_MS);
-  }
-  function lbSaveNow() {
-    if (!_lbStore) return true;
-    try {
-      const slim = { v: 1, scopes: {} };
-      for (const k of Object.keys(_lbStore.scopes)) {
-        const sc = _lbStore.scopes[k];
-        slim.scopes[k] = { rows: sc.rows, del: sc.del || {}, bf: sc.bf || null };
-      }
-      fs.writeFileSync(lbFile(), JSON.stringify(slim));
-      return true;
-    } catch (e) { return false; }   // read ops report persistErr — never silent
-  }
-  function lbScope(slot) {
-    const st = lbLoad();
+  const lbTmp = () => path.join(userDataDir(), 'local_fills_v1.json.tmp');
+  const lbJrnF = () => path.join(userDataDir(), 'local_fills_v1.jrn');
+  let _lbStore = null;
+  let _lbJrnPend = [], _lbJrnT = null, _lbJrnBusy = false, _lbJrnBytes = 0;
+  let _lbSnapT = null, _lbSnapDue = 0, _lbSnapMax = 0, _lbSnapBusy = false;
+  let _lbSnapAgain = false, _lbLastFill = 0, _lbPersistErr = null;
+  function lbScopeIn(st, slot) {
     let sc = st.scopes[slot];
     if (!sc) sc = st.scopes[slot] = { rows: [], del: {}, bf: null };
     if (!Array.isArray(sc.rows)) sc.rows = [];
     if (!sc.del || typeof sc.del !== 'object') sc.del = {};
     return sc;
   }
+  function lbLoad() {
+    if (_lbStore) return _lbStore;
+    let d = null;
+    try { d = JSON.parse(fs.readFileSync(lbFile(), 'utf8')); } catch (e) { d = null; }
+    _lbStore = (d && typeof d === 'object' && d.scopes && typeof d.scopes === 'object')
+      ? d : { v: 1, scopes: {} };
+    // journal replay — everything merged since the last snapshot
+    let jt = null;
+    try { jt = fs.readFileSync(lbJrnF(), 'utf8'); } catch (e) { jt = null; }
+    if (jt) {
+      const p = lbJrnParse(jt);
+      let n = 0;
+      for (const b of p.batches) {
+        try { n += lbScopeMerge(lbScopeIn(_lbStore, b.slot), b.rows); } catch (e) { /* one bad batch never blocks the store */ }
+      }
+      _lbJrnBytes = Buffer.byteLength(jt);
+      tdiag('lblot', 'jrn-replay', { k: 'lb', batches: p.batches.length,
+        rows: n, bad: p.bad, bytes: _lbJrnBytes });
+      lbSnapSoon(0);   // fold the journal back into the snapshot promptly
+    }
+    return _lbStore;
+  }
+  // Hot path: journal the rows that were actually added. Sites that cannot
+  // hand over their batch (backfill/import merges — not the burst path) fall
+  // back to the plain snapshot debounce, i.e. exactly today's behaviour.
+  function lbSaveSoon(slot, rows) {
+    if (slot && rows && rows.length) {
+      _lbLastFill = Date.now();
+      const t0 = lbT();
+      _lbJrnPend.push(lbJrnLine(slot, rows));
+      lbTap('persist.jrnline', t0);
+      lbJrnArm();
+      lbSnapSoon(LB_SNAP_MS);
+      return;
+    }
+    lbSnapSoon(LB_SAVE_DEBOUNCE_MS);
+  }
+  function lbJrnArm() {
+    if (_lbJrnT || _lbSnapBusy || !_lbJrnPend.length) return;
+    _lbJrnT = setTimeout(() => { _lbJrnT = null; lbJrnFlush(); }, LB_JRN_FLUSH_MS);
+  }
+  function lbJrnFlush() {
+    if (_lbJrnBusy || _lbSnapBusy || !_lbJrnPend.length) return;
+    const txt = _lbJrnPend.join('');
+    _lbJrnPend = [];
+    _lbJrnBusy = true;
+    const t0 = lbT();
+    fs.appendFile(lbJrnF(), txt, (err) => {
+      _lbJrnBusy = false;
+      lbTap('persist.jrnwrite', t0);
+      if (err) {
+        _lbPersistErr = String((err && err.message) || err);
+        lbSnapSoon(0);   // journal not taking writes ⇒ fall back to a snapshot
+        return;
+      }
+      _lbPersistErr = null;
+      _lbJrnBytes += Buffer.byteLength(txt);
+      if (_lbJrnBytes > LB_JRN_MAX_BYTES) lbSnapSoon(0);
+      else lbJrnArm();
+    });
+  }
+  function lbSnapSoon(delay) {
+    const now = Date.now();
+    const d = Number.isFinite(delay) ? Math.max(0, delay) : LB_SNAP_MS;
+    if (!_lbSnapMax) _lbSnapMax = now + LB_SNAP_MAX_MS;
+    const due = now + d;
+    if (_lbSnapT && _lbSnapDue && _lbSnapDue <= due) return;   // already sooner
+    if (_lbSnapT) clearTimeout(_lbSnapT);
+    _lbSnapDue = due;
+    _lbSnapT = setTimeout(lbSnapTick, d);
+  }
+  function lbSnapTick() {
+    _lbSnapT = null;
+    const now = Date.now();
+    // The whole-store stringify is ~10 ms of main loop. It waits out an active
+    // fill stream — but on a deadline that is NOT re-anchored, so a permanently
+    // busy account still gets its snapshot.
+    if (now < _lbSnapMax && (now - _lbLastFill) < LB_SNAP_QUIET_MS) {
+      _lbSnapDue = now + LB_SNAP_QUIET_MS;
+      _lbSnapT = setTimeout(lbSnapTick, LB_SNAP_QUIET_MS);
+      return;
+    }
+    lbSnapNow(false);
+  }
+  // Atomic whole-store write. `sync` is for the explicit ops that report
+  // persistErr to the caller (delete/import/reimport) and for quit.
+  function lbSnapNow(sync) {
+    if (!_lbStore) return true;
+    if (_lbSnapBusy) { _lbSnapAgain = true; return true; }
+    let json = null;
+    const t0 = lbT();
+    try {
+      const slim = { v: 1, scopes: {} };
+      for (const k of Object.keys(_lbStore.scopes)) {
+        const sc = _lbStore.scopes[k];
+        slim.scopes[k] = { rows: sc.rows, del: sc.del || {}, bf: sc.bf || null };
+      }
+      json = JSON.stringify(slim);
+    } catch (e) {
+      _lbPersistErr = String((e && e.message) || e);
+      return false;
+    }
+    lbTap('persist.stringify', t0);
+    // Everything queued for the journal right now is inside `json` (one
+    // thread, the stringify just ran) — later appends stay pending and are
+    // flushed to a FRESH journal once the snapshot lands.
+    _lbJrnPend = [];
+    if (_lbJrnT) { clearTimeout(_lbJrnT); _lbJrnT = null; }
+    if (_lbSnapT) { clearTimeout(_lbSnapT); _lbSnapT = null; }
+    _lbSnapDue = 0; _lbSnapMax = 0;
+    const done = (err) => {
+      _lbSnapBusy = false;
+      if (err) {
+        _lbPersistErr = String((err && err.message) || err);
+        try { fs.unlinkSync(lbTmp()); } catch (e) { /* best effort */ }
+        return false;
+      }
+      _lbPersistErr = null;
+      try { fs.unlinkSync(lbJrnF()); } catch (e) { /* no journal is fine */ }
+      _lbJrnBytes = 0;
+      if (_lbSnapAgain) { _lbSnapAgain = false; lbSnapSoon(LB_SNAP_MS); }
+      lbJrnArm();
+      return true;
+    };
+    // tmp → fsync → rename: the live store is never opened for writing, so a
+    // crash/force-quit mid-write leaves the PREVIOUS store intact and the
+    // journal still on disk. The fsync is what makes the rename meaningful —
+    // without it the directory entry can land before the bytes do.
+    if (sync) {
+      const t1 = lbT();
+      try {
+        const fd = fs.openSync(lbTmp(), 'w');
+        try { fs.writeFileSync(fd, json); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        fs.renameSync(lbTmp(), lbFile());
+      } catch (e) { return done(e); }
+      lbTap('persist.write', t1);
+      return done(null);
+    }
+    _lbSnapBusy = true;
+    const t2 = lbT();
+    fs.open(lbTmp(), 'w', (eo, fd) => {
+      if (eo) { done(eo); return; }
+      fs.writeFile(fd, json, (e1) => {
+        fs.fsync(fd, (e2) => {
+          fs.close(fd, () => {
+            const err = e1 || e2;
+            if (err) { done(err); return; }
+            fs.rename(lbTmp(), lbFile(), (e3) => { lbTap('persist.write', t2); done(e3); });
+          });
+        });
+      });
+    });
+    return true;
+  }
+  function lbSaveNow() { return lbSnapNow(true); }
+  // Quit / exit: get whatever is only in memory onto disk, synchronously.
+  function lbFlushSync() {
+    try {
+      if (_lbJrnT) { clearTimeout(_lbJrnT); _lbJrnT = null; }
+      if (_lbSnapT) { clearTimeout(_lbSnapT); _lbSnapT = null; }
+      if (!_lbStore) return true;
+      if (_lbSnapBusy) {
+        // a snapshot write is already in flight — never race it with a second
+        // writer; just make the pending rows durable in the journal.
+        if (_lbJrnPend.length) {
+          const txt = _lbJrnPend.join(''); _lbJrnPend = [];
+          try { fs.appendFileSync(lbJrnF(), txt); } catch (e) { return false; }
+        }
+        return true;
+      }
+      return lbSnapNow(true);
+    } catch (e) { return false; }
+  }
+  function lbScope(slot) { return lbScopeIn(lbLoad(), slot); }
   // Drain the live shell fill caches (kraken WS session / binance UDS
   // session) into the scope store — normalize with the engine-twin
   // normalizers, merge exactly-once. Cheap and idempotent: called from
@@ -12308,15 +12736,21 @@ function createTradeNative(opts) {
     }
     return '-';
   }
-  const _lbDrainAt = {};   // slot → { t, sig } (#2230 no-news gate)
+  const _lbDrainAt = {};    // slot → { t, sig } (#2230 no-news gate)
+  const _lbDrainCur = {};   // slot → { r: {ring: rev}, skip, full } (#2234)
+  const LB_DRAIN_RETRY_MS = 3000;   // re-try rows no normalizer could take yet
   function lbDrain(slot, venue) {
     const sc = lbScope(slot);
-    // #2230: nothing new upstream AND nothing changed in the store ⇒ this
-    // drain provably merges nothing. Skip the whole normalize+merge pass so
-    // N windows polling the same slot in the same beat cost ONE of them.
-    // The store length is part of the signature, so any mutation (merge,
-    // delete, prune, quarantine clear) forces the next drain to run.
-    const _dsig = lbDrainSrcN(slot, venue) + '|' + sc.rows.length;
+    // #2230: nothing new upstream ⇒ this drain provably merges nothing. Skip
+    // the whole normalize+merge pass so N windows polling the same slot in
+    // the same beat cost ONE of them.
+    // #2234: the store LENGTH is no longer part of the signature. It made
+    // every successful merge invalidate the gate, so each merged fill bought
+    // a second full normalize pass on the very next poll — the gate could not
+    // tell "the store changed because we just merged" from "there is new
+    // upstream data". Store mutations a drain really must react to
+    // (delete / prune / tombstone clear) reset the gate through lbStoreMut.
+    const _dsig = lbDrainSrcN(slot, venue);
     const _dnow = Date.now();
     if (lbDrainSkip(_lbDrainAt[slot], _dsig, _dnow, LB_DRAIN_IDLE_MS)) return 0;
     _lbDrainAt[slot] = { t: _dnow, sig: _dsig };
@@ -12325,30 +12759,42 @@ function createTradeNative(opts) {
       const m = sn && sn.slot !== sn.base ? /#a(\d+)$/.exec(sn.slot) : null;
       return m ? parseInt(m[1], 10) : 0;
     })();
+    // #2234 INCREMENTAL: normalize only the rows each ring has pushed since
+    // the last drain, instead of re-normalizing all 400-600 cached rows of
+    // every ring on every poll. `retry` forces a whole-ring pass when the
+    // previous pass left rows it could not normalize yet (HL '@N' spot coins,
+    // gate contracts awaiting a multiplier) — that self-healing must keep
+    // happening — and lbRingFrom falls back to the whole ring by itself on a
+    // first drain, a ring reset/reconnect, or cap eviction.
+    let cur = _lbDrainCur[slot];
+    if (!cur) cur = _lbDrainCur[slot] = { r: {}, skip: 0, full: 0 };
+    const retry = cur.skip > 0 && (_dnow - (cur.full || 0)) >= LB_DRAIN_RETRY_MS;
+    if (retry) cur.full = _dnow;
+    const tNorm = lbT();
     const fills = [];
+    let skipped = 0, scanned = 0;
+    const ring = (id, F, fn) => {
+      if (!F || !Array.isArray(F.rows)) return;
+      const rows = F.rows;
+      const from = lbRingFrom(cur.r[id], F.rev | 0, rows.length, retry);
+      for (let i = from; i < rows.length; i++) {
+        const f = fn(rows[i]);
+        if (f) fills.push(f); else skipped++;
+      }
+      scanned += rows.length - from;
+      cur.r[id] = F.rev | 0;
+    };
     if (venue === 'kraken') {
       const sess = krWsSessions[slot];
       if (sess) {
-        for (const r of ((sess.spot.fills && sess.spot.fills.rows) || [])) {
-          const f = lbNormKrWsSpot(r.raw);
-          if (f) fills.push(f);
-        }
-        for (const r of ((sess.fut.fills && sess.fut.fills.rows) || [])) {
-          const f = lbNormKrWsFut(r.raw);
-          if (f) fills.push(f);
-        }
+        ring('kr.spot', sess.spot.fills, (r) => lbNormKrWsSpot(r.raw));
+        ring('kr.fut', sess.fut.fills, (r) => lbNormKrWsFut(r.raw));
       }
     } else if (venue === 'binance') {
       const sess = bnUdsSessions[slot];
       if (sess) {
-        for (const r of ((sess.spot.fills && sess.spot.fills.rows) || [])) {
-          const f = lbNormBnSpot(r);
-          if (f) fills.push(f);
-        }
-        for (const r of ((sess.fut.fills && sess.fut.fills.rows) || [])) {
-          const f = lbNormBnFut(r, r.T);
-          if (f) fills.push(f);
-        }
+        ring('bn.spot', sess.spot.fills, (r) => lbNormBnSpot(r));
+        ring('bn.fut', sess.fut.fills, (r) => lbNormBnFut(r, r.T));
       }
     } else if (venue === 'hyperliquid') {
       // #2012: the push session caches RAW userFills rows (account-level —
@@ -12359,51 +12805,42 @@ function createTradeNative(opts) {
       const sess = hlPushSessions[slot];
       if (sess) {
         const wm = hlProds.wireMap || {};
-        for (const r of ((sess.acct.fills && sess.acct.fills.rows) || [])) {
-          const f = lbNormHlFill(r, wm);
-          if (f) fills.push(f);
-        }
+        ring('hl.acct', sess.acct.fills, (r) => lbNormHlFill(r, wm));
       }
     } else if (venue === 'bybit') {
       // #2051: the push session caches RAW V5 execution rows (account-level —
       // linear + spot ride one stream, rows carry `category`). The drain is
       // idempotent: rows merged once by exec_id stay merged.
       const sess = bybPushSessions[slot];
-      if (sess) {
-        for (const r of ((sess.acct.fills && sess.acct.fills.rows) || [])) {
-          const f = lbNormBybFill(r);
-          if (f) fills.push(f);
-        }
-      }
+      if (sess) ring('byb.acct', sess.acct.fills, (r) => lbNormBybFill(r));
     } else if (venue === 'gate') {
       // #2153: two per-market raw rings (spot/futures sockets never mix).
       // Futures rows size in CONTRACTS — quanto_multiplier from the shell
       // contract cache; a cold entry skips the row THIS drain and fires a
       // best-effort warm (HL wireMap recipe: the raw row stays cached, the
-      // next drain re-normalizes it once the multiplier landed).
+      // retry sweep re-normalizes it once the multiplier landed).
       const sess = gatePushSessions[slot];
       if (sess) {
-        for (const r of ((sess.sp.fills && sess.sp.fills.rows) || [])) {
-          const f = lbNormGateFill(r, 'spot', null);
-          if (f) fills.push(f);
-        }
-        for (const r of ((sess.fu.fills && sess.fu.fills.rows) || [])) {
+        ring('gate.sp', sess.sp.fills, (r) => lbNormGateFill(r, 'spot', null));
+        ring('gate.fu', sess.fu.fills, (r) => {
           const sym = String((r && r.contract) || '');
           const mc = gateMultCache[sym];
           const mult = mc ? mc.v : null;
           if (!(Number(mult) > 0)) {
             if (sym) gateMult(sym, sess.route).catch(() => { /* warm */ });
-            continue;
+            return null;
           }
-          const f = lbNormGateFill(r, 'futures', mult);
-          if (f) fills.push(f);
-        }
+          return lbNormGateFill(r, 'futures', mult);
+        });
       }
     }
+    cur.skip = skipped;
     if (aid) for (const f of fills) f.aid = aid;
-    // #1973 field-test diag: pre-compute which drained rows are NEW (the WS
-    // cache re-serves old rows every drain — `fills.length` alone is not a
-    // batch). Diag-only, skipped when the seen index isn't built yet.
+    lbTap('drain.normalize', tNorm);
+    // #1973 field-test diag: pre-compute which drained rows are NEW (a ring
+    // re-serves rows the cursor already covered after a retry sweep, so
+    // `fills.length` alone is not a batch). Diag-only, skipped when the seen
+    // index isn't built yet.
     let newIds = null;
     if (diagTap && sc.seen) {
       newIds = [];
@@ -12413,16 +12850,21 @@ function createTradeNative(opts) {
           newIds.push(String(f.exec_id || k));
       }
     }
-    const added = lbScopeMerge(sc, fills);
+    const tMerge = lbT();
+    const addRows = [];
+    const srt0 = sc._srt | 0;
+    const added = lbScopeMerge(sc, fills, addRows);
+    lbTap('drain.merge', tMerge);
+    if ((sc._srt | 0) !== srt0) lbPerfSort();
     if (added) {
       // one line per live drain batch that actually merged rows — venue,
       // source, count, first/last exec id, store total. Never per empty poll.
       tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'ws-drain', n: added,
         first: newIds && newIds.length ? newIds[0] : undefined,
         last: newIds && newIds.length ? newIds[newIds.length - 1] : undefined,
-        total: sc.rows.length });
+        total: sc.rows.length, scan: scanned, skip: skipped });
       if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
-      lbSaveSoon();
+      lbSaveSoon(slot, addRows);
     }
     return added;
   }
@@ -12441,12 +12883,34 @@ function createTradeNative(opts) {
     await lbHlWarm(venue, intent.route);
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
-    return {
-      ok: true, added: added, count: sc.rows.length,
-      fills: sc.rows,
+    const t0 = lbT();
+    // #2234 BOUNDED REPLY: a read used to hand back the ENTIRE store, and the
+    // reply is structured-cloned per window — the 24 reads 14 starting windows
+    // fire are what the field log's two boot stalls (0.46 s, 7.27 s) are made
+    // of. Callers now say what they need: a ts window (`since`/`until`), a
+    // newest-N cap (`limit`), or the shared serialized form (`wantJson` — one
+    // string built once, ~30× cheaper to clone than a 14k-object graph, and
+    // parsed in the renderer's own process). No selector ⇒ unchanged reply.
+    let rows = sc.rows;
+    const since = Number(intent.since) || 0;
+    const until = Number(intent.until) || 0;
+    if (since > 0 || until > 0) {
+      rows = rows.filter((r) => {
+        const ts = Number(r.ts) || 0;
+        return (!since || ts >= since) && (!until || ts <= until);
+      });
+    }
+    const limit = Math.floor(Number(intent.limit) || 0);
+    if (limit > 0 && rows.length > limit) rows = rows.slice(rows.length - limit);
+    const out = {
+      ok: true, added: added, count: sc.rows.length, n: rows.length,
       hwm: { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') },
       bf: sc.bf || null,
     };
+    if (intent.wantJson) out.fillsJson = JSON.stringify(rows);
+    else out.fills = rows;
+    lbTap('read.reply', t0);
+    return out;
   }
   async function execLblotIngest(intent) {
     // Explicit merge of NORMALIZED fills (server "Import" / panel-supplied
@@ -12485,9 +12949,9 @@ function createTradeNative(opts) {
     })();
     if (slotAid) for (const f of fills) f.aid = slotAid;
     const sc = lbScope(slot);
-    const added = lbScopeMerge(sc, fills);
+    const added = lbScopeMerge(sc, fills, null);
     if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
-    const saved = lbSaveNow();
+    const saved = lbSaveNow();   // explicit op: snapshot now, journal folded in
     // #1973: explicit ingest flow (panel Import button / supplied rows)
     tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'import', recv: rowsIn.length,
       n: added, dedup: fills.length - added, total: sc.rows.length,
@@ -12510,6 +12974,7 @@ function createTradeNative(opts) {
     const before = sc.rows.length;
     sc.rows = sc.rows.filter((r) => !set[lbFillKey(r)]);
     sc.seen = null;
+    lbStoreMut(slot, sc);   // #2234 rows removed from the middle — bust caches
     const saved = lbSaveNow();
     return { ok: true, removed: before - sc.rows.length,
              ...(saved ? {} : { persistErr: true }) };
@@ -12565,15 +13030,32 @@ function createTradeNative(opts) {
       return Object.assign({ ok: true, rev: hit.rev, added: added, count: sc.rows.length,
                              hwm: hit.hwm, bf: sc.bf || null }, pack(hit));
     }
-    let trades, quar;
+    let trades, quar, tj;
     try {
       // #2038 spot truncated-history quarantine BEFORE the replay: a spot
       // scope whose sum goes negative provably starts mid-position — the
       // incomplete prefix hides behind an honest ⚠ marker (engine #1849
       // parity), never a phantom OPEN group that swallows new round trips.
+      const tq = lbT();
       const vis = lbSpotQuar(sc.rows);
       quar = vis.quar;
-      trades = lbReconstruct(vis.rows, intent.displayMap || null);
+      lbTap('replay.quar', tq);
+      // #2234 PER-GROUP MEMOIZED REPLAY — the freeze itself. lbReconstruct is
+      // O(store) (130 ms measured on the 14.4k-row field store) and ran on
+      // EVERY fill, because a merge moves rows.length and busts the cache
+      // above. A fill only ever touches one (venue|market|symbol|aid) group,
+      // so only that group is replayed and re-serialized; the rest is reused
+      // verbatim. lbReplay's output is identical to lbReconstruct's.
+      const tr = lbT();
+      if (sc._rep && sc._rep.ep !== (sc._ep | 0)) sc._rep = null;
+      if (!sc._rep) sc._rep = { ep: sc._ep | 0, g: Object.create(null) };
+      const rp = lbReplay(sc._rep, vis.rows, intent.displayMap || null, dmSig, wantJson);
+      trades = rp.trades; tj = rp.tj;
+      lbTap('replay.build', tr);
+      if (rp.recomputed) {
+        tdiag('lblot', 'replay', { k: slot, v: venue, grp: rp.groups,
+          re: rp.recomputed, rows: rp.replayed, of: vis.rows.length });
+      }
       // #2098 silent-drop diag: any quarantine that hides rows leaves a tap
       // (once per distinct quar set per slot — reads poll every ~2s).
       try {
@@ -12592,9 +13074,12 @@ function createTradeNative(opts) {
     }
     catch (e) { return { ok: false, message: 'replay failed: ' + ((e && e.message) || 'error') }; }
     const hwm = { spot: lbHwm(sc.rows, 'spot'), futures: lbHwm(sc.rows, 'futures') };
+    // `tj` comes straight out of lbReplay when the caller wanted JSON — it is
+    // assembled from the per-group fragments, so a fill re-stringifies one
+    // group instead of the whole 1.8 MB payload (#2234).
     _lbTrCache[slot] = { rows: sc.rows, len: sc.rows.length, dmSig: dmSig,
                          rev: ++_lbTrRev, trades: trades, quar: quar || [],
-                         hwm: hwm, tj: null, qj: null };
+                         hwm: hwm, tj: tj == null ? null : tj, qj: null };
     return Object.assign({ ok: true, rev: _lbTrCache[slot].rev, added: added,
                            count: sc.rows.length, hwm: hwm, bf: sc.bf || null },
                          pack(_lbTrCache[slot]));
@@ -13276,6 +13761,10 @@ function createTradeNative(opts) {
       const quarAfter = lbSpotQuar(sc.rows).quar.length;
       const quarCleared = Math.max(0, quarBefore - quarAfter);
       if (quarCleared) _lbQuarSig[slot] = '';   // re-arm the quar tap dedupe
+      // #2234: a re-import replaces rows in place and clears tombstones — the
+      // replay cache's group signatures and the drain's ring cursors both have
+      // to start over (a cleared tombstone makes ring rows mergeable again).
+      lbStoreMut(slot, sc);
       const saved = lbSaveNow();
       tdiag('lblot', 'reimp', { k: slot, v: venue, ok: 1, mkt: market,
         frm: w.frm, to: w.to, ms: Date.now() - t0run, fetched: use.length,
@@ -13665,6 +14154,22 @@ function createTradeNative(opts) {
     if (!senderOk(event)) return { ok: false, error: 'forbidden' };
     return credsStatus();
   });
+  // #2234 shared serialized account read. The guard's memo serves ONE object
+  // to every window inside its window, so the JSON is built once per RESULT
+  // (WeakMap-keyed on that object — no cache to invalidate, it dies with the
+  // memo entry) and every window after the first pays only a string copy.
+  // Unserializable result ⇒ the old object shape, never an error.
+  const _arShareJson = new WeakMap();
+  function acctReadShare(r) {
+    if (!r || typeof r !== 'object') return r;
+    let j = _arShareJson.get(r);
+    if (j === undefined) {
+      try { j = JSON.stringify(r); } catch (e) { j = null; }
+      _arShareJson.set(r, j);
+    }
+    if (typeof j !== 'string') return r;
+    return { ok: !!r.ok, json: j };
+  }
   // Diag: array-field row counts of a read result (positions/orders/wallets/
   // fills lengths) — counts only, never row contents.
   function diagRowCounts(r) {
@@ -13737,10 +14242,26 @@ function createTradeNative(opts) {
         tdiag('trade', op, dd);
       }
     }
+    // #2234 per-window fan-out: the read memo hands the SAME result object to
+    // every window, and each IPC reply structured-clones it — 334 KB / 1.4 ms
+    // for a binance account with 865 positions, once per window per read. A
+    // caller that opts in gets the object serialized ONCE and shared as a
+    // string instead (~0.15 ms to clone). Stamped after the diag so the row
+    // counts above still see the real result. Opt-in only: an old panel keeps
+    // the object shape byte-for-byte.
+    if (intent && typeof intent === 'object' && intent.wantJson &&
+        String(intent.op || '') === 'acct_read') return acctReadShare(r);
     return r;
   });
 
-  return { execIntent, credsStatus };   // exposed for shell-internal use/tests
+  // #2234 quit hook: the local blotter now persists through an append-only
+  // journal + a rare snapshot, so whatever is still only in memory has to be
+  // forced to disk when the app goes down. Called from main.js's before-quit,
+  // with a process-exit backstop for the paths that bypass it.
+  try {
+    process.on('exit', () => { try { lbFlushSync(); } catch (e) { /* exiting */ } });
+  } catch (e) { /* no process hooks (tests) — the explicit lbFlush still works */ }
+  return { execIntent, credsStatus, lbFlush: lbFlushSync };   // exposed for shell-internal use/tests
 }
 
 // ── PURE — HL background REST budgeter (#2008) ──────────────────────────────
@@ -14242,6 +14763,14 @@ module.exports = {
   lbHwm,
   lbPruneRows,
   lbReconstruct,
+  lbGroupKey,
+  lbTradeOrder,
+  lbReplay,
+  lbRingFrom,
+  lbJrnLine,
+  lbJrnParse,
+  lbPerfNew,
+  lbPerfAdd,
   lbHlCoinIsSpot,
   lbNormHlFill,
   lbHlPageStep,

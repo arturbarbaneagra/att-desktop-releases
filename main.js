@@ -1807,7 +1807,21 @@ ipcMain.on('att:ws-close', (event, payload) => {
 // (top-level app-origin frames only) and the same proxy-agent discipline.
 // ---------------------------------------------------------------------------
 const { createTradeNative } = require('./trade_native');
-createTradeNative({
+// #2234 ledger-push subscribers. One push event used to cost one structured
+// clone per OPEN window, whether or not that window listens to the lane. A
+// renderer registers here the first time it installs an onLedgerPush handler
+// (preload sends 'att:ledger-sub'); until ANY window has registered the
+// broadcast stays open to all, so an older panel keeps working unchanged.
+const ledgerSubs = new Set();
+ipcMain.on('att:ledger-sub', (event) => {
+  if (!nativeWsSenderOk(event)) return;
+  const wc = event.sender;
+  const id = wc.id;
+  if (ledgerSubs.has(id)) return;
+  ledgerSubs.add(id);
+  try { wc.once('destroyed', () => ledgerSubs.delete(id)); } catch (e) { /* already gone */ }
+});
+const tradeNative = createTradeNative({
   ipcMain,
   safeStorage,
   getProxyConfig,
@@ -1830,14 +1844,26 @@ createTradeNative({
   // case stays byte-identical on the wire. The panel tolerates BOTH shapes
   // (it is always republished before a shell release), so a mixed
   // panel/shell pair is safe in either direction.
+  // #2234 shared serialized payload: `webContents.send` structured-clones its
+  // argument PER WINDOW, so a 14-window app paid 14 deep clones of the same
+  // object on the main loop for every push. The event is serialized ONCE here
+  // and shipped as a string (cloning a string is a memcpy); the panel unpacks
+  // both shapes. Windows that never registered a ledger handler are skipped
+  // entirely — they used to pay for the clone AND answer with an account read.
   pushLedger: (ev) => {
     const evs = Array.isArray(ev) ? ev : null;
     if (evs && evs.length === 0) return;
     let msg = ev;
     if (evs) msg = evs.length === 1 ? evs[0] : { __b: 1, evs: evs };
+    let wire = msg;
+    try { wire = JSON.stringify(msg); } catch (e) { wire = msg; }   // cyclic ⇒ old path
+    const gate = ledgerSubs.size > 0;
     for (const w of [mainWindow, ...featureWindows.values()]) {
       if (!w || w.isDestroyed()) continue;
-      try { w.webContents.send('att:ledger-push', msg); } catch (e) { /* window closing */ }
+      try {
+        if (gate && !ledgerSubs.has(w.webContents.id)) continue;
+        w.webContents.send('att:ledger-push', wire);
+      } catch (e) { /* window closing */ }
     }
   },
 });
@@ -2403,6 +2429,9 @@ app.on('before-quit', () => {
   isQuitting = true;
   mnGapStop();   // #2212
   mnCanStop();   // #2217
+  // #2234: the local blotter persists through a journal + a rare snapshot —
+  // force whatever is still only in memory onto disk before the app goes.
+  try { if (tradeNative && tradeNative.lbFlush) tradeNative.lbFlush(); } catch (e) { /* quitting */ }
   dlog('main', 'app', 'quit', {});
   if (diag) { try { diag.close(); } catch (e) { /* non-fatal */ } }
 });
