@@ -1523,6 +1523,89 @@ function lbNormGateFill(f, market, mult) {
   if (!row.symbol || !(row.ts > 0)) return null;
   return row;
 }
+// ── Bitget (#2246) ─────────────────────────────────────────────────────────
+// _bitget_fill_fee twin. (fee_raw, ccy) from any Bitget fill shape; fees
+// arrive NEGATIVE when charged (the caller flips to cost-positive).
+//  - WS orders-channel deltas (spot): flat `fillFee`/`fillFeeCoin` is the
+//    PER-FILL fee and MUST win — the same delta also carries `feeDetail`,
+//    but as the ORDER-CUMULATIVE list keyed `fee` (NOT `totalFee`), so a
+//    partial fill would otherwise record the whole order's fee.
+//  - WS orders-channel deltas (futures): NO flat fillFee, only the
+//    cumulative list — trusted only when this fill IS the whole order so
+//    far (baseVolume == accBaseVolume); else 0 and the delayed reconcile
+//    corrects it. A parser reading only `totalFee` records every live fill
+//    at ZERO fee.
+//  - REST mix fills: feeDetail LIST of {totalFee, feeCoin}.
+//  - REST spot fills: feeDetail DICT of {totalFee, feeCoin}.
+//  - feeDetail may arrive as a JSON STRING on some feeds — parsed.
+function lbBgFillFee(f) {
+  const o = f || {};
+  const v0 = lbNum(o.fillFee);
+  if (v0 !== null) return { fee: v0, ccy: String(o.fillFeeCoin || '') };
+  let fd = o.feeDetail;
+  if (typeof fd === 'string') { try { fd = JSON.parse(fd); } catch (e) { fd = null; } }
+  if (Array.isArray(fd)) {
+    let tot = 0, ccy = '';
+    for (const d0 of fd) {
+      const d = d0 || {};
+      let v = lbNum(d.totalFee);
+      if (v === null) v = lbNum(d.fee);
+      if (v !== null) { tot += Number(v); ccy = String(d.feeCoin || ccy); }
+    }
+    if (o.baseVolume !== undefined && o.baseVolume !== null) {
+      const bv = lbNum(o.baseVolume), acc = lbNum(o.accBaseVolume);
+      // lbNum-trimmed strings compare exactly like the engine's Decimal ==.
+      if (bv === null || acc === null || bv !== acc) return { fee: '0', ccy: '' };
+    }
+    return { fee: lbFmt(tot), ccy: ccy };
+  }
+  if (fd && typeof fd === 'object') {
+    return { fee: lbNum(fd.totalFee) || '0', ccy: String(fd.feeCoin || '') };
+  }
+  return { fee: '0', ccy: '' };
+}
+// norm_bitget_fill twin. Accepts BOTH a REST fills row (mix
+// /mix/order/fills and spot /spot/trade/fills) and a WS orders-channel fill
+// delta, so the follow-on push lane reuses this untouched. exec_id =
+// tradeId — the ONE id present on both paths, and the SAME id space the
+// engine's normalizer uses, so "Save to server" dedupes against engine rows.
+// Qty prefers `baseVolume`: a WS delta carries the ORDER's `size` alongside
+// it and on spot that `size` is the QUOTE amount for buys, so size-first
+// records quote qty (a $20 order rendered as 1.3M) and corrupts the
+// average-entry replay. baseVolume is always the fill's BASE qty; REST rows
+// don't carry it and keep using `size` (base there).
+function lbNormBitgetFill(f, market) {
+  if (!f || typeof f !== 'object') return null;
+  const sym = String(f.symbol || f.instId || '');
+  const bv = lbNum(f.baseVolume);
+  const sz = bv !== null ? bv : lbNum(f.size);
+  if (!sym || sz === null || !(Number(sz) > 0)) return null;
+  const mk = market === 'spot' ? 'spot' : 'futures';
+  const px = lbNum(f.priceAvg) || lbNum(f.price) || lbNum(f.fillPrice) || '0';
+  const side = String(f.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
+  const ff = lbBgFillFee(f);
+  let feeD = -Number(ff.fee || 0);             // charged = negative → flip
+  // Spot fees charged in the RECEIVED currency (base on buys) → ×price.
+  if (mk === 'spot' && ff.ccy && sym.slice(-ff.ccy.length) !== ff.ccy) feeD = feeD * Number(px);
+  // Python-`or` truthiness twin: '' / null / numeric 0 fall through, '0' does not.
+  const tpick = (v) => (v === undefined || v === null || v === '' || v === 0) ? null : v;
+  const traw = tpick(f.cTime) !== null ? f.cTime
+             : (tpick(f.fillTime) !== null ? f.fillTime
+             : (tpick(f.uTime) !== null ? f.uTime : 0));
+  let ts = Math.floor(Number(traw));
+  if (!Number.isFinite(ts)) ts = 0;
+  return {
+    venue: 'bitget', market: mk, symbol: sym,
+    side: side, posSide: '',
+    order_px: '', exec_px: px, qty: sz,
+    value: lbFmt(Number(px) * Number(sz)),
+    fee: lbFmt(feeD),
+    closed_pnl: lbNum(f.profit) || '0',
+    kind: 'trade', funding: '0',
+    ts: ts,
+    exec_id: String(f.tradeId || ''),
+  };
+}
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
 function lbFillKey(f) {
@@ -2771,6 +2854,14 @@ function gateCancelGone(msg) {
 function bitgetSign(secret, ts, method, path, body) {
   const msg = String(ts) + String(method).toUpperCase() + String(path) + String(body || '');
   return crypto.createHmac('sha256', String(secret)).update(msg, 'utf8').digest('base64');
+}
+// #2247 private-WS login signature (engine bitget_ws_login_sig twin). Same
+// HMAC-SHA256/base64 primitive as the REST signer over a FIXED
+// '<ts>GET/user/verify' message — but the timestamp is epoch SECONDS here,
+// while every REST header stamps MILLISECONDS. Feeding ms returns error
+// 30005 (login failure) with no hint about which field is wrong.
+function bitgetWsLoginSig(secret, tsSec) {
+  return bitgetSign(secret, tsSec, 'GET', '/user/verify', '');
 }
 
 const BITGET_ERRORS = {
@@ -5220,6 +5311,7 @@ function createTradeNative(opts) {
     try { if (venue) hlPushClose(venue); else hlPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bybPushClose(venue); else bybPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) gatePushClose(venue); else gatePushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) bgPushClose(venue); else bgPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -7345,6 +7437,280 @@ function createTradeNative(opts) {
                           { reduceOnly: true, trigger: intent.trigger, closeOnTrigger: true });
     if (!r.ok) return r;
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // --- #2247 Bitget account push lane --------------------------------------
+  // Bitget serves EVERY private channel on ONE socket
+  // (wss://ws.bitget.com/v2/ws/private) — engine BitgetPrivateCache twin.
+  // Login is a single op frame whose signature is HMAC-SHA256/base64 over
+  // '<epoch SECONDS>GET/user/verify' (bitgetWsLoginSig): the REST signer's
+  // MILLISECOND stamp is rejected here. Then five subscribes, per instType:
+  // USDT-FUTURES account/positions/orders + SPOT account/orders.
+  // There is NO private fills channel — FILLS ride the ORDERS channel
+  // deltas (a row carrying tradeId with baseVolume>0 IS one fill;
+  // accBaseVolume is the running total), exactly like bitget_order_apply.
+  // ONE socket, but the panel lane stays MARKET-SCOPED (two scopes, sp/fu,
+  // one lseq each): Bitget order ids are per-market sequences, so a
+  // both-markets tombstone sweep could bury an unrelated order (gate rule).
+  // Every fill delta rides the slot's REST-poll fill RING (bgFillPush), so
+  // the local blotter drain, the acct read's lbFills graft and the push
+  // event all dedupe against ONE side-inclusive tradeId seen-set — a fill
+  // the poll recorded milliseconds earlier can never re-push, and a pushed
+  // read serves rows the store already has instead of racing them.
+  // Pending PLAN orders (stop family, 'pl:<id>') do NOT ride these channels
+  // (they live on the separate orders-algo channel the engine deliberately
+  // never connects to): the ack-time bgMutKick plus the push-kicked acct
+  // read cover their badge latency, exactly like Gate's price orders. An
+  // honest poll beats pretending the lane covers them.
+  // Keepalive is the literal text 'ping' → 'pong' (Bitget drops a conn
+  // quiet for 30s). Rides the proxy agent like all shell traffic (krWsDial).
+  const BG_PUSH_WS_URL = 'wss://ws.bitget.com/v2/ws/private';
+  const BG_PUSH_PING_MS = 25000;
+  const BG_PUSH_STALL_MS = 90000;
+  // engine _BITGET_OPEN_STATUSES twin — anything else removes the badge.
+  const BG_PUSH_OPEN_ST = { live: 1, new: 1, init: 1, partially_filled: 1, partial_fill: 1 };
+  const bgPushSessions = {};
+  const bgPushPend = {};
+  let bgPushTimer = null;
+  function bgPushFlush() {
+    bgPushTimer = null;
+    const evs = krPushDrain(bgPushPend, (key) => {
+      const sess = bgPushSessions[key.slice(0, key.indexOf('|'))];
+      if (!sess) return 0;
+      return key.slice(key.indexOf('|') + 1) === 'spot' ? sess.sp.lseq : sess.fu.lseq;
+    }, Date.now(), 'bitget');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      // a mutation observed on the push beat invalidates the acct-read memo
+      // (Binance flush pattern) so the push-kicked read never serves stale.
+      try { execAcctRead.bust('bitget', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('bitget'); } catch (e) { /* #2131 hot lane */ }
+      tdiag('acct', 'bitget_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    // push-beat local-blotter drain (HL/Gate pattern): fills land in the
+    // local store on the flush itself (idempotent — lbDrain dedups by
+    // exec_id), so the read that follows serves recorded rows.
+    try {
+      for (const ev of evs) {
+        if (ev && ev.kinds && ev.kinds.indexOf('fill') >= 0)
+          lbDrain(String(ev.slot || 'bitget'), 'bitget');
+      }
+    } catch (e) { /* local store off — panel read drains later */ }
+  }
+  function bgPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(bgPushPend, scope._pk, kind, id, row);
+    if (!bgPushTimer) {
+      bgPushTimer = setTimeout(bgPushFlush, KR_PUSH_COALESCE_MS);
+      if (bgPushTimer && typeof bgPushTimer.unref === 'function') bgPushTimer.unref();
+    }
+  }
+  function bgPushScope(pk) {
+    return { lseq: 0, posSyms: null, _pk: pk };
+  }
+  function bgPushClose(slot) {
+    const sess = bgPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    try { if (sess.ws) sess.ws.terminate(); } catch (e) { /* gone */ }
+    sess.ws = null; sess.up = false;
+    delete bgPushSessions[slot];
+  }
+  function bgPushCloseAll() {
+    for (const k of Object.keys(bgPushSessions)) bgPushClose(k);
+  }
+  function bgPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key || !creds.pass) return null;
+    slot = String(slot || 'bitget');
+    let sess = bgPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { bgPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = bgPushSessions[slot] = {
+        slot: slot, tail: creds.key, closed: false, route: route, creds: creds,
+        running: false, up: false, ws: null, err: null, lastMsg: 0, tOff: 0,
+        sp: bgPushScope(slot + '|spot'),
+        fu: bgPushScope(slot + '|fut'),
+      };
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    if (!sess.running) bgPushLoop(slot, sess);
+    return sess;
+  }
+  function bgPushLoop(slot, sess) {
+    sess.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (bgPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          // signer clock discipline (native-venue-time-sync): the login
+          // frame stamps venue-synced seconds, never raw Date.now().
+          sess.tOff = await ensureVenueTime('bitget', null, sess.route);
+          await bgPushConn(slot, sess);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          sess.err = 'Bitget push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'bitget_push_err', { m: String(sess.err).slice(0, 120) });
+        }
+        sess.up = false; sess.ws = null;
+        if (sess.closed || bgPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      sess.running = false;
+    })().catch(() => { sess.running = false; });
+  }
+  function bgPushConn(slot, sess) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(BG_PUSH_WS_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      sess.ws = ws;
+      let settled = false;
+      let acked = 0;
+      const expect = 5;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        sess.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // literal-text keepalive (public-WS convention): 'ping' → 'pong'.
+      // A 90s frame gap tears down for a clean redial.
+      const kaT = setInterval(() => {
+        try { ws.send('ping'); } catch (e) { /* dying */ }
+        if (Date.now() - (sess.lastMsg || 0) > BG_PUSH_STALL_MS) done(new Error('stream stalled'));
+      }, BG_PUSH_PING_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      ws.on('open', () => {
+        sess.lastMsg = Date.now();
+        try {
+          const tsec = String(venueStampSec(sess.tOff));
+          ws.send(JSON.stringify({ op: 'login', args: [{
+            apiKey: sess.creds.key, passphrase: String(sess.creds.pass || ''),
+            timestamp: tsec, sign: bitgetWsLoginSig(sess.creds.secret, tsec),
+          }] }));
+        } catch (e) { done(e); return; }
+      });
+      ws.on('ping', () => { sess.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        sess.lastMsg = Date.now();
+        const txt = buf.toString();
+        if (txt === 'pong' || txt === 'ping') return;   // literal keepalive
+        let msg = null;
+        try { msg = JSON.parse(txt); } catch (e) { return; }
+        const evn = String((msg && msg.event) || '');
+        if (evn === 'error') {
+          done(new Error('bitget ws: ' + String((msg && msg.msg) || 'error')));
+          return;
+        }
+        if (evn === 'login') {
+          try {
+            for (const a of [
+              { instType: 'USDT-FUTURES', channel: 'account', coin: 'default' },
+              { instType: 'USDT-FUTURES', channel: 'positions', instId: 'default' },
+              { instType: 'USDT-FUTURES', channel: 'orders', instId: 'default' },
+              { instType: 'SPOT', channel: 'account', coin: 'default' },
+              { instType: 'SPOT', channel: 'orders', instId: 'default' },
+            ]) ws.send(JSON.stringify({ op: 'subscribe', args: [a] }));
+          } catch (e) { done(e); return; }
+          return;
+        }
+        if (evn === 'subscribe') {
+          acked++;
+          if (acked >= expect && !sess.up) {
+            sess.up = true; sess.err = null;
+            tdiag('acct', 'bitget_push_up', { s: slot });
+          }
+          return;
+        }
+        if (evn) return;   // unknown control frame
+        try { bgPushEvApply(sess, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function bgPushEvApply(sess, msg) {
+    const arg = (msg && msg.arg) || {};
+    const ch = String(arg.channel || '');
+    if (!ch) return;
+    const mk = String(arg.instType || '').toUpperCase() === 'SPOT' ? 'spot' : 'futures';
+    const sc = mk === 'spot' ? sess.sp : sess.fu;
+    const rows = Array.isArray(msg && msg.data) ? msg.data : [];
+    // A subscribe SNAPSHOT frame seeds dedup only — it must never replay as
+    // new fills (push lanes never double-deliver). The REST acct read is the
+    // state seed; this lane ships deltas.
+    const snap = String((msg && msg.action) || '') === 'snapshot';
+    if (ch === 'orders') {
+      const F = mk === 'spot' ? bgFillRing(sess.slot).sp : bgFillRing(sess.slot).fu;
+      for (const o of rows) {
+        // fill delta (engine bitget_order_apply rule): tradeId present and
+        // baseVolume>0 = THIS fill's qty. The RAW row rides the push —
+        // lbNormBitgetFill already reads the WS orders-delta shape, so the
+        // panel/local-blotter normalizers need no new case.
+        const tid = o && o.tradeId != null ? String(o.tradeId) : '';
+        if (tid && parseFloat(o.baseVolume) > 0) {
+          if (snap) { const k = bgRingKey(o); if (k) F.seen[k] = 1; }
+          else if (bgFillPush(F, [o]) > 0) {
+            // fid namespace = '<tradeId>:<side>' — byte-identical to the
+            // panel's lbFill/state-fill eid, so ONE chime latch covers the
+            // pushed fill and the same fill arriving on the next acct read
+            // (a '|' ring key here would double-chime every fill).
+            krLseq(sc); bgPushSc(sc, 'fill', tid + ':' + String(o.side || '').toLowerCase(), o);
+            if (mk === 'futures') { krLseq(sc); bgPushSc(sc, 'pos'); }   // a fill moves the position
+          }
+        }
+        const oid = o && o.orderId != null ? String(o.orderId) : '';
+        if (snap || !oid) continue;
+        const st = String((o && o.status) || '').toLowerCase();
+        if (BG_PUSH_OPEN_ST[st]) { krLseq(sc); bgPushSc(sc, 'order', null, o); }
+        else { krLseq(sc); bgPushSc(sc, 'ordgone', oid); }
+      }
+      return;
+    }
+    if (ch === 'positions' && mk === 'futures') {
+      // FULL-LIST semantics (engine bitget_position_apply): every payload is
+      // the whole position book, and a closed position simply disappears —
+      // an empty data:[] frame is the "everything is flat" delta. Symbols
+      // that dropped out push a synthetic flat row so the panel removes the
+      // posrow (and sweeps its reduce-only stops) on THIS beat instead of
+      // waiting for a poll to notice the absence.
+      const seen = {};
+      for (const p of rows) {
+        const sym = String((p && (p.instId || p.symbol)) || '');
+        if (sym) seen[sym] = 1;
+        if (!snap) { krLseq(sc); bgPushSc(sc, 'pos', null, p); }
+      }
+      if (!snap) {
+        for (const sym of Object.keys(sc.posSyms || {})) {
+          if (seen[sym]) continue;
+          krLseq(sc); bgPushSc(sc, 'pos', null, { instId: sym, symbol: sym, total: '0' });
+        }
+      }
+      sc.posSyms = seen;
+      return;
+    }
+    if (ch === 'account' && !snap) {
+      for (const b of rows) { krLseq(sc); bgPushSc(sc, 'bal', null, b); }
+    }
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
+  // Binance/Bybit/Gate pattern): the WS echo lands ~100ms later, but the
+  // local bump makes the badge/posrow read fire immediately after the REST
+  // ack — and it is the ONLY lane pending plan orders have, since they
+  // never stream. Market-scoped: Bitget order ids are per-market sequences.
+  function bgMutKick(slot, kind, oid, market) {
+    const sess = bgPushSessions[String(slot || 'bitget')];
+    if (!sess) return;
+    const sc = market === 'spot' ? sess.sp : sess.fu;
+    if (kind === 'ordgone' && oid) {
+      krLseq(sc); bgPushSc(sc, 'ordgone', String(oid));
+    } else {
+      krLseq(sc); bgPushSc(sc, 'order');
+    }
   }
 
   // --- Bitget ------------------------------------------------------------------
@@ -11198,6 +11564,153 @@ function createTradeNative(opts) {
              futOrders: fo.rows, priceOrders: po.rows };
   }
 
+  // ── Bitget device-local blotter live lane (#2246) ────────────────────────
+  // Bitget has no shell-side private WS session yet (the push lane is the
+  // follow-on task), so the local blotter's LIVE source is a paced REST
+  // fills poll that feeds the SAME per-slot raw ring shape every push venue
+  // uses. lbDrain consumes it through the normal incremental cursor /
+  // exactly-once merge / journal / prune path — nothing downstream needs a
+  // Bitget special case. The poll is single-flight and TTL-gated, and it is
+  // driven ONLY by the lblot ops, so a slot that never uses the local
+  // blotter pays no extra REST traffic at all.
+  const BG_FILL_RING_CAP = 600;
+  const BG_LIVE_TTL_MS = 1200;                 // ≥1 fetch per panel lblot beat
+  const BG_LIVE_OVERLAP_MS = 90000;            // per-market re-ask window
+  const BG_LIVE_COLD_MS = 15 * 60 * 1000;      // first poll of a session
+  const BG_LIVE_PAGES = 4;                     // bounded — backfill owns depth
+  const BG_PAGE_GAP_MS = 450;                  // HB_PAGE_GAP_MS twin (own scope)
+  const bgFillRings = {};   // slot → { sp, fu, spTs, fuTs, t, busy }
+  function bgFillRing(slot) {
+    let R = bgFillRings[String(slot)];
+    if (!R) {
+      R = bgFillRings[String(slot)] = {
+        sp: { rows: [], seen: {}, rev: 0 }, fu: { rows: [], seen: {}, rev: 0 },
+        spTs: 0, fuTs: 0, t: 0, busy: null, tail: '',
+      };
+    }
+    return R;
+  }
+  // Ring key is side-INCLUSIVE: a self-match returns TWO rows sharing one
+  // tradeId (opposite sides) and a side-less key silently drops a leg,
+  // leaving the trade stuck open (lbFillKey carries the same rule).
+  function bgRingKey(f) {
+    const eid = String((f && f.tradeId) || '');
+    return eid ? eid + '|' + String((f && f.side) || '').toLowerCase() : '';
+  }
+  function bgFillPush(F, rows) {
+    let n = 0;
+    for (const f of (rows || [])) {
+      const k = bgRingKey(f);
+      if (!k || F.seen[k]) continue;
+      F.seen[k] = 1;
+      F.rows.push(f);
+      lbSrcTouch(F);   // #2230 one touch per pushed row (drain cursor)
+      n++;
+    }
+    if (F.rows.length > BG_FILL_RING_CAP) {
+      const drop = F.rows.splice(0, F.rows.length - BG_FILL_RING_CAP);
+      // evicted rows are far older than any re-ask window, so forgetting
+      // their keys cannot resurrect them; the store-level dedupe is the
+      // real exactly-once guard either way.
+      for (const f of drop) { const k = bgRingKey(f); if (k) delete F.seen[k]; }
+    }
+    return n;
+  }
+  // ONE cursor walk for every Bitget fill consumer (live poll, backfill,
+  // re-import): engine BitgetHistory._fills_walk twin. Mix nests rows under
+  // data.fillList, spot returns a bare list; `idLessThan` pages OLDER on the
+  // last row's tradeId. `full:true` = the page cap was hit with a full page
+  // still pending — the caller decides whether that is a gap note or a hard
+  // failure. Never throws.
+  async function bgFillsWalk(creds, market, frm, to, route, maxPages, gapMs) {
+    const rows = [];
+    let after = '';
+    let pages = 0;
+    const cap = maxPages > 0 ? maxPages : 1;
+    for (let page = 0; page < cap; page++) {
+      const path = market === 'futures' ? '/api/v2/mix/order/fills'
+                                        : '/api/v2/spot/trade/fills';
+      const params = market === 'futures'
+        ? [['productType', BITGET_PRODUCT_TYPE], ['startTime', String(Math.floor(frm))],
+           ['endTime', String(Math.ceil(to))], ['limit', '100']]
+        : [['startTime', String(Math.floor(frm))], ['endTime', String(Math.ceil(to))],
+           ['limit', '100']];
+      if (after) params.push(['idLessThan', after]);
+      if (page && gapMs > 0) await new Promise((rs) => setTimeout(rs, gapMs));
+      let r;
+      try { r = await bitgetRequest(creds, 'GET', path, params, null, route); }
+      catch (e) { r = { ok: false, message: (e && e.message) || 'Bitget fills fetch failed' }; }
+      pages++;
+      if (!r || !r.ok) {
+        return { ok: false, rows: rows, full: false, pages: pages,
+                 message: (r && r.message) || 'Bitget ' + market + ' fills fetch failed' };
+      }
+      const d = (r.data || {}).data;
+      const lst = (d && !Array.isArray(d) && typeof d === 'object') ? d.fillList : d;
+      const page_rows = Array.isArray(lst) ? lst.filter((x) => x && typeof x === 'object') : [];
+      for (const f of page_rows) rows.push(f);
+      if (page_rows.length < 100) return { ok: true, rows: rows, full: false, pages: pages };
+      after = String((page_rows[page_rows.length - 1] || {}).tradeId || '');
+      // A FULL page with no usable cursor is a truncation, not an end of
+      // history — reporting it as complete is exactly how a partial history
+      // gets activated. `full` is the honest verdict either way.
+      if (!after) return { ok: true, rows: rows, full: true, pages: pages };
+    }
+    return { ok: true, rows: rows, full: true, pages: pages };   // cap hit
+  }
+  function bgFillTs(f) {
+    const v = (f && (f.cTime || f.fillTime || f.uTime)) || 0;
+    const t = Math.floor(Number(v));
+    return Number.isFinite(t) ? t : 0;
+  }
+  // Paced live refresh for ONE Bitget slot. Single-flight + TTL-gated (N
+  // windows polling the same slot in one beat cost ONE fetch). Best-effort
+  // by design: a failed poll means no new rows this beat — the next beat and
+  // the gap backfill recover. PER-MARKET high-water marks: one shared mark
+  // would let a recent futures fill truncate the spot re-ask window.
+  async function lbBgLive(venue, slot, route) {
+    if (venue !== 'bitget') return;
+    const R = bgFillRing(slot);
+    if (R.busy) { try { await R.busy; } catch (e) {} return; }
+    const now = Date.now();
+    if ((now - (R.t || 0)) < BG_LIVE_TTL_MS) return;
+    const creds = credsGet(slot);
+    if (!creds || !creds.key || !creds.pass) return;
+    R.t = now;
+    const p = (async () => {
+      for (const mk of ['spot', 'futures']) {
+        const key = mk === 'spot' ? 'spTs' : 'fuTs';
+        const F = mk === 'spot' ? R.sp : R.fu;
+        const frm = R[key] > 0 ? Math.max(0, R[key] - BG_LIVE_OVERLAP_MS)
+                               : now - BG_LIVE_COLD_MS;
+        const w = await bgFillsWalk(creds, mk, frm, now + 1000, routeNorm(route),
+                                    BG_LIVE_PAGES, BG_PAGE_GAP_MS);
+        if (!w.ok) continue;                   // best-effort — next beat retries
+        bgFillPush(F, w.rows);
+        let hwm = R[key] || 0;
+        for (const f of w.rows) { const t = bgFillTs(f); if (t > hwm) hwm = t; }
+        R[key] = hwm > 0 ? hwm : Math.max(R[key] || 0, now - BG_LIVE_OVERLAP_MS);
+      }
+    })();
+    R.busy = p;
+    try { await p; } catch (e) { /* best-effort */ }
+    if (R.busy === p) R.busy = null;
+  }
+  // Recent normalized live rows for the panel's fill chime / spot cost basis
+  // (the chart triangles read the local STORE). Read-only view of the ring —
+  // costs no REST call, so the account read stays exactly as expensive as
+  // before for slots that never touch the local blotter.
+  const BG_LIVE_SHARE_N = 200;
+  function bgLiveFills(slot) {
+    const R = bgFillRings[String(slot)];
+    if (!R) return [];
+    const out = [];
+    for (const f of R.sp.rows) { const n = lbNormBitgetFill(f, 'spot'); if (n) out.push(n); }
+    for (const f of R.fu.rows) { const n = lbNormBitgetFill(f, 'futures'); if (n) out.push(n); }
+    out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    return out.length > BG_LIVE_SHARE_N ? out.slice(out.length - BG_LIVE_SHARE_N) : out;
+  }
+
   // Bitget native account read (#1716): signed GETs mirroring BitgetAdapter's
   // state seed. Spot + futures are SEPARATE accounts (no unified pool).
   // Futures sizes are plain BASE coin (no multiplier). Fail-closed per leg.
@@ -11206,6 +11719,10 @@ function createTradeNative(opts) {
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     if (!creds.pass) return { ok: false, message: 'Bitget API passphrase missing — re-provision Native trading on this device' };
     const route = routeNorm(intent.route);
+    // #2247: acct reads keep the private push socket warm (push-driven
+    // display) — no-op while the loop already runs. The read then RE-ATTACHES
+    // push fills to the fresh snapshot panel-side (binance-shell-push rule).
+    try { bgPushEnsure(intent.credSlot || 'bitget', creds, route); } catch (e) { /* REST-only */ }
     const pt = BITGET_PRODUCT_TYPE;
     const spotAssets = await bitgetRequest(creds, 'GET', '/api/v2/spot/account/assets', null, null, route);
     if (!spotAssets.ok) return spotAssets;
@@ -11249,9 +11766,14 @@ function createTradeNative(opts) {
     }
     const so = await walk('/api/v2/spot/trade/unfilled-orders', []);
     if (!so.ok) return so;
+    // #2246 additive: recent LOCAL fills for this credential slot (empty
+    // unless the local blotter poll has warmed the ring for this slot). The
+    // panel only reads it while the local blotter is ACTIVE for Bitget —
+    // capability alone must never suppress the server fills.
     return { ok: true,
              spotAssets: dl(spotAssets), futAccounts: dl(futAcc), positions: dl(pos),
-             futOrders: fo.rows, planOrders: plans, spotOrders: so.rows };
+             futOrders: fo.rows, planOrders: plans, spotOrders: so.rows,
+             lbFills: bgLiveFills(intent.credSlot || 'bitget') };
   }
 
   // MEXC native account read (#1716): TWO hosts — spot api.mexc.com
@@ -12084,6 +12606,53 @@ function createTradeNative(opts) {
     return _dgLine({ ok: true, symbol: sym, leverage: levOf(r.data) });
   }
 
+  // #2247 Bitget futures leverage GET/POST (device-signed; engine
+  // leverage_config/set_leverage twins). One-way CROSS by terminal
+  // convention: the read is /mix/account/account's crossedMarginLeverage
+  // (older payloads spell it crossMarginLeverage) and the write posts a
+  // bare {symbol, productType, marginCoin, leverage} — NO holdSide, which
+  // is the hedge-mode-only field (sending it in one-way mode is the 43011
+  // "holdSide error" class). A symbol whose leverage was never configured
+  // reads null (the chip shows the venue default), never an error.
+  async function execBitgetLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'bitget');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    if (!creds.pass) return _dgLine({ ok: false, message: 'Bitget API passphrase missing — re-provision Native trading on this device' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '');
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    const levOf = (d) => {
+      const v = bnNum((d || {}).crossedMarginLeverage) || bnNum((d || {}).crossMarginLeverage);
+      return v != null && Number(v) > 0 ? v : null;
+    };
+    if (intent.what === 'set') {
+      const lev = parseFloat(intent.leverage);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      if (Math.floor(lev) !== lev) return _dgLine({ ok: false, message: 'Leverage must be a whole number' });
+      const r = await bitgetRequest(creds, 'POST', '/api/v2/mix/account/set-leverage', null,
+        { symbol: sym, productType: BITGET_PRODUCT_TYPE, marginCoin: 'USDT',
+          leverage: String(lev) }, route);
+      if (!r.ok) return _dgLine(r);
+      return _dgLine({ ok: true, symbol: sym, leverage: String(lev) });
+    }
+    const r = await bitgetRequest(creds, 'GET', '/api/v2/mix/account/account',
+      [['symbol', sym], ['productType', BITGET_PRODUCT_TYPE], ['marginCoin', 'USDT']],
+      null, route);
+    if (!r.ok) return _dgLine(r);
+    return _dgLine({ ok: true, symbol: sym, leverage: levOf((r.data || {}).data) });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -12909,6 +13478,14 @@ function createTradeNative(opts) {
       const s = gatePushSessions[slot];
       return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
     }
+    if (venue === 'bitget') {
+      // #2246/#2247: the SAME two per-market rings carry both the paced REST
+      // fills poll and the private-WS order deltas (one side-inclusive
+      // tradeId seen-set), so the no-news gate and the incremental cursor
+      // work exactly as they do for the push venues.
+      const s = bgFillRings[slot];
+      return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
+    }
     return '-';
   }
   const _lbDrainAt = {};    // slot → { t, sig } (#2230 no-news gate)
@@ -13008,6 +13585,15 @@ function createTradeNative(opts) {
           return lbNormGateFill(r, 'futures', mult);
         });
       }
+    } else if (venue === 'bitget') {
+      // #2246: two per-market REST-poll rings (lbBgLive). Rows are RAW
+      // venue fill rows — the market comes from the RING, never from the
+      // row, because a Bitget spot and a mix fill row are shape-identical.
+      const R = bgFillRings[slot];
+      if (R) {
+        ring('bg.sp', R.sp, (r) => lbNormBitgetFill(r, 'spot'));
+        ring('bg.fu', R.fu, (r) => lbNormBitgetFill(r, 'futures'));
+      }
     }
     cur.skip = skipped;
     if (aid) for (const f of fills) f.aid = aid;
@@ -13043,7 +13629,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -13056,6 +13642,7 @@ function createTradeNative(opts) {
     if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
     const slot = String(intent.credSlot || venue);
     await lbHlWarm(venue, intent.route);
+    await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const t0 = lbT();
@@ -13182,6 +13769,7 @@ function createTradeNative(opts) {
     if (!lbVenueOk(venue)) return { ok: false, message: 'local blotter not supported for this venue' };
     const slot = String(intent.credSlot || venue);
     await lbHlWarm(venue, intent.route);
+    await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const dmSig = intent.displayMap ? JSON.stringify(intent.displayMap) : '';
@@ -13558,6 +14146,68 @@ function createTradeNative(opts) {
         _dgSpotRows = rawSpot.length;
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'bitget') {
+        // #2246: account-wide cursor walks over BOTH fill endpoints (engine
+        // BitgetHistory._fills_walk twin). There is no symbol universe to
+        // resolve — coverage hinges purely on the call/page caps, so ANY cap
+        // hit or overflowing page reports covOk:false and the panel keeps
+        // the server blotter instead of activating on a partial history.
+        // Chunked into ≤7-day windows (the engine's proven span) with
+        // PER-MARKET windows: one shared high-water mark would let a recent
+        // futures fill truncate the spot window.
+        const BG_BF_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const BG_BF_CALL_CAP = 60;
+        const BG_BF_CHUNK_PAGES = 12;
+        let calls = 0;
+        let failMsg = null;
+        const rawFut = [], rawSpot = [];
+        for (const mk of ['futures', 'spot']) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          let w0 = Math.max(0, Math.floor(bfFrm(mk, mk)));
+          let span = BG_BF_SPAN_MS;
+          while (w0 < now) {
+            const left = BG_BF_CALL_CAP - calls;
+            if (left <= 0) {
+              gap = true; covOk = false;
+              notes.push(mk + ' fill call cap reached — history is incomplete');
+              break;
+            }
+            const w1 = Math.min(now, w0 + span);
+            if (calls) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+            const wk = await bgFillsWalk(creds, mk, w0, w1 + 1, route,
+                                         Math.min(BG_BF_CHUNK_PAGES, left), HB_PAGE_GAP_MS);
+            calls += wk.pages | 0;
+            if (!wk.ok) { failMsg = wk.message || ('Bitget ' + mk + ' fills fetch failed'); break; }
+            for (const f of wk.rows) sink.push(f);
+            if (wk.full) {
+              // chunk overflowed the page cap — halve it until it fits
+              // (already-fetched rows re-normalize; the merge dedups them)
+              if (w1 - w0 <= 3600 * 1000) {
+                gap = true; covOk = false;
+                notes.push(mk + ' fills denser than the page cap in one hour — history is incomplete');
+                w0 = w1 + 1;
+              } else span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+          if (failMsg) break;
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        const fills = [];
+        // Market comes from the ENDPOINT, never from the row: a Bitget spot
+        // and a mix fill row are shape-identical.
+        for (const f of rawFut) { const n = lbNormBitgetFill(f, 'futures'); if (n) fills.push(n); }
+        for (const f of rawSpot) { const n = lbNormBitgetFill(f, 'spot'); if (n) fills.push(n); }
+        _dgFutRows = rawFut.length;
+        _dgSpotRows = rawSpot.length;
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -13834,6 +14484,45 @@ function createTradeNative(opts) {
         riFutRows = rawFut.length;
         riSpotRows = rawSpot.length;
         for (const f of rawSpot) { const n = lbNormGateFill(f, 'spot', null); if (n) fills.push(n); }
+      } else if (venue === 'bitget') {
+        // #2246: the backfill's walks over the EXPLICIT window. Venue-truth
+        // contract — a truncated fetch of ANY kind fails VISIBLY (riFail),
+        // never a short history reported as success.
+        const BG_RI_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const BG_RI_CALL_CAP = 80;
+        const BG_RI_CHUNK_PAGES = 12;
+        let calls = 0;
+        const rawFut = [], rawSpot = [];
+        const mks = market === 'spot' ? ['spot']
+          : market === 'futures' ? ['futures'] : ['futures', 'spot'];
+        for (const mk of mks) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          let w0 = Math.max(0, Math.floor(w.frm));
+          let span = BG_RI_SPAN_MS;
+          while (w0 < w.to) {
+            const left = BG_RI_CALL_CAP - calls;
+            if (left <= 0) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            const w1 = Math.min(w.to, w0 + span);
+            if (calls) await sleep(HB_PAGE_GAP_MS);
+            const wk = await bgFillsWalk(creds, mk, w0, w1 + 1, route,
+                                         Math.min(BG_RI_CHUNK_PAGES, left), HB_PAGE_GAP_MS);
+            calls += wk.pages | 0;
+            if (!wk.ok) return riFail(wk.message || ('Bitget ' + mk + ' fills fetch failed'));
+            for (const f of wk.rows) sink.push(f);
+            if (wk.full) {
+              if (w1 - w0 <= 3600 * 1000) {
+                return riFail('Bitget ' + mk + ' fills denser than the page cap in one hour — narrow the date range');
+              }
+              span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+        }
+        riFutRows = rawFut.length;
+        riSpotRows = rawSpot.length;
+        for (const f of rawFut) { const n = lbNormBitgetFill(f, 'futures'); if (n) fills.push(n); }
+        for (const f of rawSpot) { const n = lbNormBitgetFill(f, 'spot'); if (n) fills.push(n); }
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -13992,6 +14681,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'hyperliquid') return await execHlLeverage(intent);   // #2000
       if (intent.venue === 'bybit') return await execBybLeverage(intent);   // #2051
       if (intent.venue === 'gate') return await execGateLeverage(intent);   // #2153
+      if (intent.venue === 'bitget') return await execBitgetLeverage(intent);   // #2247
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -14100,7 +14790,24 @@ function createTradeNative(opts) {
         }
         return r;
       }
-      if (intent.venue === 'bitget') return await execBitget(creds, intent, route);
+      if (intent.venue === 'bitget') {
+        const r = await execBitget(creds, intent, route);
+        // #2247: a successful trade ack kicks the push lane awake (no-op
+        // while the loop runs) and stamps an optimistic mutation so the
+        // badge/posrow read fires immediately after the REST ack. Market-
+        // scoped — bitget order id spaces are per-market (spot vs futures).
+        if (r && r.ok) {
+          try { bgPushEnsure(intent.credSlot || 'bitget', creds, route); }
+          catch (e) { /* REST path */ }
+          try {
+            const bmk = intent.market === 'spot' ? 'spot' : 'futures';
+            if (intent.op === 'cancel' && intent.orderID) {
+              bgMutKick(intent.credSlot || 'bitget', 'ordgone', String(intent.orderID), bmk);
+            } else bgMutKick(intent.credSlot || 'bitget', 'order', null, bmk);
+          } catch (e) { /* diag-only */ }
+        }
+        return r;
+      }
       if (intent.venue === 'kucoin') return await execKucoin(creds, intent, route);
       if (intent.venue === 'bitmex') return await execBitmex(creds, intent, route);
       if (intent.venue === 'mexc') return await execMexc(creds, intent, route);
@@ -14304,6 +15011,20 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'gate') continue;
             const c = credsGet(k);
             if (c) { try { gatePushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2247: same one-time kick for the Bitget private push socket (ONE
+      // conn carrying both instTypes: orders/positions/account); loop
+      // self-maintains.
+      if (venue === 'bitget') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'bitget') continue;
+            const c = credsGet(k);
+            if (c) { try { bgPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
@@ -14959,6 +15680,7 @@ module.exports = {
   lbHlPageStep,
   lbNormBybFill,
   bybWsAuthSig,
+  bitgetWsLoginSig,
   bybOrdEffect,
   // pure — #2230 no-news local-blotter drain gate
   LB_DRAIN_IDLE_MS,
