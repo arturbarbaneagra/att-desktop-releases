@@ -1423,8 +1423,18 @@ function lbNormBybFill(f) {
 // drain re-normalizes once the contract map warmed). Spot fee is charged
 // in the RECEIVED currency: base-ccy fee ×price, quote as-is, other (GT
 // deduction) ⇒ 0. Gate hands NO per-fill closed PnL — '0' always (NET
-// comes from local-blotter replay panel-side). ts: create_time_ms
-// preferred, else create_time seconds ×1000.
+// comes from local-blotter replay panel-side).
+// #2237 ts rides lbGateTsMs: Gate ships BOTH units under `create_time_ms`
+// (spot = ms string, futures = seconds double — verified live on the public
+// tape 2026-08-15), so the field name proves nothing and only MAGNITUDE
+// does. Same fold as the engine's `>10**12 ? v : v*1000` order-row twin; a
+// seconds ts here would date persisted blotter rows to 1970.
+function lbGateTsMs(v) {
+  if (v == null) return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n) || !(n > 0)) return 0;
+  return Math.floor(n > 1e12 ? n : n * 1000);
+}
 // #2177 gate hedge-mode position side from a futures fill's `close_size`
 // (my_trades_timerange / re-import rows carry it; WS usertrades rows do
 // NOT → '' = unknown, replay degrades to legacy one-way netting). Gate
@@ -1471,9 +1481,8 @@ function lbNormGateFill(f, market, mult) {
   if (!eid) return null;
   const px = lbNum(f.price) || '0';
   if (!(Number(px) > 0)) return null;
-  const msRaw = f.create_time_ms != null ? Number(f.create_time_ms)
-                                         : (Number(f.create_time) || 0) * 1000;
-  const ts = Math.floor(msRaw > 0 ? msRaw : 0);
+  const ts = lbGateTsMs(f.create_time_ms != null ? f.create_time_ms
+                                                 : f.create_time);
   let row = null;
   if (market === 'futures') {
     const sz = Number(f.size);
