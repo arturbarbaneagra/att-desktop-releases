@@ -12515,12 +12515,22 @@ function createTradeNative(opts) {
   const LB_SNAP_MS = 30000;            // ordinary snapshot debounce
   const LB_SNAP_QUIET_MS = 3000;       // ... deferred while fills keep landing
   const LB_SNAP_MAX_MS = 120000;       // ... but never past this hard deadline
-  const LB_SNAP_RETRY_MS = 2000;       // failed snapshot / journal busy ⇒ retry
+  const LB_SNAP_RETRY_MS = 2000;       // failed snapshot ⇒ retry
   const lbFile = () => path.join(userDataDir(), 'local_fills_v1.json');
   const lbTmp = () => path.join(userDataDir(), 'local_fills_v1.json.tmp');
-  const lbJrnF = () => path.join(userDataDir(), 'local_fills_v1.jrn');
+  // The journal is a SEQUENCE of segments, never one rewritten file. A
+  // snapshot opens a fresh segment before it serializes and deletes the older
+  // ones only once it has landed, so no journal file is ever renamed or
+  // truncated under an append that may still be in flight — the whole class of
+  // "the rows are in neither file for a moment" simply cannot arise.
+  const LB_JRN_HARD_BYTES = 4 << 20;   // …and past this the fold cannot wait
+  const LB_JRN_STALE_WARN = 8;         // covered segments still on disk ⇒ say so
+  const LB_JRN_RE = /^local_fills_v1\.(\d+)\.jrn$/;
+  const LB_JRN_OLD = 'local_fills_v1.jrn';   // pre-segment installs (≤ v1.5.107)
+  const lbJrnF = (seq) => path.join(userDataDir(), 'local_fills_v1.' + seq + '.jrn');
   let _lbStore = null;
   let _lbJrnPend = [], _lbJrnT = null, _lbJrnBusy = false, _lbJrnBytes = 0;
+  let _lbJrnSeq = 0;   // segment appends go to right now
   let _lbSnapT = null, _lbSnapDue = 0, _lbSnapMax = 0, _lbSnapBusy = false;
   let _lbSnapAgain = false, _lbLastFill = 0, _lbPersistErr = null;
   function lbScopeIn(st, slot) {
@@ -12536,18 +12546,34 @@ function createTradeNative(opts) {
     try { d = JSON.parse(fs.readFileSync(lbFile(), 'utf8')); } catch (e) { d = null; }
     _lbStore = (d && typeof d === 'object' && d.scopes && typeof d.scopes === 'object')
       ? d : { v: 1, scopes: {} };
-    // journal replay — everything merged since the last snapshot
-    let jt = null;
-    try { jt = fs.readFileSync(lbJrnF(), 'utf8'); } catch (e) { jt = null; }
-    if (jt) {
-      const p = lbJrnParse(jt);
-      let n = 0;
-      for (const b of p.batches) {
-        try { n += lbScopeMerge(lbScopeIn(_lbStore, b.slot), b.rows); } catch (e) { /* one bad batch never blocks the store */ }
+    // Journal replay — every segment still on disk, oldest first. Replaying a
+    // segment the snapshot already contains costs nothing (the merge is
+    // exactly-once), so a segment whose delete failed can never corrupt: the
+    // sweep is free to be best-effort.
+    const segs = [];
+    try {
+      for (const f of fs.readdirSync(userDataDir())) {
+        const m = LB_JRN_RE.exec(f);
+        if (m) segs.push({ seq: +m[1], f: path.join(userDataDir(), f) });
       }
-      _lbJrnBytes = Buffer.byteLength(jt);
-      tdiag('lblot', 'jrn-replay', { k: 'lb', batches: p.batches.length,
-        rows: n, bad: p.bad, bytes: _lbJrnBytes });
+    } catch (e) { /* no dir yet */ }
+    segs.sort((a, b) => a.seq - b.seq);
+    _lbJrnSeq = segs.length ? segs[segs.length - 1].seq : 0;
+    let batches = 0, rows = 0, bad = 0;
+    for (const s of [{ seq: -1, f: path.join(userDataDir(), LB_JRN_OLD) }].concat(segs)) {
+      let jt = null;
+      try { jt = fs.readFileSync(s.f, 'utf8'); } catch (e) { continue; }
+      if (!jt) continue;
+      const p = lbJrnParse(jt);
+      for (const b of p.batches) {
+        try { rows += lbScopeMerge(lbScopeIn(_lbStore, b.slot), b.rows); } catch (e) { /* one bad batch never blocks the store */ }
+      }
+      batches += p.batches.length; bad += p.bad;
+      if (s.seq === _lbJrnSeq) _lbJrnBytes = Buffer.byteLength(jt);
+    }
+    if (batches || bad) {
+      tdiag('lblot', 'jrn-replay', { k: 'lb', seg: segs.length, batches,
+        rows, bad, bytes: _lbJrnBytes });
       lbSnapSoon(0);   // fold the journal back into the snapshot promptly
     }
     return _lbStore;
@@ -12559,7 +12585,7 @@ function createTradeNative(opts) {
     if (slot && rows && rows.length) {
       _lbLastFill = Date.now();
       const t0 = lbT();
-      _lbJrnPend.push(lbJrnLine(slot, rows));
+      lbJrnQueue(slot, rows);
       lbTap('persist.jrnline', t0);
       lbJrnArm();
       lbSnapSoon(LB_SNAP_MS);
@@ -12567,17 +12593,26 @@ function createTradeNative(opts) {
     }
     lbSnapSoon(LB_SAVE_DEBOUNCE_MS);
   }
+  function lbJrnQueue(slot, rows) {
+    _lbJrnPend.push(lbJrnLine(slot, rows));
+  }
+  // NOTE: appends keep flowing while a snapshot is in flight. Blocking them
+  // for the duration of the write would stretch a fill's exposure from the
+  // coalescing window to "however long the snapshot takes" — and those rows
+  // are not in that snapshot either, so a crash would lose them. They go into
+  // the segment the snapshot has ALREADY moved past, which it will not delete.
   function lbJrnArm() {
-    if (_lbJrnT || _lbSnapBusy || !_lbJrnPend.length) return;
+    if (_lbJrnT || !_lbJrnPend.length) return;
     _lbJrnT = setTimeout(() => { _lbJrnT = null; lbJrnFlush(); }, LB_JRN_FLUSH_MS);
   }
   function lbJrnFlush() {
-    if (_lbJrnBusy || _lbSnapBusy || !_lbJrnPend.length) return;
+    if (_lbJrnBusy || !_lbJrnPend.length) return;
     const txt = _lbJrnPend.join('');
     _lbJrnPend = [];
     _lbJrnBusy = true;
+    const seq = _lbJrnSeq;   // the segment THIS batch belongs to
     const t0 = lbT();
-    fs.appendFile(lbJrnF(), txt, (err) => {
+    fs.appendFile(lbJrnF(seq), txt, (err) => {
       _lbJrnBusy = false;
       lbTap('persist.jrnwrite', t0);
       if (err) {
@@ -12590,9 +12625,38 @@ function createTradeNative(opts) {
         return;
       }
       _lbPersistErr = null;
-      _lbJrnBytes += Buffer.byteLength(txt);
+      // a snapshot opened a new segment while this was in flight: the bytes
+      // went to the old one, which that snapshot is about to sweep.
+      if (seq === _lbJrnSeq) _lbJrnBytes += Buffer.byteLength(txt);
       if (_lbJrnBytes > LB_JRN_MAX_BYTES) lbSnapSoon(0);
       else lbJrnArm();
+    });
+  }
+  // Drop the segments a LANDED snapshot has made redundant (everything up to
+  // and including the one that was current when it serialized). Deliberately
+  // best effort and asynchronous: an unlink that fails — Windows keeps a
+  // handle busy, the file is gone already — leaves a segment that the next
+  // replay simply dedupes, and the next snapshot tries again. Nothing is ever
+  // deleted before the snapshot that supersedes it is on disk.
+  function lbJrnSweep(upto) {
+    const dir = userDataDir();
+    fs.readdir(dir, (e, list) => {
+      if (e || !list) return;
+      let stale = 0;
+      for (const f of list) {
+        const m = LB_JRN_RE.exec(f);
+        if (f !== LB_JRN_OLD && !(m && +m[1] <= upto)) continue;
+        stale++;
+        fs.unlink(path.join(dir, f), () => { /* next sweep retries */ });
+      }
+      // Best effort, but a directory that keeps REFUSING deletes accumulates
+      // segments and slows every restart. Deleting them is the only bound that
+      // does not throw fills away, so when they pile up we say so instead of
+      // failing silently.
+      if (stale > LB_JRN_STALE_WARN) {
+        _lbPersistErr = 'journal cleanup failing: ' + stale + ' stale segments';
+        tdiag('lblot', 'jrn-stale', { k: 'lb', stale, upto });
+      }
     });
   }
   function lbSnapSoon(delay) {
@@ -12611,7 +12675,13 @@ function createTradeNative(opts) {
     // The whole-store stringify is ~10 ms of main loop. It waits out an active
     // fill stream — but on a deadline that is NOT re-anchored, so a permanently
     // busy account still gets its snapshot.
-    if (now < _lbSnapMax && (now - _lbLastFill) < LB_SNAP_QUIET_MS) {
+    // …but the wait is also capped by SIZE, not just by the deadline: a fill
+    // stream that never goes quiet would otherwise grow one segment for the
+    // whole two minutes, and every restart replays it synchronously. Past the
+    // hard cap the fold runs mid-stream — ~10 ms of loop against an unbounded
+    // startup.
+    if (now < _lbSnapMax && (now - _lbLastFill) < LB_SNAP_QUIET_MS
+        && _lbJrnBytes < LB_JRN_HARD_BYTES) {
       _lbSnapDue = now + LB_SNAP_QUIET_MS;
       _lbSnapT = setTimeout(lbSnapTick, LB_SNAP_QUIET_MS);
       return;
@@ -12622,12 +12692,10 @@ function createTradeNative(opts) {
   // persistErr to the caller (delete/import/reimport) and for quit.
   function lbSnapNow(sync) {
     if (!_lbStore) return true;
-    if (_lbSnapBusy) { _lbSnapAgain = true; return true; }
-    // Never rotate the journal underneath an append that is still in flight:
-    // the unlink would either drop that write (POSIX) or fail and leave the
-    // byte count lying about the file (Windows). Wait for it — the snapshot
-    // deadline is NOT re-anchored by this, so it still cannot be starved.
-    if (_lbJrnBusy && !sync) { lbSnapSoon(LB_SNAP_RETRY_MS); return true; }
+    // A second writer cannot run: the store would be serialized twice into the
+    // same tmp file. A caller that needs a DEFINITIVE verdict (explicit ops,
+    // quit) still gets durability — its rows go to the journal synchronously.
+    if (_lbSnapBusy) { _lbSnapAgain = true; return sync ? lbJrnFlushSync() : true; }
     let json = null;
     const t0 = lbT();
     try {
@@ -12643,18 +12711,20 @@ function createTradeNative(opts) {
     }
     lbTap('persist.stringify', t0);
     // Everything queued for the journal right now is inside `json` (one
-    // thread, the stringify just ran) — later appends stay pending and are
-    // flushed to a FRESH journal once the snapshot lands. The queued batches
-    // are only LENT to this write: a failed snapshot puts them straight back
-    // (ahead of anything that arrived meanwhile) so they still reach the
-    // journal, which sits on top of the PREVIOUS snapshot. Dropping them here
-    // would leave those fills in memory only — lost on the next crash.
+    // thread, the stringify just ran). The queued batches are only LENT to
+    // this write: a failed snapshot puts them straight back (ahead of anything
+    // that arrived meanwhile) so they still reach the journal, which sits on
+    // top of the PREVIOUS snapshot. Dropping them here would leave those fills
+    // in memory only — lost on the next crash.
     const covered = _lbJrnPend;
     _lbJrnPend = [];
-    // an append still in flight (sync/quit path only, see above): the rows it
-    // carries are inside `json` too, so keeping the journal is harmless —
-    // replay dedupes — while unlinking it under an open handle is not.
-    const keepJrn = _lbJrnBusy;
+    // Everything merged from here on goes to a FRESH segment, so it survives
+    // the sweep this snapshot performs when it lands — and if the snapshot
+    // fails, both segments simply stay. No file is touched until then.
+    // Rolling is skipped when the live segment has no bytes yet: an untouched
+    // segment number has no file at all, so there is nothing to supersede —
+    // and a quiet app then stops minting a segment per snapshot.
+    if (_lbJrnBytes) { _lbJrnSeq += 1; _lbJrnBytes = 0; }
     if (_lbJrnT) { clearTimeout(_lbJrnT); _lbJrnT = null; }
     if (_lbSnapT) { clearTimeout(_lbSnapT); _lbSnapT = null; }
     _lbSnapDue = 0; _lbSnapMax = 0;
@@ -12669,10 +12739,11 @@ function createTradeNative(opts) {
         return false;
       }
       _lbPersistErr = null;
-      if (!keepJrn) {
-        try { fs.unlinkSync(lbJrnF()); } catch (e) { /* no journal is fine */ }
-        _lbJrnBytes = 0;
-      }
+      // only NOW are the segments below the live one redundant. The boundary
+      // is read HERE, not captured before the write: if the segment did not
+      // roll (it had no bytes), the live one keeps every row appended during
+      // the write.
+      lbJrnSweep(_lbJrnSeq - 1);
       if (_lbSnapAgain) { _lbSnapAgain = false; lbSnapSoon(LB_SNAP_MS); }
       lbJrnArm();
       return true;
@@ -12716,7 +12787,7 @@ function createTradeNative(opts) {
   function lbJrnFlushSync() {
     if (!_lbJrnPend.length) return true;
     const txt = _lbJrnPend.join('');
-    try { fs.appendFileSync(lbJrnF(), txt); } catch (e) {
+    try { fs.appendFileSync(lbJrnF(_lbJrnSeq), txt); } catch (e) {
       _lbPersistErr = String((e && e.message) || e);
       return false;
     }
@@ -12730,11 +12801,9 @@ function createTradeNative(opts) {
       if (_lbJrnT) { clearTimeout(_lbJrnT); _lbJrnT = null; }
       if (_lbSnapT) { clearTimeout(_lbSnapT); _lbSnapT = null; }
       if (!_lbStore) return true;
-      if (_lbSnapBusy) {
-        // a snapshot write is already in flight — never race it with a second
-        // writer; just make the pending rows durable in the journal.
-        return lbJrnFlushSync();
-      }
+      // lbSnapNow(true) already falls back to a synchronous journal append
+      // when it cannot write (a snapshot is in flight) — the previous snapshot
+      // plus the journal segments replay every fill.
       const ok = lbSnapNow(true);
       // the snapshot failed (disk full, permissions): the batches it borrowed
       // are back in the queue, so get them into the journal before we exit —
@@ -12989,8 +13058,14 @@ function createTradeNative(opts) {
     })();
     if (slotAid) for (const f of fills) f.aid = slotAid;
     const sc = lbScope(slot);
-    const added = lbScopeMerge(sc, fills, null);
+    const addRows = [];
+    const added = lbScopeMerge(sc, fills, addRows);
     if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
+    // Queue the added rows for the journal FIRST: if a background snapshot is
+    // in flight this op cannot write the store, and the journal is then what
+    // makes the import durable (lbSnapNow flushes it synchronously and still
+    // reports an honest verdict). A snapshot that does run folds them in.
+    if (added) lbJrnQueue(slot, addRows);
     const saved = lbSaveNow();   // explicit op: snapshot now, journal folded in
     // #1973: explicit ingest flow (panel Import button / supplied rows)
     tdiag('lblot', 'ingest', { k: slot, v: venue, src: 'import', recv: rowsIn.length,
