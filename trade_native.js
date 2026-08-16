@@ -28,6 +28,10 @@ const { nativeProxyUrl } = require('./proxy_url');
 
 const { routeNorm, VENUE_ROUTE_HOSTS } = require('./route_hosts');
 const dexSign = require('./dex_sign.js');
+// #2272 KuCoin bullet dance — the SAME pure validators the public market-data
+// bridge uses (wss-only + *.kucoin.com), so the private lane cannot become an
+// arbitrary-socket primitive either.
+const { kcBulletParse, kcDialUrl } = require('./kucoin_bullet');
 
 let SocksProxyAgent = null, HttpsProxyAgent = null;
 try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch (e) { /* optional */ }
@@ -1677,6 +1681,66 @@ function lbNormBitgetFill(f, market) {
     closed_pnl: lbNum(f.profit) || '0',
     kind: 'trade', funding: '0',
     ts: ts,
+    exec_id: String(f.tradeId || ''),
+  };
+}
+// #2272 KuCoin fill timestamp → MILLISECONDS. norm_kucoin_fill's key order
+// and nanosecond fold: futures `tradeTime` arrives in NANOSECONDS, spot
+// `createdAt` in ms, and the private tradeOrders `match` delta stamps `ts` in
+// ns on BOTH hosts. Spot and futures are two hosts with two clocks, so the
+// fold is per-VALUE (>1e15 = ns), never per-market. The first POSITIVE key
+// wins — a present-but-zero field falls through, the Python `or 0` chain.
+function lbKcTsMs(f) {
+  for (const k of ['tradeTime', 'createdAt', 'ts', 'orderTime']) {
+    const v = Math.floor(Number((f || {})[k] || 0));
+    if (!Number.isFinite(v) || v <= 0) continue;
+    return v > 1e15 ? Math.floor(v / 1e6) : v;
+  }
+  return 0;
+}
+// #2272 is THIS row's fee readable as THIS fill's fee? A `match` delta off
+// the private tradeOrders channel carries no fee field at all, and a fill
+// recorded with a size but a zeroed fee is worse than no row: the replay
+// carries the quantity while break-even divides real fees by an inflated net
+// (bgFeeTrusted rule, KuCoin shape). Numeric = the venue's own value (an
+// explicit 0, or a rebate, is a real value and stays admissible); missing or
+// unparseable = fee UNKNOWN, and the REST fills poll owns the enrichment.
+function lbKcFeeKnown(f) {
+  return Number.isFinite(parseFloat((f || {}).fee));
+}
+// norm_kucoin_fill twin. Accepts a REST fills row (spot /api/v1/fills:
+// size/price/fee/feeCurrency/tradeId/createdAt; futures /api/v1/fills:
+// size in CONTRACTS/price/fee/tradeId/tradeTime ns) AND the private
+// tradeOrders `match` delta (matchSize/matchPrice/tradeId/ts ns), so the
+// push lane and the poll share one parser and one id space.
+function lbNormKucoinFill(f, market, multiplier) {
+  if (!f || typeof f !== 'object') return null;
+  const sym = String(f.symbol || '');
+  const mk = market === 'spot' ? 'spot' : 'futures';
+  let sz = lbNum(f.matchSize);
+  if (sz === null) sz = lbNum(f.size);
+  if (!sym || sz === null || !(Number(sz) > 0)) return null;
+  // Futures sizes are INTEGER CONTRACTS × the contract multiplier. A row
+  // stored in contracts replays a 100× position on a 0.01-multiplier symbol,
+  // so a missing multiplier must leave the raw value rather than guess 1.
+  if (mk === 'futures') sz = kcBaseQty(sz, multiplier) || sz;
+  const px = lbNum(f.matchPrice) || lbNum(f.price) || '0';
+  const side = String(f.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
+  // KuCoin reports fees POSITIVE (a charge) and reconstruct SUBTRACTS
+  // commission, so the value is kept as-is — no sign flip (Bitget's venue
+  // reports charges negative and needs one; KuCoin does not).
+  let fee = Number(lbNum(f.fee) || 0);
+  const ccy = String(f.feeCurrency || '');
+  if (mk === 'spot' && ccy && sym.slice(-ccy.length) !== ccy) fee = fee * Number(px);
+  return {
+    venue: 'kucoin', market: mk, symbol: sym,
+    side: side, posSide: '',
+    order_px: '', exec_px: px, qty: sz,
+    value: lbFmt(Number(px) * Number(sz)),
+    fee: lbFmt(fee),
+    closed_pnl: '0',
+    kind: 'trade', funding: '0',
+    ts: lbKcTsMs(f),
     exec_id: String(f.tradeId || ''),
   };
 }
@@ -5414,6 +5478,7 @@ function createTradeNative(opts) {
     try { if (venue) bybPushClose(venue); else bybPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) gatePushClose(venue); else gatePushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bgPushClose(venue); else bgPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) kcPushClose(venue); else kcPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -8531,8 +8596,508 @@ function createTradeNative(opts) {
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
   }
 
+  // --- #2272 KuCoin account push lane --------------------------------------
+  // KuCoin is the only native venue whose private streams live on TWO hosts
+  // with TWO clocks: spot rides api.kucoin.com, futures api-futures.kucoin.com,
+  // and each needs its OWN signed bullet + its own socket. The session
+  // therefore runs two independent connection loops (sp/fu) under one slot,
+  // each with its own scope/lseq — order id spaces are per-market here too, so
+  // a both-markets tombstone sweep could bury an unrelated order (gate rule).
+  //
+  // Handshake, per host:
+  //   POST /api/v1/bullet-private (signed) → { token, instanceServers:[{
+  //   endpoint, pingInterval }] } → dial endpoint?token=…&connectId=… →
+  //   {type:'welcome'} → subscribe frames → {type:'ack'} each.
+  // Keepalive is APP-LEVEL JSON ({id,type:'ping'} → {type:'pong'}); KuCoin
+  // drops a socket ~18s without one and WS protocol frames do NOT count, so
+  // the cadence comes from the bullet's own pingInterval (kcPingMs: 60% of
+  // it, clamped 5..16s).
+  //
+  // Channels (essential ones are counted in `expect`; the rest are BONUS — a
+  // venue that refuses one leaves the socket up on the others):
+  //   spot    /spotMarket/tradeOrdersV2   orders + `match` fill deltas
+  //           /account/balance            wallet deltas
+  //   futures /contractMarket/tradeOrders orders + `match` fill deltas
+  //           /contractAccount/wallet     wallet deltas
+  //           /contractMarket/advancedOrders  (bonus) untriggered STOPs —
+  //             they never appear on tradeOrders, so without this the stop
+  //             chips would still wait for a poll
+  //           /contract/position:<sym>    (bonus, per symbol) venue-truth
+  //             position rows; KuCoin has no all-symbols position channel, so
+  //             the set is seeded from the acct read's own positions and from
+  //             every futures symbol the lane sees, capped.
+  //
+  // FILL OWNERSHIP (#2272 step 2). A `match` delta carries NO fee and no
+  // realized PnL, and a fill recorded with a size but a zeroed fee is worse
+  // than no row (bgFeeTrusted rule: the replay carries the quantity while
+  // break-even divides real fees by an inflated net). So the two lanes split
+  // by capability, not by preference:
+  //   • the REST fills poll (lbKcLive) RECORDS — its rows carry the venue's
+  //     own fee, and it shares the `tradeId` id space with the match delta,
+  //     so the ring's side-inclusive seen-set makes recording exactly-once;
+  //   • the acked `match` lane EMITS the push event (badge, chime, posrow) at
+  //     stream latency and kicks an immediate catch-up poll, which records
+  //     the same execution WITH its fee and re-pushes the SAME fid so the
+  //     panel merges the complete row over the fee-less one.
+  // Emission ownership is per-connection and per-market and MONOTONE:
+  // pending → owned (ack inside the grace) or → fallback (refusal, or a grace
+  // that ran out), never back. Under fallback the poll emits too, so a market
+  // is never left without a lane. One fid ('<tradeId>:<side>' — side-INCLUSIVE
+  // or a self-match's two legs collapse into one row) = one chime latch, so
+  // neither the enrichment re-push nor the poll can ring an execution twice.
+  const KC_PUSH_STALL_MS = 60000;
+  const KC_PUSH_FRESH_MS = 120000;
+  const KC_FILL_ACK_GRACE_MS = 10000;
+  const KC_PUSH_POS_CAP = 32;         // per-symbol position subs are bounded
+  const KC_PUSH_CATCHUP_MS = 400;     // debounce for the fee-enrichment poll
+  // engine kc_*_ws_apply event vocabulary — anything else removes the badge.
+  const KC_PUSH_OPEN_EV = { open: 1, update: 1, match: 1 };
+  const kcPushSessions = {};
+  const kcPushPend = {};
+  let kcPushTimer = null;
+  let kcPushMsgId = 0;
+  function kcPushNextId() { return 'ntk' + (++kcPushMsgId); }
+  function kcPushFlush() {
+    kcPushTimer = null;
+    const evs = krPushDrain(kcPushPend, (key) => {
+      const sess = kcPushSessions[key.slice(0, key.indexOf('|'))];
+      if (!sess) return 0;
+      return key.slice(key.indexOf('|') + 1) === 'spot' ? sess.sp.lseq : sess.fu.lseq;
+    }, Date.now(), 'kucoin');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      try { execAcctRead.bust('kucoin', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('kucoin'); } catch (e) { /* hot lane */ }
+      tdiag('acct', 'kucoin_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    // push-beat local-blotter drain (HL/Gate/Bitget pattern): fills land in
+    // the local store on the flush itself (idempotent — lbDrain dedups by
+    // exec_id), so the read that follows serves recorded rows.
+    try {
+      for (const ev of evs) {
+        if (ev && ev.kinds && ev.kinds.indexOf('fill') >= 0)
+          lbDrain(String(ev.slot || 'kucoin'), 'kucoin');
+      }
+    } catch (e) { /* local store off — panel read drains later */ }
+  }
+  function kcPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(kcPushPend, scope._pk, kind, id, row);
+    if (!kcPushTimer) {
+      kcPushTimer = setTimeout(kcPushFlush, KR_PUSH_COALESCE_MS);
+      if (kcPushTimer && typeof kcPushTimer.unref === 'function') kcPushTimer.unref();
+    }
+  }
+  function kcPushScope(pk, mk) {
+    return { lseq: 0, mk: mk, _pk: pk, ws: null, up: false, running: false,
+             lastMsg: 0, subT: null, fseen: null, connT: 0, openT: 0,
+             fillCh: 0, posSyms: null, posWant: {}, posSub: {}, nf: 0, lt: 0 };
+  }
+  function kcPushScopeReset(sc) {
+    sc.ws = null; sc.up = false; sc.subT = null; sc.fseen = null;
+    sc.connT = 0; sc.openT = 0; sc.fillCh = 0; sc.posSyms = null; sc.posSub = {};
+  }
+  function kcPushClose(slot) {
+    const sess = kcPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    for (const sc of [sess.sp, sess.fu]) {
+      try { if (sc.ws) sc.ws.terminate(); } catch (e) { /* gone */ }
+      kcPushScopeReset(sc);
+    }
+    delete kcPushSessions[slot];
+  }
+  function kcPushCloseAll() {
+    for (const k of Object.keys(kcPushSessions)) kcPushClose(k);
+  }
+  function kcPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key || !creds.pass) return null;
+    slot = String(slot || 'kucoin');
+    let sess = kcPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { kcPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = kcPushSessions[slot] = {
+        slot: slot, tail: creds.key, closed: false, route: route, creds: creds,
+        err: null, cu: {},
+        sp: kcPushScope(slot + '|spot', 'spot'),
+        fu: kcPushScope(slot + '|fut', 'futures'),
+      };
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    for (const sc of [sess.sp, sess.fu]) if (!sc.running) kcPushLoop(slot, sess, sc);
+    return sess;
+  }
+  function kcPushLoop(slot, sess, sc) {
+    sc.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (kcPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          const b = await kcBulletPrivate(sess.creds, sc.mk, sess.route);
+          if (!b.ok) throw new Error(b.message || 'bullet refused');
+          await kcPushConn(slot, sess, sc, b);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          sess.err = 'KuCoin push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'kucoin_push_err',
+                { s: slot, mk: sc.mk, m: String(sess.err).slice(0, 120) });
+        }
+        kcPushScopeReset(sc);
+        if (sess.closed || kcPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      sc.running = false;
+    })().catch(() => { sc.running = false; });
+  }
+  // Signed bullet for ONE host. Validated through the SAME kcBulletParse the
+  // public market-data bridge uses (wss-only + *.kucoin.com suffix): the
+  // endpoint host varies per bullet, so that check is what keeps this from
+  // becoming an arbitrary-socket primitive.
+  async function kcBulletPrivate(creds, market, route) {
+    const r = await kcRequest(creds, 'POST', market, '/api/v1/bullet-private',
+                              null, null, route);
+    if (!r.ok) return { ok: false, message: r.message || 'bullet-private failed' };
+    const p = kcBulletParse(r.data);
+    if (!p.ok) return { ok: false, message: 'bullet-private ' + (p.error || 'invalid') };
+    return p;
+  }
+  function kcPushConn(slot, sess, sc, bullet) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(kcDialUrl(bullet.endpoint, bullet.token, kcPushNextId()),
+                          sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      sc.ws = ws;
+      let settled = false;
+      let acked = 0;
+      let expect = 0;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        sc.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // APP-LEVEL keepalive — a WS protocol ping does NOT hold this socket up.
+      const kaT = setInterval(() => {
+        try { ws.send(JSON.stringify({ id: kcPushNextId(), type: 'ping' })); }
+        catch (e) { /* dying */ }
+        if (Date.now() - (sc.lastMsg || 0) > KC_PUSH_STALL_MS) done(new Error('stream stalled'));
+      }, bullet.pingMs || 16000);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      const sub = (topic, essential) => {
+        const id = kcPushNextId();
+        sc.subT[id] = topic;
+        if (essential) expect++;
+        try {
+          ws.send(JSON.stringify({ id: id, type: 'subscribe', topic: topic,
+                                   privateChannel: true, response: true }));
+        } catch (e) { done(e); }
+      };
+      sc.subs = sub;
+      ws.on('open', () => {
+        sc.lastMsg = Date.now();
+        // per-CONNECTION seed state (bitget recipe): `fseen` makes the first
+        // frame of a topic the subscribe snapshot; `connT` is the venue-clock
+        // time at connect, so a replayed fill is told from a live one by its
+        // OWN timestamp; `openT` is the LOCAL stamp the ack grace measures.
+        sc.subT = {};
+        sc.fseen = {};
+        sc.connT = Date.now() + (sess.tOff || 0);
+        sc.openT = Date.now();
+        sc.fillCh = 0;
+        sc.posSub = {};
+      });
+      ws.on('ping', () => { sc.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        sc.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const ty = String((msg && msg.type) || '');
+        if (ty === 'pong' || ty === 'ping') return;
+        if (ty === 'welcome') {
+          if (sc.mk === 'spot') {
+            sub('/spotMarket/tradeOrdersV2', true);
+            sub('/account/balance', true);
+          } else {
+            sub('/contractMarket/tradeOrders', true);
+            sub('/contractAccount/wallet', true);
+            // BONUS: untriggered stops never ride tradeOrders.
+            sub('/contractMarket/advancedOrders', false);
+            for (const s of Object.keys(sc.posWant || {})) kcPosSub(sc, s);
+          }
+          return;
+        }
+        if (ty === 'error') {
+          const topic = String((sc.subT || {})[String((msg && msg.id) || '')] || '');
+          // A refused BONUS topic must NOT tear the socket down: killing the
+          // connection would take orders/fills/wallet with it and redial
+          // forever for a channel that is additive by construction.
+          if (topic && !kcTopicEssential(topic)) {
+            if (topic === '/contractMarket/tradeOrders' || topic === '/spotMarket/tradeOrdersV2') {
+              kcFillChSet(sc, -1);
+            }
+            tdiag('acct', 'kucoin_push_nosub',
+                  { s: slot, mk: sc.mk, t: topic,
+                    m: String((msg && msg.data) || '').slice(0, 80) });
+            return;
+          }
+          if (kcTopicIsOrders(topic)) kcFillChSet(sc, -1);
+          done(new Error('kucoin ws: ' + String((msg && msg.data) || 'error')));
+          return;
+        }
+        if (ty === 'ack') {
+          const topic = String((sc.subT || {})[String((msg && msg.id) || '')] || '');
+          // An acked orders topic takes OWNERSHIP of this market's fill
+          // EVENTS (see kcFillChSet) — the REST poll keeps recording them.
+          if (kcTopicIsOrders(topic)) {
+            kcFillChSet(sc, 1);
+            tdiag('acct', 'kucoin_push_fillch', { s: slot, mk: sc.mk, st: sc.fillCh | 0 });
+          }
+          if (!kcTopicEssential(topic)) return;
+          acked++;
+          if (expect > 0 && acked >= expect && !sc.up) {
+            sc.up = true; sess.err = null;
+            tdiag('acct', 'kucoin_push_up', { s: slot, mk: sc.mk });
+          }
+          return;
+        }
+        if (ty !== 'message') return;
+        try { kcPushEvApply(sess, sc, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function kcTopicIsOrders(topic) {
+    return topic === '/contractMarket/tradeOrders' || topic === '/spotMarket/tradeOrdersV2';
+  }
+  function kcTopicEssential(topic) {
+    return kcTopicIsOrders(topic) || topic === '/account/balance'
+      || topic === '/contractAccount/wallet';
+  }
+  // Per-market, per-CONNECTION fill-EVENT ownership, monotone for the life of
+  // one connection: pending(0) → owned(1) on an ack inside the grace, or →
+  // fallback(-1) on a refusal or a grace that ran out, and NEVER back. A late
+  // ack is demoted on purpose — the REST poll has already been emitting for
+  // this market, and a stream that starts emitting alongside it would chime
+  // executions the poll just chimed. The reconnect re-decides.
+  function kcFillAckLate(sc) {
+    return (Date.now() - ((sc && sc.openT) || 0)) >= KC_FILL_ACK_GRACE_MS;
+  }
+  function kcFillChSet(sc, st) {
+    if (!sc) return 0;
+    if (st > 0 && ((sc.fillCh | 0) < 0 || kcFillAckLate(sc))) st = -1;
+    sc.fillCh = st;
+    return st;
+  }
+  function kcFillLaneOwns(sc) {
+    const st = (sc && sc.fillCh) | 0;
+    if (st) return st > 0;
+    if (!kcFillAckLate(sc)) return true;      // pending, inside the grace
+    kcFillChSet(sc, -1);                      // …and the timeout LATCHES
+    return false;
+  }
+  // A fill-BEARING row: a venue trade id plus a positive THIS-fill quantity.
+  function kcFillQty(o) {
+    const m = parseFloat(o && o.matchSize);
+    if (Number.isFinite(m) && m > 0) return m;
+    const s = parseFloat(o && o.size);
+    return (Number.isFinite(s) && s > 0) ? s : 0;
+  }
+  function kcFillRow(o) {
+    return !!(o && o.tradeId != null && String(o.tradeId) && kcFillQty(o) > 0);
+  }
+  // fid namespace = '<tradeId>:<side>' — byte-identical to the panel's
+  // lbFill/state-fill eid, so ONE chime latch covers the pushed match delta,
+  // its fee-enriched re-push and the same fill arriving on the next acct read.
+  function kcFillFid(o) {
+    return String((o && o.tradeId) || '') + ':' + String((o && o.side) || '').toLowerCase();
+  }
+  const KC_SHAPE_KEYS = ['tradeId', 'orderId', 'clientOid', 'symbol', 'side', 'type',
+    'orderType', 'matchSize', 'matchPrice', 'size', 'price', 'filledSize', 'remainSize',
+    'fee', 'feeCurrency', 'feeType', 'liquidity', 'status', 'ts', 'orderTime',
+    'tradeTime', 'createdAt'];
+  function kcPushShapeDiag(sc, topic, row) {
+    if (!row || typeof row !== 'object') return;
+    if (!sc.shape) sc.shape = {};
+    if (sc.shape[topic]) return;
+    sc.shape[topic] = 1;
+    const have = [];
+    for (const n of KC_SHAPE_KEYS) {
+      const v = row[n];
+      if (v !== undefined && v !== null && v !== '') have.push(n);
+    }
+    tdiag('acct', 'kucoin_push_shape', { s: sc._pk, t: topic, keys: have.join(',') });
+  }
+  // One EMITTED fill. The row is NOT written to the ring here: a match delta
+  // has no fee, and an unknown fee must never be stored as a real zero — the
+  // catch-up poll below records the same execution with the venue's own fee
+  // and re-pushes the same fid, which the panel merges over this row.
+  function kcWsMatch(sess, sc, o) {
+    if (!kcFillRow(o)) return;
+    kcPushShapeDiag(sc, 'match|' + sc.mk, o);
+    if (!kcFillLaneOwns(sc)) { sc.lt++; return; }
+    if (!lbKcFeeKnown(o)) sc.nf++;
+    // Recorded by the poll either way; only the EVENT is age-gated, so a
+    // subscribe replay can never chime historical fills.
+    const ts = lbKcTsMs(o);
+    if (!ts || ts >= ((sc.connT || 0) - KC_PUSH_FRESH_MS)) {
+      // fid ONLY — no row. The panel's fee/break-even replay must never see
+      // a fee-less delta (that is the "unknown fee stored as a real zero"
+      // failure in another disguise); kcPushFillRows below re-pushes the SAME
+      // fid carrying the recorded, fee-bearing row a few hundred ms later.
+      krLseq(sc); kcPushSc(sc, 'fill', kcFillFid(o));
+      if (sc.mk === 'futures') { krLseq(sc); kcPushSc(sc, 'pos'); }
+    }
+    kcFillCatchUp(sess, sc.mk);
+  }
+  // Debounced, single-flight REST catch-up: the fee-and-realized-PnL half of
+  // the lane. Best-effort — a failed catch-up just means the fill records on
+  // the next lblot beat, never a zero-fee row.
+  function kcFillCatchUp(sess, mk) {
+    if (!sess || sess.closed) return;
+    if (!sess.cu) sess.cu = {};
+    if (sess.cu[mk]) return;
+    sess.cu[mk] = setTimeout(() => {
+      sess.cu[mk] = null;
+      lbKcLive('kucoin', sess.slot, sess.route, mk)
+        .catch(() => { /* next beat retries */ });
+    }, KC_PUSH_CATCHUP_MS);
+    if (sess.cu[mk] && typeof sess.cu[mk].unref === 'function') sess.cu[mk].unref();
+  }
+  // Per-symbol futures position subscription (KuCoin has no all-symbols
+  // channel). Bounded: the cap protects a many-symbol account from turning
+  // one reconnect into dozens of frames.
+  function kcPosSub(sc, symbol) {
+    const s = String(symbol || '');
+    if (!s || !sc || sc.mk !== 'futures') return;
+    if (sc.posSub && sc.posSub[s]) return;
+    if (Object.keys(sc.posSub || {}).length >= KC_PUSH_POS_CAP) return;
+    if (!sc.ws || !sc.subT || typeof sc.subs !== 'function') return;
+    sc.posSub[s] = 1;
+    sc.subs('/contract/position:' + s, false);
+  }
+  // Symbols the account is known to hold — seeded by the acct read so the
+  // position row is push-driven from the first beat, not from the first fill.
+  function kcPushPosWatch(slot, symbols) {
+    const sess = kcPushSessions[String(slot || 'kucoin')];
+    if (!sess) return;
+    const sc = sess.fu;
+    for (const s0 of (symbols || [])) {
+      const s = String(s0 || '');
+      if (!s) continue;
+      if (!sc.posWant) sc.posWant = {};
+      if (Object.keys(sc.posWant).length < KC_PUSH_POS_CAP) sc.posWant[s] = 1;
+      kcPosSub(sc, s);
+    }
+  }
+  function kcPushEvApply(sess, sc, msg) {
+    const topic = String((msg && msg.topic) || '');
+    const data = (msg && msg.data) || {};
+    if (!topic) return;
+    if (!sc.fseen) sc.fseen = {};
+    const base = topic.indexOf(':') >= 0 ? topic.slice(0, topic.indexOf(':')) : topic;
+    const snap = !sc.fseen[topic];
+    sc.fseen[topic] = 1;
+    if (kcTopicIsOrders(topic)) {
+      const ev = String(data.type || '');
+      const oid = String(data.orderId || '');
+      if (ev === 'match') {
+        if (sc.mk === 'futures' && data.symbol) kcPosSub(sc, String(data.symbol));
+        kcWsMatch(sess, sc, data);
+      }
+      if (!oid) return;
+      // engine kc_*_ws_apply parity: filled/canceled (or futures status
+      // 'done') retire the badge; open/update/match keep it.
+      const done = ev === 'filled' || ev === 'canceled'
+        || String(data.status || '') === 'done';
+      if (done) { krLseq(sc); kcPushSc(sc, 'ordgone', oid); return; }
+      if (KC_PUSH_OPEN_EV[ev] && !snap) { krLseq(sc); kcPushSc(sc, 'order', null, data); }
+      return;
+    }
+    if (topic === '/contractMarket/advancedOrders') {
+      // Untriggered STOP orders. `type`: open / triggered / cancel. The ids
+      // are 'st:'-namespaced exactly like the REST /api/v1/stopOrders rows,
+      // so a push retirement clears the same badge the poll would.
+      const oid = String(data.orderId || '');
+      if (!oid) return;
+      const ev = String(data.type || '');
+      if (ev === 'open') { krLseq(sc); kcPushSc(sc, 'order', null, kcStopEvRow(data)); }
+      else { krLseq(sc); kcPushSc(sc, 'ordgone', 'st:' + oid); }
+      return;
+    }
+    if (base === '/contract/position') {
+      // Venue-truth position rows. A flat row (currentQty 0) is pushed too —
+      // the panel retires the posrow (and sweeps its reduce-only stops) on
+      // THIS beat instead of waiting for a poll to notice the absence.
+      const sym = String(data.symbol || topic.slice(base.length + 1) || '');
+      if (!sym) return;
+      // A `position.change` frame with changeReason 'markPriceChange' carries
+      // ONLY the new mark — no currentQty. Read as a position row that would
+      // be a FLAT row and would retire a live posrow on every mark tick, so a
+      // frame without the quantity is not a position frame at all here.
+      if (data.currentQty === undefined || data.currentQty === null) return;
+      const row = Object.assign({}, data, { symbol: sym });
+      if (!sc.posSyms) sc.posSyms = {};
+      sc.posSyms[sym] = 1;
+      krLseq(sc); kcPushSc(sc, 'pos', null, row);
+      return;
+    }
+    if ((topic === '/account/balance' || topic === '/contractAccount/wallet') && !snap) {
+      krLseq(sc); kcPushSc(sc, 'bal', null, data);
+    }
+  }
+  // advancedOrders frames name the trigger side as `stop` ('up'/'down') on
+  // some builds and omit it on others. Missing direction stays MISSING (the
+  // panel then falls back to its side-derived family) rather than guessing —
+  // a wrong guess paints the chip the wrong colour until the next reconcile.
+  function kcStopEvRow(d) {
+    const r = {
+      id: String(d.orderId || ''), symbol: String(d.symbol || ''),
+      side: String(d.side || ''), type: String(d.orderType || d.orderPrice ? 'limit' : 'market'),
+      stopPrice: d.stopPrice != null ? String(d.stopPrice) : '',
+      size: d.size != null ? String(d.size) : '',
+      createdAt: d.createdAt != null ? d.createdAt : d.ts,
+    };
+    if (d.stop === 'up' || d.stop === 'down') r.stop = d.stop;
+    return r;
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
+  // Binance/Bybit/Gate/Bitget pattern): the WS echo lands ~100ms later, but
+  // the local bump makes the badge/posrow read fire immediately after the
+  // REST ack. `row` lets a freshly placed STOP carry its trigger direction so
+  // the chip renders the right family at once instead of flickering to the
+  // wrong colour until the next reconcile. Market-scoped: KuCoin order id
+  // spaces are per-market (two hosts).
+  function kcMutKick(slot, kind, oid, market, row) {
+    const sess = kcPushSessions[String(slot || 'kucoin')];
+    if (!sess) return;
+    const sc = market === 'spot' ? sess.sp : sess.fu;
+    if (kind === 'ordgone' && oid) {
+      krLseq(sc); kcPushSc(sc, 'ordgone', String(oid));
+    } else {
+      krLseq(sc); kcPushSc(sc, 'order', null, row || undefined);
+    }
+  }
+
   // --- KuCoin ----------------------------------------------------------------
-  const KC_NATIVE_LEVERAGE = '10';   // engine KC_DEFAULT_LEVERAGE parity — leverage rides each order
+  // #2272 per-KEY + per-SYMBOL futures leverage memory — engine _kc_leverage
+  // twin. KuCoin one-way cross has NO dependable persistent set-leverage
+  // (`leverage` rides EACH order), so this memory is authoritative and the
+  // cross-leverage endpoint is only a best-effort sync so the KuCoin web UI
+  // agrees. KC_NATIVE_LEVERAGE is the fallback for a symbol never set here,
+  // never a value silently pinned into every order.
+  const KC_NATIVE_LEVERAGE = '10';   // engine KC_DEFAULT_LEVERAGE parity
+  const kcLevMem = {};
+  function kcLevKey(creds, symbol) { return String((creds && creds.key) || '') + '\u0000' + String(symbol || ''); }
+  function kcLevFor(creds, symbol) {
+    const v = kcLevMem[kcLevKey(creds, symbol)];
+    return v != null && String(v) ? String(v) : KC_NATIVE_LEVERAGE;
+  }
   const kcMultCache = {};
 
   async function kcRequest(creds, method, market, path, params, body, route) {
@@ -8643,14 +9208,24 @@ function createTradeNative(opts) {
         trigDir = kcStopDir(side, f.trigger, mark);
       }
       const body = kcFutOrderBody(symbol, side, ordType, contracts, price, clOrdID,
-                                  KC_NATIVE_LEVERAGE,
+                                  kcLevFor(creds, symbol),
                                   { reduceOnly: !!f.reduceOnly,
                                     trigger: isStop ? f.trigger : null,
                                     triggerDir: trigDir });
       const r = await kcRequest(creds, 'POST', 'futures', '/api/v1/orders', null, body, route);
       if (!r.ok) return r;
       const oid = String((((r.data || {}).data) || {}).orderId || '');
-      if (isStop) return { ok: true, orderID: oid ? 'st:' + oid : null, clOrdID: clOrdID };
+      if (isStop) {
+        // #2272 the freshly placed chip carries its TRIGGER DIRECTION: the
+        // stop-versus-target family is direction × side (KuCoin has no native
+        // take-profit order type), and without it the chip flickers to the
+        // wrong colour until the next reconcile.
+        return { ok: true, orderID: oid ? 'st:' + oid : null, clOrdID: clOrdID,
+                 kcStop: oid ? { id: oid, symbol: String(symbol), side: side,
+                                 type: (t === 'limit' || t === 'stop_limit') ? 'limit' : 'market',
+                                 stop: trigDir, stopPrice: String(f.trigger),
+                                 size: String(contracts), createdAt: Date.now() } : null };
+      }
       return { ok: true, orderID: oid || null, clOrdID: clOrdID };
     }
     if (intent.op === 'order') {
@@ -12488,6 +13063,190 @@ function createTradeNative(opts) {
              futOrders: fo.rows, planOrders: plan.rows, spotOrders: spotOrders };
   }
 
+  // --- #2272 KuCoin local-blotter live lane --------------------------------
+  // The RECORDING half of the fill lane (the private-WS `match` delta owns
+  // EMISSION — see kcFillLaneOwns). It is the fee-bearing lane: /api/v1/fills
+  // rows carry the venue's own `fee`, so every row that reaches the ring has
+  // a real fee and an unknown fee is never stored as a real zero. Same paced
+  // shape as every other REST live lane — single-flight, TTL-gated, driven
+  // ONLY by the lblot ops and the push catch-up, so a slot that never touches
+  // the local blotter pays no extra REST traffic at all.
+  //
+  // TWO HOSTS, TWO CLOCKS: the path is identical on both, but the high-water
+  // marks are strictly per market. One shared mark would let a futures fill
+  // (stamped by the futures host's clock, and delivered in NANOSECONDS)
+  // truncate the spot re-ask window against a clock that never produced it.
+  const KC_FILL_RING_CAP = 600;
+  const KC_LIVE_TTL_MS = 1200;                 // ≥1 fetch per panel lblot beat
+  const KC_LIVE_OVERLAP_MS = 90000;            // per-market re-ask window
+  const KC_LIVE_COLD_MS = 15 * 60 * 1000;      // first poll of a session
+  const KC_LIVE_PAGES = 4;                     // bounded — backfill owns depth
+  const KC_PAGE_GAP_MS = 450;
+  const KC_PAGE_SIZE = 100;
+  const kcFillRings = {};   // slot → { sp, fu, spTs, fuTs, t, busy }
+  function kcFillRingFor(slot) {
+    let R = kcFillRings[String(slot)];
+    if (!R) {
+      R = kcFillRings[String(slot)] = {
+        sp: { rows: [], seen: {}, rev: 0 }, fu: { rows: [], seen: {}, rev: 0 },
+        spTs: 0, fuTs: 0, t: 0, busy: null, route: null,
+      };
+    }
+    return R;
+  }
+  // Side-INCLUSIVE, like every other venue ring: a self-match returns TWO
+  // rows sharing one tradeId (opposite sides) and a side-less key silently
+  // drops a leg, leaving the trade stuck open (lbFillKey carries the rule).
+  function kcRingKey(f) {
+    const eid = String((f && f.tradeId) || '');
+    return eid ? eid + '|' + String((f && f.side) || '').toLowerCase() : '';
+  }
+  function kcFillPush(F, rows, fresh) {
+    let n = 0;
+    for (const f of (rows || [])) {
+      const k = kcRingKey(f);
+      if (!k || F.seen[k]) continue;
+      // Fee UNKNOWN is not fee zero. /api/v1/fills always carries `fee`, so
+      // this never fires in practice — and when it somehow does, the row is
+      // left UNSEEN so the next overlap window re-asks for it rather than
+      // recording a real zero the break-even replay would then trust.
+      if (!lbKcFeeKnown(f)) { F.nofee = (F.nofee | 0) + 1; continue; }
+      F.seen[k] = 1;
+      F.rows.push(f);
+      if (fresh) fresh.push(f);
+      lbSrcTouch(F);   // one touch per pushed row (drain cursor)
+      n++;
+    }
+    if (F.rows.length > KC_FILL_RING_CAP) {
+      const drop = F.rows.splice(0, F.rows.length - KC_FILL_RING_CAP);
+      for (const f of drop) { const k = kcRingKey(f); if (k) delete F.seen[k]; }
+    }
+    return n;
+  }
+  // #2272 the fee-bearing half of the push lane. The WS `match` delta pushed
+  // its fid the instant the execution streamed; these are the SAME executions
+  // re-read from REST with the venue's own fee and realized PnL, normalized
+  // into the row shape the panel's fill/BE replay consumes. Same fid ⇒ the
+  // chime already latched, so this beat repaints the posrow and the chart
+  // triangle without ringing twice. A futures row whose contract multiplier
+  // is still cold is SKIPPED here (never sized at a guessed 1:1) — the acct
+  // read's lbFills share carries it once kcMult landed.
+  function kcPushFillRows(slot, mk, rows) {
+    if (!rows || !rows.length || !pushLedgerCb) return;
+    const sess = kcPushSessions[String(slot || 'kucoin')];
+    if (!sess || sess.closed) return;
+    const sc = mk === 'spot' ? sess.sp : sess.fu;
+    if (!sc || !sc._pk) return;
+    let n = 0;
+    for (const f of rows) {
+      let nrm = null;
+      if (mk === 'spot') nrm = lbNormKucoinFill(f, 'spot', null);
+      else {
+        const mc = kcMultCache[String((f && f.symbol) || '')];
+        if (!(Number(mc && mc.v) > 0)) continue;
+        nrm = lbNormKucoinFill(f, 'futures', mc.v);
+      }
+      if (!nrm) continue;
+      krLseq(sc);
+      kcPushSc(sc, 'fill', kcFillFid(f), nrm);
+      n++;
+    }
+    if (n && mk === 'futures') { krLseq(sc); kcPushSc(sc, 'pos'); }
+  }
+  // ONE cursor walk for every KuCoin fill consumer (live poll, backfill,
+  // re-import): KucoinHistory._fills_walk twin — currentPage pagination over
+  // a startAt/endAt window, same path on both hosts. `full:true` = the page
+  // cap was hit with pages still pending; the caller decides whether that is
+  // a gap note or a hard failure. Never throws.
+  async function kcFillsWalk(creds, market, frm, to, route, maxPages, gapMs) {
+    const rows = [];
+    let pages = 0;
+    const cap = maxPages > 0 ? maxPages : 1;
+    for (let page = 1; page <= cap; page++) {
+      const params = [['startAt', String(Math.floor(frm))], ['endAt', String(Math.ceil(to))],
+                      ['currentPage', String(page)], ['pageSize', String(KC_PAGE_SIZE)]];
+      if (page > 1 && gapMs > 0) await new Promise((rs) => setTimeout(rs, gapMs));
+      let r;
+      try { r = await kcRequest(creds, 'GET', market, '/api/v1/fills', params, null, route); }
+      catch (e) { r = { ok: false, message: (e && e.message) || 'KuCoin fills fetch failed' }; }
+      pages++;
+      if (!r || !r.ok) {
+        return { ok: false, rows: rows, full: false, pages: pages,
+                 message: (r && r.message) || 'KuCoin ' + market + ' fills fetch failed' };
+      }
+      const d = (r.data || {}).data || {};
+      const lst = Array.isArray(d.items) ? d.items : [];
+      const pageRows = lst.filter((x) => x && typeof x === 'object');
+      for (const f of pageRows) rows.push(f);
+      const total = Number(d.totalPage) | 0;
+      if (!pageRows.length || (total > 0 && page >= total)) {
+        return { ok: true, rows: rows, full: false, pages: pages };
+      }
+      if (total <= 0 && pageRows.length < KC_PAGE_SIZE) {
+        return { ok: true, rows: rows, full: false, pages: pages };
+      }
+    }
+    return { ok: true, rows: rows, full: true, pages: pages };   // cap hit
+  }
+  // Paced live refresh for ONE KuCoin slot. `only` restricts the walk to one
+  // market AND bypasses the TTL — that is the push lane's fee catch-up, which
+  // must land the just-streamed execution now, not on the next panel beat.
+  async function lbKcLive(venue, slot, route, only) {
+    if (venue !== 'kucoin') return;
+    const R = kcFillRingFor(slot);
+    if (R.busy) { try { await R.busy; } catch (e) {} if (!only) return; }
+    const now = Date.now();
+    if (!only && (now - (R.t || 0)) < KC_LIVE_TTL_MS) return;
+    const creds = credsGet(slot);
+    if (!creds || !creds.key || !creds.pass) return;
+    R.t = now;
+    R.route = routeNorm(route);   // the drain's multiplier warm dials the same route
+    const mks = only ? [only === 'spot' ? 'spot' : 'futures'] : ['spot', 'futures'];
+    const p = (async () => {
+      for (const mk of mks) {
+        const key = mk === 'spot' ? 'spTs' : 'fuTs';
+        const F = mk === 'spot' ? R.sp : R.fu;
+        const frm = R[key] > 0 ? Math.max(0, R[key] - KC_LIVE_OVERLAP_MS)
+                               : now - KC_LIVE_COLD_MS;
+        const w = await kcFillsWalk(creds, mk, frm, now + 1000, routeNorm(route),
+                                    KC_LIVE_PAGES, KC_PAGE_GAP_MS);
+        if (!w.ok) continue;                   // best-effort — next beat retries
+        const fresh = [];
+        kcFillPush(F, w.rows, fresh);
+        kcPushFillRows(slot, mk, fresh);
+        // The cursor is stamped with the SAME normalizer the stored row uses
+        // (lbKcTsMs): a nanosecond futures stamp taken as ms parks the mark in
+        // the year 56000 and the market never re-asks anything again.
+        let hwm = R[key] || 0;
+        for (const f of w.rows) { const t = lbKcTsMs(f); if (t > hwm) hwm = t; }
+        R[key] = hwm > 0 ? hwm : Math.max(R[key] || 0, now - KC_LIVE_OVERLAP_MS);
+      }
+    })();
+    R.busy = p;
+    try { await p; } catch (e) { /* best-effort */ }
+    if (R.busy === p) R.busy = null;
+  }
+  // Recent normalized live rows for the panel's fill chime / spot cost basis
+  // (the chart triangles read the local STORE). Read-only view of the ring —
+  // costs no REST call. Futures rows need the contract multiplier: a cold
+  // entry drops the row from THIS share (never guesses 1 contract = 1 coin)
+  // and the drain's retry sweep picks it up once kcMult landed.
+  const KC_LIVE_SHARE_N = 200;
+  function kcLiveFills(slot) {
+    const R = kcFillRings[String(slot)];
+    if (!R) return [];
+    const out = [];
+    for (const f of R.sp.rows) { const n = lbNormKucoinFill(f, 'spot', null); if (n) out.push(n); }
+    for (const f of R.fu.rows) {
+      const mc = kcMultCache[String((f && f.symbol) || '')];
+      if (!(Number(mc && mc.v) > 0)) continue;
+      const n = lbNormKucoinFill(f, 'futures', mc.v);
+      if (n) out.push(n);
+    }
+    out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    return out.length > KC_LIVE_SHARE_N ? out.slice(out.length - KC_LIVE_SHARE_N) : out;
+  }
+
   // KuCoin native account read (#1716): spot /api/v1/accounts (type=='trade'),
   // futures /api/v1/account-overview + /positions, paged active futures orders
   // (/orders?status=active) + untriggered stops (/stopOrders), spot active
@@ -12498,6 +13257,20 @@ function createTradeNative(opts) {
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     if (!creds.pass) return { ok: false, message: 'KuCoin API passphrase missing — re-provision Native trading on this device' };
     const route = routeNorm(intent.route);
+    // #2272: acct reads keep the two private push sockets warm (push-driven
+    // display) — no-op while the loops already run. The read then RE-ATTACHES
+    // push fills to the fresh snapshot panel-side (binance-shell-push rule).
+    try { kcPushEnsure(intent.credSlot || 'kucoin', creds, route); } catch (e) { /* REST-only */ }
+    // #2272 pump the LIVE fill lane on the account beat — the one beat that
+    // always runs. Gated on intent.lblot (the panel sends it only while the
+    // local blotter is ACTIVE for KuCoin), started in PARALLEL with the
+    // account legs and awaited just before the reply: a slot that never uses
+    // the local blotter pays exactly zero extra REST calls, and one that does
+    // pays no extra wall-clock. lbKcLive keeps its own single-flight + TTL,
+    // so N windows on one slot still cost ONE fetch per beat.
+    const lbPump = intent.lblot
+      ? lbKcLive('kucoin', intent.credSlot || 'kucoin', route).catch(() => {})
+      : null;
     const spotAcc = await kcRequest(creds, 'GET', 'spot', '/api/v1/accounts', null, null, route);
     if (!spotAcc.ok) return spotAcc;
     const overview = await kcRequest(creds, 'GET', 'futures',
@@ -12526,11 +13299,68 @@ function createTradeNative(opts) {
     if (!stops.ok) return stops;
     const so = await pageWalk('spot', '/api/v1/orders', [['status', 'active']]);
     if (!so.ok) return so;
+    // #2272 seed the per-symbol position subscriptions from the account's own
+    // positions: KuCoin has no all-symbols position channel, so without this
+    // the position row would only go push-driven after the first fill.
+    const posRows = ((pos.data || {}).data) || [];
+    try {
+      kcPushPosWatch(intent.credSlot || 'kucoin',
+                     (Array.isArray(posRows) ? posRows : [])
+                       .map((p) => String((p || {}).symbol || '')).filter(Boolean));
+    } catch (e) { /* push lane off */ }
+    // #2272 additive: recent LOCAL fills for this credential slot (empty
+    // unless the local blotter poll has warmed the ring for this slot). The
+    // panel only reads it while the local blotter is ACTIVE for KuCoin —
+    // capability alone must never suppress the server fills.
+    if (lbPump) await lbPump;
     return { ok: true,
              spotAccounts: ((spotAcc.data || {}).data) || [],
              futOverview: (overview.data || {}).data || null,
-             positions: ((pos.data || {}).data) || [],
-             futOrders: fo.rows, stopOrders: stops.rows, spotOrders: so.rows };
+             positions: posRows,
+             futOrders: fo.rows, stopOrders: stops.rows, spotOrders: so.rows,
+             lbFills: kcLiveFills(intent.credSlot || 'kucoin') };
+  }
+  // #2272 KuCoin futures leverage GET/SET (device-signed). KuCoin one-way
+  // cross has NO dependable persistent set-leverage — `leverage` rides EACH
+  // order — so the per-key + per-symbol memory is AUTHORITATIVE and the
+  // cross-leverage endpoint is a best-effort sync so the KuCoin web UI
+  // agrees. Engine KucoinAdapter.leverage_config / set_leverage twin.
+  async function execKucoinLeverage(intent) {
+    const what = String(intent.what || 'get');
+    const symbol = String(intent.symbol || '');
+    tdiag('trade', 'kucoin_lev', { s: intent.credSlot || 'kucoin', w: what, sym: symbol,
+                                   lev: intent.leverage });
+    if (!symbol) return { ok: false, message: 'symbol required' };
+    const creds = credsGet(intent.credSlot || 'kucoin');
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    if (!creds.pass) return { ok: false, message: 'KuCoin API passphrase missing — re-provision Native trading on this device' };
+    const route = routeNorm(intent.route);
+    if (what === 'set') {
+      const mag = Number(intent.leverage);
+      if (!Number.isFinite(mag) || mag <= 0 || Math.floor(mag) !== mag) {
+        return { ok: false, message: 'Leverage must be a positive whole number' };
+      }
+      const lev = String(Math.floor(mag));
+      // The memory write is the source of truth and happens FIRST: the very
+      // next order must carry the new leverage even if the account is a
+      // classic one where the endpoint does not exist.
+      kcLevMem[kcLevKey(creds, symbol)] = lev;
+      const r = await kcRequest(creds, 'POST', 'futures', '/api/v2/changeCrossUserLeverage',
+                                null, { symbol: symbol, leverage: lev }, route);
+      if (!r.ok) tdiag('trade', 'kucoin_lev_sync', { sym: symbol, m: String(r.message || '').slice(0, 80) });
+      return { ok: true, symbol: symbol, leverage: lev };
+    }
+    const mem = kcLevMem[kcLevKey(creds, symbol)];
+    if (mem != null && String(mem)) return { ok: true, symbol: symbol, leverage: String(mem) };
+    const r = await kcRequest(creds, 'GET', 'futures', '/api/v2/getCrossUserLeverage',
+                              [['symbol', symbol]], null, route);
+    if (r.ok) {
+      const v = (((r.data || {}).data) || {}).leverage;
+      if (v != null && Number(v) > 0) return { ok: true, symbol: symbol, leverage: String(v) };
+    }
+    // No memory and no readable venue setting: report the value orders will
+    // actually carry rather than an empty chip.
+    return { ok: true, symbol: symbol, leverage: KC_NATIVE_LEVERAGE };
   }
 
   // BitMEX native account read (#1716): /user/margin + /user/wallet (spot
@@ -14167,6 +14997,14 @@ function createTradeNative(opts) {
       const s = bgFillRings[slot];
       return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
     }
+    if (venue === 'kucoin') {
+      // #2272: the SAME two per-market rings carry the paced REST fills poll
+      // and the private-WS fee catch-up (one side-inclusive tradeId|side
+      // seen-set), so the no-news gate and the incremental cursor work
+      // exactly as they do for the push venues.
+      const s = kcFillRings[slot];
+      return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
+    }
     return '-';
   }
   const _lbDrainAt = {};    // slot → { t, sig } (#2230 no-news gate)
@@ -14275,6 +15113,29 @@ function createTradeNative(opts) {
         ring('bg.sp', R.sp, (r) => lbNormBitgetFill(r, 'spot'));
         ring('bg.fu', R.fu, (r) => lbNormBitgetFill(r, 'futures'));
       }
+    } else if (venue === 'kucoin') {
+      // #2272: two per-market REST-poll rings (lbKcLive). Rows are RAW venue
+      // fill rows — the market comes from the RING, never from the row,
+      // because a KuCoin spot and futures fill row are shape-identical.
+      // Futures rows size in CONTRACTS: the multiplier comes from the shell
+      // contract cache, and a cold entry skips the row THIS drain and fires a
+      // best-effort warm (gate/HL recipe — the raw row stays cached and the
+      // retry sweep re-normalizes it once the multiplier landed). Storing a
+      // contract count as a coin quantity would replay a 100× position.
+      const R = kcFillRings[slot];
+      if (R) {
+        ring('kc.sp', R.sp, (r) => lbNormKucoinFill(r, 'spot', null));
+        ring('kc.fu', R.fu, (r) => {
+          const sym = String((r && r.symbol) || '');
+          const mc = kcMultCache[sym];
+          const mult = mc ? mc.v : null;
+          if (!(Number(mult) > 0)) {
+            if (sym) kcMult(sym, R.route).catch(() => { /* warm */ });
+            return null;
+          }
+          return lbNormKucoinFill(r, 'futures', mult);
+        });
+      }
     }
     cur.skip = skipped;
     if (aid) for (const f of fills) f.aid = aid;
@@ -14310,7 +15171,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -14324,6 +15185,7 @@ function createTradeNative(opts) {
     const slot = String(intent.credSlot || venue);
     await lbHlWarm(venue, intent.route);
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
+    await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const t0 = lbT();
@@ -14451,6 +15313,7 @@ function createTradeNative(opts) {
     const slot = String(intent.credSlot || venue);
     await lbHlWarm(venue, intent.route);
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
+    await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const dmSig = intent.displayMap ? JSON.stringify(intent.displayMap) : '';
@@ -14899,6 +15762,87 @@ function createTradeNative(opts) {
         _dgSpotRows = rawSpot.length;
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'kucoin') {
+        // #2272: account-wide currentPage walks over BOTH hosts' /api/v1/fills
+        // (engine KucoinHistory._fills_walk twin). There is no symbol universe
+        // to resolve — coverage hinges purely on the call/page caps, so ANY cap
+        // hit or overflowing page reports covOk:false and the panel keeps the
+        // server blotter instead of activating on a partial history. PER-MARKET
+        // windows: spot and futures are two hosts with two clocks, so one
+        // shared high-water mark would truncate a window it never produced.
+        const KC_BF_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const KC_BF_CALL_CAP = 60;
+        const KC_BF_CHUNK_PAGES = 12;
+        let calls = 0;
+        let failMsg = null;
+        const rawFut = [], rawSpot = [];
+        for (const mk of ['futures', 'spot']) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          let w0 = Math.max(0, Math.floor(bfFrm(mk, mk)));
+          let span = KC_BF_SPAN_MS;
+          while (w0 < now) {
+            const left = KC_BF_CALL_CAP - calls;
+            if (left <= 0) {
+              gap = true; covOk = false;
+              notes.push(mk + ' fill call cap reached — history is incomplete');
+              break;
+            }
+            const w1 = Math.min(now, w0 + span);
+            if (calls) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+            const wk = await kcFillsWalk(creds, mk, w0, w1 + 1, route,
+                                         Math.min(KC_BF_CHUNK_PAGES, left), HB_PAGE_GAP_MS);
+            calls += wk.pages | 0;
+            if (!wk.ok) { failMsg = wk.message || ('KuCoin ' + mk + ' fills fetch failed'); break; }
+            for (const f of wk.rows) sink.push(f);
+            if (wk.full) {
+              if (w1 - w0 <= 3600 * 1000) {
+                gap = true; covOk = false;
+                notes.push(mk + ' fills denser than the page cap in one hour — history is incomplete');
+                w0 = w1 + 1;
+              } else span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+          if (failMsg) break;
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        // Futures sizes are integer CONTRACTS — resolve every symbol's
+        // multiplier before normalizing. A symbol whose spec will not load is
+        // a coverage HOLE, not a row to guess at: storing contracts as coins
+        // would replay a 100× position on a 0.01-multiplier symbol.
+        const kcm = {};
+        for (const f of rawFut) {
+          const s = String((f && f.symbol) || '');
+          if (!s || kcm[s] !== undefined) continue;
+          kcm[s] = await kcMult(s, route).catch(() => null);
+        }
+        const fills = [];
+        // Market comes from the HOST, never from the row: a KuCoin spot and
+        // futures fill row are shape-identical.
+        const kcMiss = {};
+        for (const f of rawFut) {
+          const s = String((f && f.symbol) || '');
+          const n = Number(kcm[s]) > 0 ? lbNormKucoinFill(f, 'futures', kcm[s]) : null;
+          if (n) fills.push(n); else if (s) kcMiss[s] = 1;
+        }
+        for (const f of rawSpot) { const n = lbNormKucoinFill(f, 'spot', null); if (n) fills.push(n); }
+        const missN = Object.keys(kcMiss);
+        if (missN.length) {
+          gap = true; covOk = false;
+          notes.push('contract spec unavailable for ' + missN.slice(0, 4).join(', ')
+                     + (missN.length > 4 ? ' +' + (missN.length - 4) + ' more' : '')
+                     + ' — their fills could not be sized');
+        }
+        _dgFutRows = rawFut.length;
+        _dgSpotRows = rawSpot.length;
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -15217,6 +16161,53 @@ function createTradeNative(opts) {
         riSpotRows = rawSpot.length;
         for (const f of rawFut) { const n = lbNormBitgetFill(f, 'futures'); if (n) fills.push(n); }
         for (const f of rawSpot) { const n = lbNormBitgetFill(f, 'spot'); if (n) fills.push(n); }
+      } else if (venue === 'kucoin') {
+        // #2272: the backfill's walks over the EXPLICIT window. Venue-truth
+        // contract — a truncated fetch of ANY kind fails VISIBLY (riFail),
+        // never a short history reported as success.
+        const KC_RI_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const KC_RI_CALL_CAP = 80;
+        const KC_RI_CHUNK_PAGES = 12;
+        let calls = 0;
+        const rawFut = [], rawSpot = [];
+        const mks = market === 'spot' ? ['spot']
+          : market === 'futures' ? ['futures'] : ['futures', 'spot'];
+        for (const mk of mks) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          let w0 = Math.max(0, Math.floor(w.frm));
+          let span = KC_RI_SPAN_MS;
+          while (w0 < w.to) {
+            const left = KC_RI_CALL_CAP - calls;
+            if (left <= 0) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            const w1 = Math.min(w.to, w0 + span);
+            if (calls) await sleep(HB_PAGE_GAP_MS);
+            const wk = await kcFillsWalk(creds, mk, w0, w1 + 1, route,
+                                         Math.min(KC_RI_CHUNK_PAGES, left), HB_PAGE_GAP_MS);
+            calls += wk.pages | 0;
+            if (!wk.ok) return riFail(wk.message || ('KuCoin ' + mk + ' fills fetch failed'));
+            for (const f of wk.rows) sink.push(f);
+            if (wk.full) {
+              if (w1 - w0 <= 3600 * 1000) {
+                return riFail('KuCoin ' + mk + ' fills denser than the page cap in one hour — narrow the date range');
+              }
+              span = Math.max(3600 * 1000, Math.floor((w1 - w0) / 2));
+              continue;
+            }
+            w0 = w1 + 1;
+          }
+        }
+        riFutRows = rawFut.length;
+        riSpotRows = rawSpot.length;
+        for (const f of rawFut) {
+          const cs = String((f && f.symbol) || '');
+          const mult = cs ? await kcMult(cs, route).catch(() => null) : null;
+          const n = Number(mult) > 0 ? lbNormKucoinFill(f, 'futures', mult) : null;
+          if (n) fills.push(n);
+          else if (cs && !(Number(mult) > 0)) {
+            return riFail('KuCoin contract spec unavailable for ' + cs + ' — cannot size its fills; retry shortly');
+          }
+        }
+        for (const f of rawSpot) { const n = lbNormKucoinFill(f, 'spot', null); if (n) fills.push(n); }
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -15376,6 +16367,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'bybit') return await execBybLeverage(intent);   // #2051
       if (intent.venue === 'gate') return await execGateLeverage(intent);   // #2153
       if (intent.venue === 'bitget') return await execBitgetLeverage(intent);   // #2247
+      if (intent.venue === 'kucoin') return await execKucoinLeverage(intent);   // #2272
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -15502,7 +16494,26 @@ function createTradeNative(opts) {
         }
         return r;
       }
-      if (intent.venue === 'kucoin') return await execKucoin(creds, intent, route);
+      if (intent.venue === 'kucoin') {
+        const r = await execKucoin(creds, intent, route);
+        // #2272: a successful trade ack kicks the push lane awake (no-op
+        // while the loops run) and stamps an optimistic mutation so the
+        // badge/posrow read fires immediately after the REST ack. Market-
+        // scoped — KuCoin order id spaces are per-market (two hosts). A
+        // freshly placed STOP forwards its trigger direction so the chip
+        // renders the right family at once (no wrong-colour flicker).
+        if (r && r.ok) {
+          try { kcPushEnsure(intent.credSlot || 'kucoin', creds, route); }
+          catch (e) { /* REST path */ }
+          try {
+            const kmk = intent.market === 'spot' ? 'spot' : 'futures';
+            if (intent.op === 'cancel' && intent.orderID) {
+              kcMutKick(intent.credSlot || 'kucoin', 'ordgone', String(intent.orderID), kmk);
+            } else kcMutKick(intent.credSlot || 'kucoin', 'order', null, kmk, r.kcStop || null);
+          } catch (e) { /* diag-only */ }
+        }
+        return r;
+      }
       if (intent.venue === 'bitmex') return await execBitmex(creds, intent, route);
       if (intent.venue === 'mexc') return await execMexc(creds, intent, route);
       if (intent.venue === 'hyperliquid') {
@@ -15719,6 +16730,19 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'bitget') continue;
             const c = credsGet(k);
             if (c) { try { bgPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2272: same one-time kick for the KuCoin private push sockets (TWO
+      // conns — spot and futures live on different hosts); loops self-maintain.
+      if (venue === 'kucoin') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'kucoin') continue;
+            const c = credsGet(k);
+            if (c) { try { kcPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
