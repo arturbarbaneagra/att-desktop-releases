@@ -1758,7 +1758,7 @@ function lbNormKucoinFill(f, market, multiplier) {
   let fee = Number(lbNum(f.fee) || 0);
   const ccy = String(f.feeCurrency || '');
   if (mk === 'spot' && ccy && sym.slice(-ccy.length) !== ccy) fee = fee * Number(px);
-  return {
+  const out = {
     venue: 'kucoin', market: mk, symbol: sym,
     side: side, posSide: '',
     order_px: '', exec_px: px, qty: sz,
@@ -1769,6 +1769,16 @@ function lbNormKucoinFill(f, market, multiplier) {
     ts: lbKcTsMs(f),
     exec_id: String(f.tradeId || ''),
   };
+  // #2275 fee UNKNOWN is not fee zero: a row whose venue fee has not arrived
+  // yet is admitted immediately but carries an explicit marker, so every
+  // break-even/net consumer treats the fee as unknown instead of a real 0.
+  // fee_pending = still awaiting the fee-bearing REST copy (settles in
+  // place); fee_unknown = the bounded wait expired and the fee stays
+  // genuinely unknown forever.
+  if (!lbKcFeeKnown(f)) {
+    if (f._feeUnk) out.fee_unknown = 1; else out.fee_pending = 1;
+  }
+  return out;
 }
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
@@ -9172,6 +9182,20 @@ function createTradeNative(opts) {
       krLseq(sc); kcPushSc(sc, 'fill', kcFillFid(o));
       if (sc.mk === 'futures') { krLseq(sc); kcPushSc(sc, 'pos'); }
     }
+    // #2275 immediate visibility: the SAME delta is admitted into the fill
+    // ring as a fee-PENDING row — price and quantity are the venue's own, the
+    // fee carries an explicit pending marker (never a real zero) — so the
+    // blotter and the break-even lane show the trade NOW instead of 2-6 s
+    // later. The fee-bearing REST copy settles the same tradeId|side row in
+    // place (kcFeeSettle). Gated behind lane ownership above, so a fallback
+    // socket cannot start a second emitting lane.
+    try {
+      const R = kcFillRingFor(sess.slot);
+      const F = sc.mk === 'spot' ? R.sp : R.fu;
+      const freshP = [];
+      kcFillPush(F, [o], freshP);
+      if (freshP.length) kcPushFillRows(sess.slot, sc.mk, freshP);
+    } catch (e) { /* ring admit best-effort — the catch-up poll records */ }
     kcFillCatchUp(sess, sc.mk);
   }
   // Debounced, single-flight REST catch-up: the fee-and-realized-PnL half of
@@ -13364,25 +13388,138 @@ function createTradeNative(opts) {
     const eid = String((f && f.tradeId) || '');
     return eid ? eid + '|' + String((f && f.side) || '').toLowerCase() : '';
   }
+  // #2275 bounded fee wait: a fill whose fee never arrives is recorded after
+  // this ceiling with the fee marked genuinely UNKNOWN (never a real zero)
+  // instead of waiting invisibly forever.
+  const KC_FEE_WAIT_MAX_MS = 90000;
+  // #2275 the fee-bearing copy of a pending fill landed: settle the SAME ring
+  // row in place (fee + currency onto the object every consumer already
+  // holds), mark it seen so the overlap window stops re-asking, and queue a
+  // store fix — the device store merged the pending copy exactly-once, so
+  // only lbFeeFixIn (via kcFeeFixDrain) can reach that stored row.
+  function kcFeeSettle(F, k, p, f) {
+    p.fee = f.fee;
+    if (f.feeCurrency != null) p.feeCurrency = f.feeCurrency;
+    delete p._feePendT;
+    delete F.pend[k];
+    F.seen[k] = 1;
+    F.nofee = Math.max(0, (F.nofee | 0) - 1);
+    (F.fix || (F.fix = [])).push(p);
+    lbSrcTouch(F);
+  }
+  // #2275 ceiling sweep: pending rows older than the wait ceiling latch to
+  // fee-UNKNOWN — recorded, visible, and permanently excluded from break-even
+  // arithmetic (unknown is not zero) — and stop being re-asked for.
+  function kcFeePendSweep(F, now) {
+    if (!F.pend) return;
+    for (const k in F.pend) {
+      const p = F.pend[k];
+      if (!p || (now - (p._feePendT || now)) < KC_FEE_WAIT_MAX_MS) continue;
+      delete F.pend[k];
+      delete p._feePendT;
+      p._feeUnk = 1;
+      F.seen[k] = 1;
+      F.nofee = Math.max(0, (F.nofee | 0) - 1);
+      F.feeUnk = (F.feeUnk | 0) + 1;
+      (F.fix || (F.fix = [])).push(p);
+      lbSrcTouch(F);
+    }
+  }
+  // #2275 settle the DEVICE-STORE copy of a fee-pending fill: the store
+  // merged the pending row exactly-once (lbScopeMerge seen-key), so no drain
+  // can revisit it — only an in-place patch reaches it (bgFeeStoreFix
+  // recipe). Ring rows queued on F.fix by kcFeeSettle / kcFeePendSweep are
+  // normalized here and their stored twin gets the real fee (or the
+  // fee_unknown latch) plus a marker clear, then the replay cache and the
+  // serialized-trades cache are invalidated so every window repaints.
+  function kcFeeFixDrain(slot, sc, R) {
+    if (!R || !sc) return 0;
+    let fixed = 0;
+    for (const mk of ['spot', 'futures']) {
+      const F = mk === 'spot' ? R.sp : R.fu;
+      if (!F || !F.fix || !F.fix.length) continue;
+      const q = F.fix; F.fix = [];
+      for (const raw of q) {
+        let nrm = null;
+        if (mk === 'spot') nrm = lbNormKucoinFill(raw, 'spot', null);
+        else {
+          const sym = String((raw && raw.symbol) || '');
+          const mc = kcMultCache[sym];
+          if (!(Number(mc && mc.v) > 0)) {
+            if (sym) kcMult(sym, R.route).catch(() => { /* warm */ });
+            F.fix.push(raw);   // multiplier cold — retry next drain
+            continue;
+          }
+          nrm = lbNormKucoinFill(raw, 'futures', mc.v);
+        }
+        if (!nrm) continue;
+        const k = lbFillKey(nrm);
+        if (!k || (sc.del && sc.del[k])) continue;
+        const hit = {};
+        lbFeeFixIn(sc, k, nrm.fee, hit);
+        const row = hit.row;
+        if (!row) continue;                       // not merged yet — the fresh
+                                                  // copy already carries truth
+        const wasPend = !!(row.fee_pending || row.fee_unknown);
+        delete row.fee_pending;
+        if (raw._feeUnk) row.fee_unknown = 1; else delete row.fee_unknown;
+        if (!wasPend && String(row.fee) === String(nrm.fee)) continue;   // already final
+        if (sc._rep && sc._rep.g) delete sc._rep.g[lbGroupKey(row)];
+        delete _lbTrCache[slot];
+        lbSnapSoon(0);
+        fixed++;
+      }
+    }
+    return fixed;
+  }
+  // #2275 currently-pending / permanently-unknown fee counts for the panel's
+  // honest-degradation chip (read-only; both markets folded).
+  function kcFeeWaitCounts(slot) {
+    const R = kcFillRings[String(slot)];
+    if (!R) return null;
+    const pend = ((R.sp && R.sp.nofee) | 0) + ((R.fu && R.fu.nofee) | 0);
+    const unk = ((R.sp && R.sp.feeUnk) | 0) + ((R.fu && R.fu.feeUnk) | 0);
+    return (pend || unk) ? { pend: pend, unk: unk } : null;
+  }
   function kcFillPush(F, rows, fresh) {
     let n = 0;
+    const now = Date.now();
+    if (!F.pend) F.pend = {};
     for (const f of (rows || [])) {
       const k = kcRingKey(f);
       if (!k || F.seen[k]) continue;
-      // Fee UNKNOWN is not fee zero. /api/v1/fills always carries `fee`, so
-      // this never fires in practice — and when it somehow does, the row is
-      // left UNSEEN so the next overlap window re-asks for it rather than
-      // recording a real zero the break-even replay would then trust.
-      if (!lbKcFeeKnown(f)) { F.nofee = (F.nofee | 0) + 1; continue; }
+      const p = F.pend[k];
+      // Fee UNKNOWN is not fee zero — but the execution is REAL now (#2275).
+      // The row is admitted immediately carrying an explicit fee-pending
+      // marker (lbNormKucoinFill stamps it) and stays UN-seen, so the next
+      // overlap window re-asks for the fee-bearing copy, which settles this
+      // SAME row in place instead of duplicating the trade. F.nofee counts
+      // the rows currently awaiting their fee.
+      if (!lbKcFeeKnown(f)) {
+        if (p) continue;               // already pending — wait for the fee
+        F.nofee = (F.nofee | 0) + 1;
+        f._feePendT = now;
+        F.pend[k] = f;
+        F.rows.push(f);
+        if (fresh) fresh.push(f);
+        lbSrcTouch(F);   // one touch per pushed row (drain cursor)
+        n++;
+        continue;
+      }
+      if (p) { kcFeeSettle(F, k, p, f); if (fresh) fresh.push(p); n++; continue; }
       F.seen[k] = 1;
       F.rows.push(f);
       if (fresh) fresh.push(f);
       lbSrcTouch(F);   // one touch per pushed row (drain cursor)
       n++;
     }
+    kcFeePendSweep(F, now);
     if (F.rows.length > KC_FILL_RING_CAP) {
       const drop = F.rows.splice(0, F.rows.length - KC_FILL_RING_CAP);
-      for (const f of drop) { const k = kcRingKey(f); if (k) delete F.seen[k]; }
+      for (const f of drop) {
+        const k = kcRingKey(f);
+        if (k) { delete F.seen[k]; if (F.pend[k]) delete F.pend[k]; }
+      }
     }
     return n;
   }
@@ -15432,6 +15569,13 @@ function createTradeNative(opts) {
       if (sc.rows.length > LB_ROWS_CAP) lbPruneTap(slot, venue, sc);
       lbSaveSoon(slot, addRows);
     }
+    // #2275 KuCoin fee settle-in-place: patch the stored copies of any fills
+    // whose fee (or fee-unknown latch) landed since the last drain. Runs
+    // AFTER the merge so a just-merged pending row is reachable.
+    if (venue === 'kucoin') {
+      const Rk = kcFillRings[slot];
+      if (Rk) { try { kcFeeFixDrain(slot, sc, Rk); } catch (e) { /* best-effort */ } }
+    }
     return added;
   }
   function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin'; }
@@ -15599,12 +15743,15 @@ function createTradeNative(opts) {
     const hit = _lbTrCache[slot];
     if (hit && hit.rows === sc.rows && hit.len === sc.rows.length &&
         hit.dmSig === dmSig) {
+      // #2275 fee-wait counts ride EVERY reply shape (incl. unchanged) so the
+      // panel chip tracks pending/unknown fees without a payload rev bump.
+      const fwH = venue === 'kucoin' ? kcFeeWaitCounts(slot) : null;
       if ((intent.haveRev | 0) === hit.rev) {
         return { ok: true, unchanged: true, rev: hit.rev, added: added,
-                 count: sc.rows.length, bf: sc.bf || null };
+                 count: sc.rows.length, bf: sc.bf || null, feeWait: fwH || undefined };
       }
       return Object.assign({ ok: true, rev: hit.rev, added: added, count: sc.rows.length,
-                             hwm: hit.hwm, bf: sc.bf || null }, pack(hit));
+                             hwm: hit.hwm, bf: sc.bf || null, feeWait: fwH || undefined }, pack(hit));
     }
     let trades, quar, tj;
     try {
@@ -15657,7 +15804,8 @@ function createTradeNative(opts) {
                          rev: ++_lbTrRev, trades: trades, quar: quar || [],
                          hwm: hwm, tj: tj == null ? null : tj, qj: null };
     return Object.assign({ ok: true, rev: _lbTrCache[slot].rev, added: added,
-                           count: sc.rows.length, hwm: hwm, bf: sc.bf || null },
+                           count: sc.rows.length, hwm: hwm, bf: sc.bf || null,
+                           feeWait: venue === 'kucoin' ? (kcFeeWaitCounts(slot) || undefined) : undefined },
                          pack(_lbTrCache[slot]));
   }
   // Startup/arm gap backfill: "all fills since my newest locally-recorded
