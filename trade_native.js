@@ -2427,11 +2427,7 @@ function lbReconstruct(fills, displayMap) {
           net = sign * (tr.close_notional - tr.open_notional) - tr.commission - fund;
         }
       }
-      let pct = 0;
-      if (openPx > 0 && closePx > 0) {
-        const raw = (closePx - openPx) / openPx * 100;
-        pct = tr.dir === 'long' ? raw : -raw;
-      }
+      const pct = tr.open_notional > 0 ? net / tr.open_notional * 100 : 0;
       let tid = tr.market + ':' + tr.symbol + ':' + tr.open_ts + ':' + tr.close_ts;
       if (tr.aid) tid = 'a' + tr.aid + ':' + tid;
       tr.out = {
