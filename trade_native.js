@@ -159,6 +159,32 @@ const PHEMEX_BASE = 'https://api.phemex.com';
 const PHEMEX_HOST = 'api.phemex.com';
 const PHEMEX_EXPIRY_S = 60;
 const HTTP_TIMEOUT_MS = 12000;
+// #2281 Phemex account-read budget. Phemex is by far the worst citizen of the
+// shared pool (field capture 2026-08-16: 480 reads, p50 2,340 ms, p90 4,912 ms,
+// max 16,828 ms — ~1,196 s of pool wall time, a quarter of the whole session's
+// budget on one venue), and its read is four-plus SEQUENTIAL signed legs, so
+// the generic 12 s transport timeout let a single hung leg hold the venue's
+// share of the pool for most of a minute. The read now carries a hard overall
+// DEADLINE and each leg's socket timeout is clamped to whatever is left of it,
+// so a hung request is abandoned long before it can wedge anything. Applies to
+// the background account-read lane ONLY — order placement, cancellation and
+// the fill-recording legs keep the full HTTP_TIMEOUT_MS.
+const PHEMEX_ACCT_LEG_MS = 4000;
+const PHEMEX_ACCT_DEADLINE_MS = 7000;
+// #2281 per-ATTEMPT socket timeout under an ABSOLUTE deadline. Returns the
+// smaller of the caller's own per-attempt cap and whatever is LEFT of the
+// deadline; a result of 0 or less means "the budget is spent — do not open a
+// socket at all". Re-evaluated per attempt rather than once per call, so
+// httpJson's one phase-aware retry can only ever spend the REMAINDER of the
+// deadline instead of being handed a second full timeout (which is how a
+// nominally 7 s read could otherwise run past 20 s and keep holding its share
+// of the shared pool). No deadline ⇒ the caller's cap ⇒ today's behavior.
+function httpTmoAt(timeoutMs, deadlineAt, now) {
+  const base = (Number.isFinite(timeoutMs) && timeoutMs > 0)
+    ? Math.min(timeoutMs, HTTP_TIMEOUT_MS) : HTTP_TIMEOUT_MS;
+  if (!(Number.isFinite(deadlineAt) && deadlineAt > 0)) return base;
+  return Math.min(base, deadlineAt - now);
+}
 const PRODUCTS_TTL_MS = 10 * 60 * 1000;
 const TIMESYNC_TTL_MS = 10 * 60 * 1000;
 
@@ -5120,6 +5146,40 @@ const ACCT_RL_COOLDOWN_MS = {
 };
 const ACCT_RL_MAX_MS = 120000;
 const ACCT_READ_MEMO_MS = 1200;
+// #2281 union pacing. The panel applies its budget-audited per-venue cadence
+// PER WINDOW, but a venue only ever sees the UNION of every window's polls
+// through this one process — with five terminal windows open the 1200 ms memo
+// deduped almost nothing (field capture 2026-08-16: every venue converged on
+// ~0.49 reads/s regardless of whether its audited cadence was 2.5 s or 10 s,
+// 5,495 reads in 1,042 s). A caller may now declare the cadence it is polling
+// at (intent.memoMs, additive — an old panel keeps the 1200 ms default byte
+// for byte) so N windows really do cost the venue ONE request train per
+// cadence. Clamped: never below the old default, never above the ceiling, and
+// checked against the CALLER's own value so the fastest-demanding window
+// still gets its full freshness.
+const ACCT_READ_MEMO_MAX_MS = 20000;
+function acctMemoMs(intent) {
+  const m = intent && Number(intent.memoMs);
+  if (!Number.isFinite(m) || !(m > 0)) return ACCT_READ_MEMO_MS;
+  return Math.min(Math.max(m, ACCT_READ_MEMO_MS), ACCT_READ_MEMO_MAX_MS);
+}
+// #2281 shared-pool admission caps. Field capture 2026-08-16 (15 windows, 11
+// venues, 17.4 min): AVERAGE outbound concurrency was only 2.29 requests, but
+// the per-window metronomes align and every venue fires together — the same
+// session peaked at 43 simultaneous in-flight TLS requests and spent whole 6 s
+// stretches above 20. Everything (including each renderer's own /state poll)
+// funnels through one tunnel, so those bursts queue the user-visible path
+// behind background refresh and every window wedges at once (17 stalls, all
+// 6.0-7.0 s, several simultaneous across five windows). Admitting at most
+// ACCT_POOL_MAX_TOTAL costs nothing at a 2.29 average and removes the spikes.
+const ACCT_POOL_MAX_TOTAL = 6;
+// Per-venue share is HARD: a venue whose reads hang can never occupy more than
+// this, so a slow venue degrades ONLY its own data.
+const ACCT_POOL_MAX_VENUE = 2;
+// …and the GLOBAL cap is soft after this bound: a waiter queued longer than
+// ACCT_POOL_OVERFLOW_MS is admitted regardless of the total, so a wedged venue
+// sitting on its own slots can never stall the other ten.
+const ACCT_POOL_OVERFLOW_MS = 4000;
 // #2131 hot-venue priority: a venue where the user JUST traded (own fill /
 // order event / gesture — markHot below, or an intent stamped prio:'hot' by
 // the panel) is HOT for ACCT_HOT_MS. HOT reads jump ahead of routine
@@ -5167,6 +5227,86 @@ function acctPrioGate(nowFn, yieldMs) {
     exit: (isHot) => { if (isHot) { hotN = hotN > 0 ? hotN - 1 : 0; release(); } },
   };
 }
+// #2281 shared-pool admission gate (pure factory, injectable clock — node-
+// tested). acctPrioGate above only ORDERS dispatch; nothing bounded how many
+// account reads were on the wire at once, and the answer in the field was 43.
+// Three rules:
+//   * per-venue cap is HARD — one venue can never occupy more than its share,
+//     so a hanging venue degrades only its own data;
+//   * the global cap is soft past overflowMs — a waiter queued longer than the
+//     bound is admitted anyway, so a wedged venue can never stall the others;
+//   * hot waiters (the venue the user is trading) are granted before idle
+//     background refresh, and a waiter blocked by ITS venue's cap is skipped
+//     over rather than blocking the queue behind it.
+// Admission REORDERS and paces; it never sheds a read and never changes what
+// is requested. Trading paths (order/cancel/fills) do not ride this gate at
+// all — only the background account-read lane does.
+function acctPoolGate(nowFn, opts) {
+  const now = typeof nowFn === 'function' ? nowFn : Date.now;
+  const o = opts || {};
+  const pick = (v, d) => (Number.isFinite(v) && v > 0) ? v : d;
+  const maxTot = pick(o.maxTotal, ACCT_POOL_MAX_TOTAL);
+  const maxVen = pick(o.maxVenue, ACCT_POOL_MAX_VENUE);
+  const ovMs = pick(o.overflowMs, ACCT_POOL_OVERFLOW_MS);
+  let tot = 0;
+  const per = {};                  // venue → in-flight count
+  const qHot = [], qIdle = [];     // waiters, FIFO within tier
+  const vN = (v) => per[v] || 0;
+  const take = (v) => { tot++; per[v] = vN(v) + 1; };
+  const free = (v) => (vN(v) < maxVen) && (tot < maxTot);
+  const grant = (w) => {
+    if (w.done) return;
+    w.done = true;
+    if (w.tm) { try { clearTimeout(w.tm); } catch (e) { /* noop */ } w.tm = null; }
+    take(w.v);
+    try { w.res(Math.max(0, now() - w.t0)); } catch (e) { /* already settled */ }
+  };
+  // A waiter past the overflow bound ignores the GLOBAL cap only — the
+  // per-venue cap is never waived.
+  const admit = (w) => (vN(w.v) < maxVen) && (tot < maxTot || (now() - w.t0) >= ovMs);
+  const pump = () => {
+    for (const q of [qHot, qIdle]) {
+      for (let i = 0; i < q.length; ) {
+        const w = q[i];
+        if (w.done) { q.splice(i, 1); continue; }
+        if (!admit(w)) { i++; continue; }   // venue-capped → skip, never block the queue
+        q.splice(i, 1);
+        grant(w);
+      }
+    }
+  };
+  const wait = (v, isHot) => new Promise((res) => {
+    const w = { v: v, t0: now(), res: res, done: false, tm: null };
+    (isHot ? qHot : qIdle).push(w);
+    // Overflow escape hatch: without a release nothing would re-check the
+    // bound, so arm one timer per waiter (cleared on grant, unref'd so it can
+    // never hold the process open).
+    try {
+      w.tm = setTimeout(() => { w.tm = null; pump(); }, ovMs + 25);
+      if (w.tm && typeof w.tm.unref === 'function') w.tm.unref();
+    } catch (e) { /* timers unavailable — release still pumps */ }
+  });
+  return {
+    // Returns a NUMBER (0) synchronously when a slot is free — the guard's
+    // uncontended path must stay synchronous (single-flight timing) — and a
+    // promise resolving to the queued-wait ms only under contention.
+    acquire: (venue, isHot) => {
+      const v = String(venue || '');
+      if (free(v)) { take(v); return 0; }
+      return wait(v, !!isHot);
+    },
+    release: (venue) => {
+      const v = String(venue || '');
+      if (tot > 0) tot--;
+      if (per[v] > 0) { per[v]--; if (!per[v]) delete per[v]; }
+      pump();
+    },
+    // Diag/testing surface: in-flight totals at this instant.
+    depth: () => ({ tot: tot, v: Object.assign({}, per),
+                    wait: qHot.length + qIdle.length }),
+    pump: pump,
+  };
+}
 // One read outcome → was it a rate-limit? Explicit flag (wrappers that parse
 // Retry-After) or the uniform "Rate limited by <venue>" message every venue
 // wrapper emits for 429 statuses AND body-code maps (OKX 50011, KuCoin
@@ -5200,6 +5340,7 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
   const memo = {};       // venue|credSlot → { ts, r, hot }
   const hotAt = {};      // #2131: venue → last own-trade-activity ts
   const gate = acctPrioGate(now);   // #2131: hot-first dispatch ordering
+  const pool = acctPoolGate(now);   // #2281 shared-pool admission caps
   let readSeq = 0;       // #1853: monotonic ISSUANCE seq stamped on results
   const guarded = async function (intent) {
     const venue = String((intent && intent.venue) || '');
@@ -5222,7 +5363,7 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
     // #2131: a HOT read must not be served a stale memo an IDLE poll just
     // populated — hot reuses only hot-stamped memo entries; idle reads keep
     // the full memo window byte-identically.
-    if (m && t0 - m.ts < ACCT_READ_MEMO_MS && (!isHot || m.hot)) {
+    if (m && t0 - m.ts < acctMemoMs(intent) && (!isHot || m.hot)) {   // #2281 caller cadence
       emit('memo', { venue: venue }); return m.r;
     }
     if (inflight[key]) { emit('coalesced', { venue: venue }); return await inflight[key]; }
@@ -5240,18 +5381,36 @@ function acctReadGuard(runRaw, nowFn, onEvent) {
       // gate.enter returns 0 SYNCHRONOUSLY when uncontended so the raw call
       // keeps firing on the same tick (single-flight timing unchanged).
       const qe = gate.enter(isHot);
-      const qms = (typeof qe === 'number') ? qe : await qe;
+      const q1 = (typeof qe === 'number') ? qe : await qe;
+      // #2281 admission: bounded share of the shared outbound pool. Same
+      // synchronous-when-free contract as the priority gate above, so an
+      // uncontended read still fires on this tick.
+      const pe = pool.acquire(venue, isHot);
+      const q2 = (typeof pe === 'number') ? pe : await pe;
+      const qms = q1 + q2;
+      const dep = pool.depth();
+      const dispT = now();
       let r;
       try {
         // __hot rides the intent copy so venue readers can claim priority on
         // their own internal budgets (kraken rate-points ledger) — additive,
         // the original intent object is never mutated.
         r = await runRaw(isHot ? Object.assign({}, intent, { __hot: 1 }) : intent);
-      } finally { gate.exit(isHot); }
+      } finally { gate.exit(isHot); pool.release(venue); }
       if (r && typeof r === 'object') {
         if (r.readSeq == null) r.readSeq = issSeq;
         if (r.prio == null) r.prio = isHot ? 'hot' : 'idle';   // #2131 diag
         if (r.qms == null && Number.isFinite(qms)) r.qms = Math.round(qms);
+        // #2281: pool depth AT DISPATCH — the gauge that identifies pool
+        // saturation in a capture without guessing it from overlapping spans.
+        if (r.inf == null) r.inf = dep.tot;
+        if (r.qw == null && dep.wait > 0) r.qw = dep.wait;
+        // #2281: the snapshot's true age. A memo hit hands this same object to
+        // a window that asked up to memoMs later, and a reader that stamps its
+        // push-overlay boundary at its OWN call time would then consume frames
+        // the snapshot never contained. Dispatch time is the conservative
+        // boundary (earlier ⇒ overlays survive rather than vanish).
+        if (r.snapTs == null) r.snapTs = dispT;
       }
       if (acctRlHit(r)) {
         const wait = acctRlWaitMs(venue, Number.isFinite(r.retryInMs) ? r.retryInMs : null);
@@ -5558,8 +5717,14 @@ function createTradeNative(opts) {
   // orders) shares one latch per host.
   const _bnBanReg = {};
 
-  function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes) {
+  function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes, timeoutMs, deadlineAt) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
+    // #2281 optional per-call socket timeout + ABSOLUTE deadline. Both default
+    // to absent, so every existing call site keeps HTTP_TIMEOUT_MS and one
+    // full-budget retry byte-identically; only the background account-read
+    // lane of a venue with a read deadline passes them. Evaluated per attempt
+    // (see httpTmoAt) so the retry below cannot outlive the deadline.
+    const tmoOf = () => httpTmoAt(timeoutMs, deadlineAt, Date.now());
     // #2026: while a Binance ban latch holds for this HOST, no request may
     // leave — each request during a ban EXTENDS it. Fail fast + fail visible
     // (order sends surface the ban message immediately, never queue).
@@ -5583,6 +5748,13 @@ function createTradeNative(opts) {
     };
     const attempt = () => new Promise((resolve, reject) => {
       const diagT0 = Date.now();
+      // #2281: the deadline is checked BEFORE a socket is opened, so an
+      // expired budget costs nothing on the wire and the caller's pool slot is
+      // released immediately instead of at the next transport timeout.
+      const tmo = tmoOf();
+      if (!(tmo > 0)) {
+        const de = new Error('timeout'); de.deadline = 1; reject(de); return;
+      }
       // Per-attempt transmit flag: flipped only after the request has fully
       // flushed to a live (TLS-complete) socket. An error with sent=false is
       // a connect-phase failure — nothing reached the venue.
@@ -5603,7 +5775,7 @@ function createTradeNative(opts) {
         // returning {agent: undefined} for direct so tradeViaFromAgent's
         // proxy/direct echo stays truthful.
         agent: ag.agent !== undefined ? ag.agent : sharedKeepAliveAgent(null, null),
-        headers: h, timeout: HTTP_TIMEOUT_MS,
+        headers: h, timeout: tmo,
       }, (res) => {
         let buf = '';
         res.setEncoding('utf8');
@@ -5650,7 +5822,9 @@ function createTradeNative(opts) {
     // double-fill risk, nothing reached the venue); post-transmit dead-socket
     // errors keep the strict GET/DELETE-only matrix. See httpRetryAllowed.
     return attempt().then(banNote, (e) => {
-      if (httpRetryAllowed(method, e, !!(e && e.reqSent))) {
+      // #2281: a deadline-expired rejection is TERMINAL — the budget a retry
+      // would need is already spent, so retrying could only reject again.
+      if (!(e && e.deadline) && httpRetryAllowed(method, e, !!(e && e.reqSent))) {
         // Stale-socket failure → flush the agent's FREE pool first so the
         // retry is guaranteed a fresh socket (LIFO could otherwise hand it
         // another idle corpse the venue/CF killed in the same sweep).
@@ -5819,9 +5993,50 @@ function createTradeNative(opts) {
     return p.spot[symbol] || null;
   }
 
+  // #2281: last known Phemex clock offset (0 until the first probe lands) —
+  // the fallback when a deadline-bounded signer cannot wait for a slow probe.
+  function phemexClkOffsetMs() {
+    const k = venueTimeProbeKey('phemex', null);
+    const st = k ? venueClk[k] : null;
+    const o = st && Number(st.offsetMs);
+    return Number.isFinite(o) ? o : 0;
+  }
+
   // --- signed request runner ------------------------------------------------
   async function signedRequest(creds, step, route) {
-    const offMs = await ensureVenueTime('phemex', null, route);
+    // #2281: step.deadlineAt (absolute ms) is set ONLY by the background
+    // account-read lane. It bounds the WHOLE call, not just the socket: the
+    // clock probe below is a wire call too, and an unbounded await here was a
+    // hole through which a "7 s" read could sit on its pool slot indefinitely.
+    const dlAt = Number(step.deadlineAt);
+    const hasDl = Number.isFinite(dlAt) && dlAt > 0;
+    let offMs;
+    if (hasDl) {
+      const left = dlAt - Date.now();
+      if (left <= 0) return { ok: false, message: 'Phemex request timed out' };
+      // Wait for the probe only as long as a probe is worth waiting for: a
+      // sample slower than CLK_RTT_SANE_MS is one clkProbeFold would refuse to
+      // latch anyway, so blocking the read on it buys nothing and would hand
+      // the venue's whole budget to a clock probe (its own internal budget is
+      // 8 s — longer than this entire read). The probe keeps running in the
+      // background and lands for the NEXT read; meanwhile we sign with the
+      // last known offset, exactly as this venue already does when a probe
+      // fails or sits in 429 backoff. Phemex signs a 60 s EXPIRY rather than a
+      // tight recvWindow, so a cold-start offset of 0 is the documented
+      // initial state here, not a regression.
+      const clkWait = Math.min(left, CLK_RTT_SANE_MS);
+      const pr = ensureVenueTime('phemex', null, route);
+      Promise.resolve(pr).catch(() => {});   // stray probe — never unhandled
+      let tm = null;
+      offMs = await Promise.race([
+        Promise.resolve(pr).catch(() => null),
+        new Promise((rs) => { tm = setTimeout(() => rs(null), clkWait); }),
+      ]);
+      if (tm) clearTimeout(tm);
+      if (!Number.isFinite(offMs)) offMs = phemexClkOffsetMs();
+    } else {
+      offMs = await ensureVenueTime('phemex', null, route);
+    }
     const bodyStr = step.body != null ? canonJson(step.body) : '';
     const expiry = phemexExpiry(null, offMs / 1000);
     const headers = {
@@ -5831,7 +6046,11 @@ function createTradeNative(opts) {
     };
     let r;
     try {
-      r = await httpJson(PHEMEX_HOST, step.method, step.path, step.query || '', bodyStr || null, headers, route);
+      // #2281: step.timeoutMs / step.deadlineAt are set ONLY by the background
+      // account-read lane; every other caller stays undefined and keeps the
+      // generic HTTP_TIMEOUT_MS with its full-budget retry.
+      r = await httpJson(PHEMEX_HOST, step.method, step.path, step.query || '', bodyStr || null, headers, route,
+                         undefined, step.timeoutMs, hasDl ? dlAt : undefined);
     } catch (e) {
       const em = (e && e.message) || 'error';
       if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable — order NOT sent' };
@@ -12497,13 +12716,52 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'phemex');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
-    const acct = await signedRequest(creds, {
+    // #2281 read DEADLINE. This read is four-plus SEQUENTIAL signed legs, so at
+    // the generic 12 s transport timeout one hung leg could hold Phemex's share
+    // of the shared pool for most of a minute (observed max 16,828 ms). Every
+    // leg's socket timeout is clamped to what is LEFT of the deadline, and the
+    // optional per-symbol fallback loops stop at it, so the whole read is
+    // bounded — a hung request is abandoned instead of wedging the venue.
+    // Fail-visible: an abandoned leg surfaces as that leg's own error (or a
+    // partial-error note where the read already degrades), never as silent
+    // empty data. Only THIS lane is clamped: orders, cancels and the fills read
+    // pass no timeoutMs and keep the full HTTP_TIMEOUT_MS budget.
+    const dl0 = Date.now() + PHEMEX_ACCT_DEADLINE_MS;
+    // No post-expiry floor: once dl0 has passed there is no budget left to
+    // grant, so a leg must not START at all rather than be handed a courtesy
+    // slice. Every wire call in this function goes through rd()/cat() so the
+    // deadline is genuinely absolute across the whole read.
+    const legMs = () => Math.min(PHEMEX_ACCT_LEG_MS, dl0 - Date.now());
+    const past = () => Date.now() >= dl0;
+    const timedOut = { ok: false, message: 'Phemex account read timed out' };
+    const rd = (step) => past() ? Promise.resolve(timedOut)
+      : signedRequest(creds, Object.assign({ timeoutMs: legMs(), deadlineAt: dl0 }, step), route);
+    // The products catalog is a wire GET too (8 MB cap, generic timeout) and
+    // was the last unbounded await in this lane. It is TTL-cached, so the
+    // steady-state path resolves instantly and never races; only a cold or
+    // expired catalog can lose, and losing degrades exactly like a catalog
+    // fetch failure already does here (no derivable fallback symbols ⇒
+    // surfaced partial-error note; no scales ⇒ renderer-side default of 8).
+    const cat = async () => {
+      const left = dl0 - Date.now();
+      if (left <= 0) return null;
+      const pr = phemexProducts(route);
+      Promise.resolve(pr).catch(() => {});   // stray fetch — never unhandled
+      let tm = null;
+      const r = await Promise.race([
+        Promise.resolve(pr).catch(() => null),
+        new Promise((rs) => { tm = setTimeout(() => rs(null), left); }),
+      ]);
+      if (tm) clearTimeout(tm);
+      return r || null;
+    };
+    const acct = await rd({
       method: 'GET', path: '/g-accounts/accountPositions',
-      query: 'currency=USDT', body: null }, route);
+      query: 'currency=USDT', body: null });
     if (!acct.ok) return acct;
-    let fo = await signedRequest(creds, {
+    let fo = await rd({
       method: 'GET', path: '/g-orders/activeList',
-      query: 'currency=USDT', body: null }, route);
+      query: 'currency=USDT', body: null });
     let futRows;
     if (fo.ok) {
       futRows = (fo.data && fo.data.rows) || (Array.isArray(fo.data) ? fo.data : []);
@@ -12514,24 +12772,25 @@ function createTradeNative(opts) {
       const poss = ((acct.data || {}).positions || []).slice(0, 10);
       for (const p of poss) {
         if (!p || !p.symbol) continue;
-        const rs = await signedRequest(creds, {
+        if (past()) break;                      // #2281 deadline — stop walking symbols
+        const rs = await rd({
           method: 'GET', path: '/g-orders/activeList',
-          query: 'symbol=' + encodeURIComponent(p.symbol), body: null }, route);
+          query: 'symbol=' + encodeURIComponent(p.symbol), body: null });
         if (rs.ok) futRows = futRows.concat((rs.data && rs.data.rows) || (Array.isArray(rs.data) ? rs.data : []));
       }
     } else return fo;
     // Wallets BEFORE spot orders (#1722): the spot symbol-required fallback
     // derives its symbols from nonzero wallets × the products catalog.
-    const wl = await signedRequest(creds, {
-      method: 'GET', path: '/spot/wallets', query: '', body: null }, route);
+    const wl = await rd({
+      method: 'GET', path: '/spot/wallets', query: '', body: null });
     if (!wl.ok) return wl;
     // Shape-tolerant: /spot/wallets data is a bare list today, but a wrapped
     // {rows:[…]} variant must not silently empty the spot holdings (the DOM
     // posrow derives from these rows — engine twin unwraps identically).
     const wallets = Array.isArray(wl.data) ? wl.data
       : (wl.data && Array.isArray(wl.data.rows)) ? wl.data.rows : [];
-    const so = await signedRequest(creds, {
-      method: 'GET', path: '/spot/orders', query: '', body: null }, route);
+    const so = await rd({
+      method: 'GET', path: '/spot/orders', query: '', body: null });
     let spotRows;
     const partialErrors = [];
     if (so.ok) {
@@ -12545,7 +12804,8 @@ function createTradeNative(opts) {
       spotRows = [];
       let syms = [];
       try {
-        const pr = await phemexProducts(route);
+        const pr = await cat();   // #2281 deadline-bounded; null ⇒ no symbols
+        if (!pr) throw new Error('catalog unavailable within read deadline');
         const curs = {};
         for (const w of wallets) {
           const nz = (Number(w && w.balanceEv) || 0)
@@ -12561,18 +12821,21 @@ function createTradeNative(opts) {
       } catch (e) { /* no catalog → no derivable symbols → degrade below */ }
       let got = false;
       for (const sym of syms.slice(0, 10)) {
-        const rs = await signedRequest(creds, {
+        if (past()) break;                      // #2281 deadline — stop walking symbols
+        const rs = await rd({
           method: 'GET', path: '/spot/orders',
-          query: 'symbol=' + encodeURIComponent(sym), body: null }, route);
+          query: 'symbol=' + encodeURIComponent(sym), body: null });
         if (rs.ok) { got = true; spotRows = spotRows.concat((rs.data && rs.data.rows) || (Array.isArray(rs.data) ? rs.data : [])); }
       }
       if (!got) partialErrors.push({ scope: 'spot', message: so.message || 'spot orders unavailable' });
     } else return so;
     let curScales = {}, spotBaseScales = {};
     try {
-      const pr = await phemexProducts(route);
-      curScales = pr.curScales || {};
-      for (const s in (pr.spot || {})) spotBaseScales[s] = pr.spot[s].value_scale;
+      const pr = await cat();   // #2281 deadline-bounded (TTL-cached: normally instant)
+      if (pr) {
+        curScales = pr.curScales || {};
+        for (const s in (pr.spot || {})) spotBaseScales[s] = pr.spot[s].value_scale;
+      }
     } catch (e) { /* scales default to 8 renderer-side — majors byte-identical */ }
     const out = { ok: true,
              acct: acct.data || {},
@@ -16847,7 +17110,15 @@ function createTradeNative(opts) {
                      rows: diagRowCounts(r && r.data ? r.data : r) };
         // #2131: queue wait vs HTTP time at a glance — prio + queued-wait ms
         // (stamped by the guard's dispatch gate; absent on memo/paced hits).
-        if (r && r.prio) { dd.prio = r.prio; if (Number.isFinite(r.qms)) dd.qms = r.qms; }
+        // #2281: pool depth at dispatch + queued waiters — the saturation
+        // gauge a capture needs to separate "the pool was full" from "the
+        // venue was slow" without reconstructing it from overlapping spans.
+        if (r && r.prio) {
+          dd.prio = r.prio;
+          if (Number.isFinite(r.qms)) dd.qms = r.qms;
+          if (Number.isFinite(r.inf)) dd.inf = r.inf;
+          if (Number.isFinite(r.qw)) dd.qw = r.qw;
+        }
         tdiag('acct', op, dd);
       } else if (op === 'order' || op === 'cancel' || op === 'cancel_all' ||
                  op === 'close_pos' || op === 'amend') {
@@ -17131,6 +17402,7 @@ module.exports = {
   flushKeepAliveAgents,
   kaAgentKey,
   httpRetryLimit,
+  httpTmoAt,
   staleSocketError,
   connectPhaseError,
   httpRetryAllowed,
@@ -17420,6 +17692,15 @@ module.exports = {
   ACCT_HOT_MS,
   ACCT_IDLE_YIELD_MS,
   acctPrioGate,
+  // #2281 shared-pool admission + union pacing
+  ACCT_READ_MEMO_MAX_MS,
+  acctMemoMs,
+  ACCT_POOL_MAX_TOTAL,
+  ACCT_POOL_MAX_VENUE,
+  ACCT_POOL_OVERFLOW_MS,
+  acctPoolGate,
+  PHEMEX_ACCT_LEG_MS,
+  PHEMEX_ACCT_DEADLINE_MS,
   // pure — #2168 re-import reservation on the kraken rate-points ledger
   KR_RESV_TTL_MS,
   krResvNew,
