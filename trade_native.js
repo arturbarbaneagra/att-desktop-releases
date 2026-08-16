@@ -15385,13 +15385,26 @@ function createTradeNative(opts) {
       const s = gatePushSessions[slot];
       return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
     }
+    // ⚠️ SHAPE (#2303) — everything BELOW hands this gate the RING ITSELF, not
+    // a push session. A push session wraps its ring in `.fills` (that is all
+    // `rn` above does); a bgFillRings/kcFillRings slot is `{ sp, fu, … }` where
+    // `sp`/`fu` ARE the `{ rows, seen, rev }` rings. Reading `.fills` off one
+    // of those yields undefined, so lbSrcVer answers '-' for both markets and
+    // the whole signature freezes at the constant '-/-'. A frozen signature
+    // stops being a no-news gate: it can never see that fills arrived, so it
+    // degrades into a blind rate limiter that simply refuses the drain until
+    // the idle cap expires (field log, shell 1.5.117: Bitget 1146 ms / KuCoin
+    // 1573 ms push→blotter row, ingests exactly LB_DRAIN_IDLE_MS apart, while
+    // the push venues landed at 0 ms). So version the ring DIRECTLY here — and
+    // a future venue that keeps a bare ring belongs in THIS branch, never with
+    // `rn`.
     if (venue === 'bitget') {
       // #2246/#2247: the SAME two per-market rings carry both the paced REST
       // fills poll and the private-WS order deltas (one side-inclusive
       // tradeId seen-set), so the no-news gate and the incremental cursor
       // work exactly as they do for the push venues.
       const s = bgFillRings[slot];
-      return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
+      return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
     }
     if (venue === 'kucoin') {
       // #2272: the SAME two per-market rings carry the paced REST fills poll
@@ -15399,7 +15412,7 @@ function createTradeNative(opts) {
       // seen-set), so the no-news gate and the incremental cursor work
       // exactly as they do for the push venues.
       const s = kcFillRings[slot];
-      return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
+      return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
     }
     return '-';
   }
