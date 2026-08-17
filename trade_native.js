@@ -2750,21 +2750,38 @@ function lbReconstruct(fills, displayMap) {
       }
       const openPx = tr.open_qty > 0 ? tr.open_notional / tr.open_qty : 0;
       const closePx = tr.close_qty > 0 ? tr.close_notional / tr.close_qty : 0;
-      let net;
+      let net, netSrc = '';
       if (tr.market === 'spot') net = tr.close_notional - tr.open_notional - tr.commission;
       else {
         net = tr.closed_pnl - tr.commission - fund;
-        // #2177 gate: engine stamps per-fill closed PnL '0' by design (Gate
-        // hands none) — NET must come from the matched-notional fallback or
-        // every gate futures round-trip nets −fees.
+        // #2177 gate / #2339 lighter: these venues hand NO per-fill realized
+        // PnL (their normalizers stamp closed_pnl '0' by design) — NET must
+        // come from the matched-notional fallback or every such futures
+        // round-trip nets −fees, and on Lighter, whose fee is a TRUE zero,
+        // every row read a flat 0. The `closed_pnl === 0` gate is what keeps a
+        // venue-REPORTED value authoritative: the day a venue starts sending
+        // realized PnL it supersedes this derive with no other change.
         if ((tr.venue === 'bybit' || tr.venue === 'kucoin' || tr.venue === 'bitmex'
-             || tr.venue === 'kraken' || tr.venue === 'gate')
+             || tr.venue === 'kraken' || tr.venue === 'gate' || tr.venue === 'lighter')
             && tr.closed_pnl === 0 && tr.close_qty > 0) {
-          const sign = tr.dir === 'long' ? 1 : -1;
-          net = sign * (tr.close_notional - tr.open_notional) - tr.commission - fund;
+          // The derive is exact ONLY when this round trip's own opening fills
+          // are in the stored history: closed qty fully matched by opened qty,
+          // at a usable price. When they are not (history truncated before the
+          // entry, or a qty fill with no price) there is no cost basis and the
+          // honest answer is NO net — the same rule the spot cost-basis path
+          // follows — never a fabricated number.
+          if (tr.open_notional > 0 && tr.open_qty > 0
+              && Math.abs(tr.open_qty - tr.close_qty) <= LB_EPS) {
+            const sign = tr.dir === 'long' ? 1 : -1;
+            net = sign * (tr.close_notional - tr.open_notional) - tr.commission - fund;
+            netSrc = 'derived';
+          } else {
+            net = null;
+            netSrc = 'nobasis';
+          }
         }
       }
-      const pct = tr.open_notional > 0 ? net / tr.open_notional * 100 : 0;
+      const pct = (net !== null && tr.open_notional > 0) ? net / tr.open_notional * 100 : 0;
       let tid = tr.market + ':' + tr.symbol + ':' + tr.open_ts + ':' + tr.close_ts;
       if (tr.aid) tid = 'a' + tr.aid + ':' + tid;
       tr.out = {
@@ -2775,7 +2792,12 @@ function lbReconstruct(fills, displayMap) {
         dir: tr.dir,
         vol_base: lbFmt(tr.open_qty), vol_usd: lbMoney(tr.open_notional),
         open_px: lbFmt(openPx), close_px: lbFmt(closePx),
-        pct: lbMoney(pct), net: lbMoney(net),
+        pct: net === null ? '' : lbMoney(pct), net: net === null ? '' : lbMoney(net),
+        // PROVENANCE (additive — absent whenever the venue supplied the PnL,
+        // so every other row stays byte-identical): 'derived' = computed here
+        // from this device's own fill history, 'nobasis' = no cost basis in
+        // the stored history, net deliberately blank.
+        ...(netSrc ? { net_src: netSrc } : {}),
         commission: lbMoney(tr.commission), funding: lbMoney(fund),
         open_ts: tr.open_ts, close_ts: tr.close_ts,
         fills: tr.fills, keys: tr.keys,
@@ -5481,10 +5503,16 @@ function formEnc(pairs) {
 // Venue cool-downs sized to documented budgets (see panel poll-map audit):
 // slower-recovering counters (Kraken spot decay 0.33-0.5/s, Binance ban
 // escalation) cool longer than plain per-second limiters.
+// #2349 lighter: the budget is a ROLLING minute (60 requests / 40 same-type
+// transactions), so headroom comes back gradually rather than at a bucket
+// edge — a third of the window is the honest pause after a refusal. Lighter
+// sends no Retry-After, so this table entry IS the cool-down for it (its
+// absence was the concrete gap: a Lighter refusal used to fall through to the
+// anonymous 15s default with nothing venue-specific behind it).
 const ACCT_RL_COOLDOWN_MS = {
   bybit: 10000, okx: 10000, bitget: 10000,
   phemex: 15000, gate: 15000, kucoin: 15000, asterdex: 15000,
-  mexc: 20000, bitmex: 20000,
+  mexc: 20000, bitmex: 20000, lighter: 20000,
   binance: 30000, kraken: 30000,
 };
 const ACCT_RL_MAX_MS = 120000;
@@ -5666,6 +5694,168 @@ function acctRlWaitMs(venue, hintMs) {
   if (Number.isFinite(hintMs) && hintMs > 0) return Math.min(hintMs, ACCT_RL_MAX_MS);
   const c = ACCT_RL_COOLDOWN_MS[String(venue || '')];
   return (Number.isFinite(c) && c > 0) ? c : 15000;
+}
+// --- Lighter rate budget (#2349) --------------------------------------------
+// Lighter refuses orders once the account passes its request budget and warns
+// nobody on the way there: a live probe of the API confirms a SUCCESSFUL
+// response carries no X-RateLimit-*, no Retry-After and no remaining-quota
+// field. The venue never says how much budget is left, so the shell keeps its
+// own tally of what THIS APP sent and the panel paints it as a headroom chip.
+// Everything below is an ESTIMATE by construction — see ltRlRefuse for the one
+// moment ground truth arrives.
+//
+// Caps are a TABLE, never literals: the opt-in Premium and Plus tiers raise the
+// submission ceiling by orders of magnitude. Standard — the default zero-fee
+// tier — is the only entry today and nothing here tries to detect the tier.
+//   tx  40/min — the per-transaction-type cap that applies to EVERY account
+//                type; order creation is the default type, and a rapid clicker
+//                meets this ceiling first.
+//   req 60/min — the account/IP request cap a Standard account is bound to.
+//                Order submission gets NO separate bucket on this tier, so the
+//                sendTx calls count here too.
+const LT_RL_TIERS = {
+  standard: { tx: 40, req: 60 },
+};
+const LT_RL_TIER = 'standard';
+// Both caps are per ROLLING minute. A counter that reset on a minute boundary
+// would read 0/40 while the venue still holds the last 40 sends live — exactly
+// when it would mislead most — so the tally is a ring of send timestamps and
+// the count is "how many are inside the trailing 60 s".
+const LT_RL_WIN_MS = 60000;
+const LT_RL_RING_MAX = 512;   // bounded ring; far above any cap tracked here
+function ltRlCaps(tier) {
+  return LT_RL_TIERS[String(tier || '')] || LT_RL_TIERS[LT_RL_TIER];
+}
+function ltRlMake(tier) {
+  return { tier: LT_RL_TIERS[String(tier || '')] ? String(tier) : LT_RL_TIER,
+           tx: [], req: [], thr: null };
+}
+// Drop stamps that aged out of the window, then hard-cap the ring length (the
+// oldest go first — they are also the next to expire).
+function ltRlTrim(arr, now) {
+  const cut = now - LT_RL_WIN_MS;
+  let i = 0;
+  while (i < arr.length && arr[i] <= cut) i++;
+  if (i > 0) arr.splice(0, i);
+  if (arr.length > LT_RL_RING_MAX) arr.splice(0, arr.length - LT_RL_RING_MAX);
+  return arr;
+}
+// Non-mutating reads — correct whether or not the ring was trimmed first.
+function ltRlCount(arr, now) {
+  const cut = now - LT_RL_WIN_MS;
+  let n = 0;
+  for (let i = arr.length - 1; i >= 0; i--) { if (arr[i] <= cut) break; n++; }
+  return n;
+}
+// ms until the OLDEST in-window stamp ages out — i.e. when the next unit of
+// headroom returns. 0 when nothing is in the window (full headroom already).
+function ltRlFreesInMs(arr, now) {
+  const cut = now - LT_RL_WIN_MS;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] > cut) return Math.max(0, arr[i] + LT_RL_WIN_MS - now);
+  }
+  return 0;
+}
+// One send counted. `kind` is 'tx' for a signed transaction (sendTx /
+// sendTxBatch — a BATCH is one transaction however many orders it carries) or
+// 'req' for any Lighter REST call. A submission notes BOTH, from its own tap:
+// transactions are counted where they are signed, so a submission over the
+// private WS lane would feed the same counter without touching HTTP.
+function ltRlNote(st, kind, now) {
+  const arr = (kind === 'tx') ? st.tx : st.req;
+  arr.push(now);
+  ltRlTrim(arr, now);
+  return arr.length;
+}
+// Retry-After header → ms. Seconds form or an HTTP-date; anything else → 0.
+function ltRlRetryMs(ra, now) {
+  const s = String(ra == null ? '' : ra).trim();
+  if (!s) return 0;
+  if (/^\d+$/.test(s)) return Math.min(Number(s) * 1000, ACCT_RL_MAX_MS);
+  const t = Date.parse(s);
+  if (!isFinite(t)) return 0;
+  return Math.max(0, Math.min(t - now, ACCT_RL_MAX_MS));
+}
+// A refusal's short text: the venue's own message when the body carries one,
+// else the bare status. Used for the detector AND for the badge tooltip.
+function ltRlMsg(status, body) {
+  let raw = String(body == null ? '' : body);
+  try {
+    const d = JSON.parse(raw);
+    if (d && typeof d === 'object') {
+      raw = String(d.message || d.msg || '');
+      if (!raw && Number(d.code) === 429) raw = 'too many requests';
+    }
+  } catch (e) { /* not JSON — the raw text is the message */ }
+  return raw.replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+// Is this Lighter response the venue REFUSING on budget? Routed through the
+// shared per-venue detector (acctRlHit) rather than a second mechanism: HTTP
+// 429 is the explicit flag, and the body message goes through the same
+// "rate limit / too many requests" vocabulary every venue wrapper feeds it.
+function ltRlHit(status, body) {
+  const s = Number(status) || 0;
+  return acctRlHit({ ok: false, rateLimited: s === 429, message: ltRlMsg(s, body) });
+}
+// GROUND TRUTH — the only moment the venue tells us anything about the budget.
+// Latches a CONFIRMED-throttled state with a real cool-down (an explicit
+// Retry-After wins, else the shared per-venue table via acctRlWaitMs) and
+// re-syncs the counter UP to the cap, because the venue has just said there is
+// no headroom left and the estimate must stop claiming otherwise. The synthetic
+// stamps land at `now`: the traffic we could not see is assumed recent, which
+// is the conservative reading.
+// A refusal that arrives while our own count sits BELOW the cap is EVIDENCE of
+// traffic this app did not send — the budget is per IP and per L1 address, so
+// another device, another app, or anything else behind the same proxy exit
+// spends the same allowance invisibly. That is recorded (`outside: true`) and
+// surfaced as its own state; it is never reconciled away and never treated as
+// a counter bug.
+function ltRlRefuse(st, now, status, ra, body, kind) {
+  const caps = ltRlCaps(st.tier);
+  const txN = ltRlCount(st.tx, now);
+  const reqN = ltRlCount(st.req, now);
+  const waitMs = acctRlWaitMs('lighter', ltRlRetryMs(ra, now));
+  const k = (kind === 'tx') ? 'tx' : 'req';
+  const arr = (k === 'tx') ? st.tx : st.req;
+  const cap = (k === 'tx') ? caps.tx : caps.req;
+  for (let n = (k === 'tx') ? txN : reqN; n < cap; n++) arr.push(now);
+  ltRlTrim(arr, now);
+  st.thr = { at: now, until: now + waitMs, ms: waitMs, kind: k,
+             status: Number(status) || 0, msg: ltRlMsg(status, body),
+             outside: (k === 'tx') ? (txN < caps.tx) : (reqN < caps.req),
+             sentTx: txN, sentReq: reqN };
+  return st.thr;
+}
+// The wire frame the panel paints. Countdowns are RELATIVE ms so the renderer
+// never has to align clocks with the main process. Expired latches are dropped
+// here (the one mutation a snapshot makes, so the idle test below stays a plain
+// emptiness check).
+function ltRlSnap(st, now) {
+  const caps = ltRlCaps(st.tier);
+  if (st.thr && now >= st.thr.until) st.thr = null;
+  ltRlTrim(st.tx, now);
+  ltRlTrim(st.req, now);
+  const T = st.thr;
+  return { v: 1, tier: st.tier,
+           tx: ltRlCount(st.tx, now), txCap: caps.tx, txFreeMs: ltRlFreesInMs(st.tx, now),
+           req: ltRlCount(st.req, now), reqCap: caps.req, reqFreeMs: ltRlFreesInMs(st.req, now),
+           thr: T ? { untilMs: Math.max(0, T.until - now), status: T.status,
+                      msg: T.msg, outside: !!T.outside, kind: T.kind } : null };
+}
+// Nothing left to report: no send inside the window and no live latch. The
+// broadcaster stops ticking here, after the zeroed frame has gone out.
+function ltRlIdle(st, now) {
+  return !ltRlCount(st.tx, now) && !ltRlCount(st.req, now) && !st.thr;
+}
+// Change gate for the broadcast: countdowns are compared at SECOND resolution
+// (that is the resolution the badge shows), so a steady tally costs no IPC.
+function ltRlSig(s) {
+  if (!s) return '';
+  const T = s.thr;
+  return [s.tx, s.txCap, Math.ceil(s.txFreeMs / 1000), s.req, s.reqCap,
+          Math.ceil(s.reqFreeMs / 1000),
+          T ? Math.ceil(T.untilMs / 1000) + '|' + T.status + '|' + (T.outside ? 1 : 0) + '|' + T.msg : ''
+         ].join(',');
 }
 // Guard factory: wraps the raw per-venue dispatcher. Pure state machine over
 // an injectable clock so the dedup/backoff behavior is node-testable.
@@ -5879,6 +6069,10 @@ function createTradeNative(opts) {
   // #1867 push channel sink — main.js broadcasts each event to every panel
   // window ('att:ledger-push'). Absent (old wiring) → the channel is inert.
   const pushLedgerCb = typeof opts.pushLedger === 'function' ? opts.pushLedger : null;
+  // #2349 Lighter rate-budget sink — main.js broadcasts each tally frame to
+  // every panel window ('att:rl-budget'). Absent (old wiring) → the lane is
+  // inert and the tally never even starts ticking.
+  const pushRlBudgetCb = typeof opts.pushRlBudget === 'function' ? opts.pushRlBudget : null;
   function tdiag(cat, ev, data) {
     if (!diagTap) return;
     try { diagTap(cat, ev, data); } catch (e) { /* diagnostics never break trading */ }
@@ -6064,6 +6258,70 @@ function createTradeNative(opts) {
   // orders) shares one latch per host.
   const _bnBanReg = {};
 
+  // --- Lighter rate-budget tally (#2349) ------------------------------------
+  // ONE tally per app, kept here beside the ban registry for the same reason:
+  // httpJson is the single choke point every window's Lighter traffic rides
+  // (candle polls issued for renderer charts included — they arrive over the
+  // cat_http bridge and leave from here). Lighter applies its budget per IP and
+  // per L1 address, so ~15 open windows share ONE allowance; a per-window or
+  // per-DOM counter would under-report by an order of magnitude, which is worse
+  // than no badge at all.
+  // The panel only ever RECEIVES this tally, on a low-frequency broadcast tick.
+  // It is never read synchronously from a renderer and never recomputed in a
+  // render path — synchronous main-process access from a hot path has frozen
+  // every window in this app before, and a dropped update to a display costs
+  // nothing.
+  const LT_RL_TICK_MS = 1000;
+  const _ltRl = ltRlMake(LT_RL_TIER);
+  let _ltRlTimer = null;
+  let _ltRlSigLast = '';
+  function ltRlTick() {
+    const now = Date.now();
+    const snap = ltRlSnap(_ltRl, now);
+    const sig = ltRlSig(snap);
+    if (sig !== _ltRlSigLast) {
+      _ltRlSigLast = sig;
+      if (pushRlBudgetCb) { try { pushRlBudgetCb(snap); } catch (e) { /* window closing */ } }
+    }
+    // Idle → stop ticking (the zeroed frame above already went out, so the
+    // badge clears). The next Lighter request restarts the timer.
+    if (ltRlIdle(_ltRl, now) && _ltRlTimer) {
+      clearInterval(_ltRlTimer);
+      _ltRlTimer = null;
+    }
+  }
+  function ltRlKick() {
+    if (_ltRlTimer || !pushRlBudgetCb) return;
+    _ltRlTimer = setInterval(ltRlTick, LT_RL_TICK_MS);
+    try { if (_ltRlTimer.unref) _ltRlTimer.unref(); } catch (e) { /* non-node timer */ }
+  }
+  // One Lighter REST call about to hit the wire (see the httpJson tap): counted
+  // at SEND time, per ATTEMPT, because the venue counts what it RECEIVES —
+  // refusals and the transient-retry ladder's second wire request included.
+  function ltRlNoteReq(now) {
+    ltRlNote(_ltRl, 'req', now);
+    ltRlKick();
+  }
+  // One signed transaction about to leave for the venue. Counted where the tx
+  // is signed rather than where it is sent, so a submission over the private WS
+  // lane would feed the same counter; a sendTxBatch is ONE transaction here
+  // however many orders it carries.
+  function ltRlNoteTx(now) {
+    ltRlNote(_ltRl, 'tx', now);
+    ltRlKick();
+  }
+  // A Lighter response that MIGHT be the venue refusing on budget. Non-hits
+  // (every ordinary rejection — balance, precision, unknown order) fall
+  // through untouched.
+  function ltRlNoteRes(status, ra, body, kind) {
+    if (!ltRlHit(status, body)) return false;
+    const t = ltRlRefuse(_ltRl, Date.now(), status, ra, body, kind);
+    tdiag('lt', 'rl-refused', { s: t.status, waitMs: t.ms, kind: t.kind,
+                                outside: t.outside, tx: t.sentTx, req: t.sentReq });
+    ltRlKick();
+    return true;
+  }
+
   function httpJson(host, method, reqPath, query, bodyStr, headers, route, maxBytes, timeoutMs, deadlineAt) {
     const cap = (Number.isFinite(maxBytes) && maxBytes > 0) ? maxBytes : 262144;
     // #2281 optional per-call socket timeout + ABSOLUTE deadline. Both default
@@ -6108,6 +6366,12 @@ function createTradeNative(opts) {
       let sent = false;
       const ag = agentFor(route);
       if (ag.refuse) { reject(new Error('proxy-unavailable')); return; }
+      // #2349: this request is about to leave for Lighter — count it against
+      // the venue's rolling request budget. Every Lighter call in the app funnels
+      // through here (candles, book, account, nonce, fills AND the submissions
+      // themselves), from every window, which is exactly the union the venue
+      // meters. One boolean compare per request on every other host.
+      if (host === LIGHTER_HOST) ltRlNoteReq(diagT0);
       const h = Object.assign({}, headers);
       // Default JSON only when the caller didn't set an explicit type
       // (Lighter sendTx is form-urlencoded).
@@ -6138,6 +6402,14 @@ function createTradeNative(opts) {
                                  s: res.statusCode, ms: Date.now() - diagT0,
                                  b: buf.length, tr: buf.length >= cap,
                                  reused: !!req.reusedSocket });
+          // #2349: a Lighter refusal is the ONLY ground truth this venue gives
+          // about the budget (successful responses carry no quota headers at
+          // all), so latch it. Only NON-2xx bodies are inspected — the common
+          // case (hundreds of candle polls a minute) never pays a parse.
+          if (host === LIGHTER_HOST && !(res.statusCode >= 200 && res.statusCode < 300)) {
+            ltRlNoteRes(res.statusCode, (res.headers && res.headers['retry-after']) || null,
+                        buf, reqPath === '/api/v1/sendTx' ? 'tx' : 'req');
+          }
           resolve({ status: res.statusCode, text: buf,
                     // #1945: truncation surfaced to callers — a body clipped
                     // at the byte cap must fail EXPLICITLY (catalog parse
@@ -13067,6 +13339,11 @@ function createTradeNative(opts) {
         }
         const body = 'tx_type=' + encodeURIComponent(String(s.txType)) +
                      '&tx_info=' + encodeURIComponent(String(s.txInfo));
+        // #2349: one signed transaction leaving for the venue — counted against
+        // the per-transaction-type cap HERE (where transactions are signed)
+        // rather than at the HTTP layer, so a submission that ever rides the
+        // private WS lane feeds the same counter. A batch is ONE transaction.
+        ltRlNoteTx(Date.now());
         const r = await httpJson(LIGHTER_HOST, 'POST', '/api/v1/sendTx', '', body,
                                  { 'Content-Type': 'application/x-www-form-urlencoded' }, route);
         let data = null;
@@ -13078,6 +13355,10 @@ function createTradeNative(opts) {
         }
         drop();
         const msg = (data && (data.message || data.msg)) || '';
+        // #2349: a refusal that arrives as HTTP 200 with a throttle code in the
+        // body never reaches the transport tap — latch it here too. Non-hits
+        // (balance, precision, unknown order …) fall straight through.
+        ltRlNoteRes(code != null ? code : r.status, r.ra, msg, 'tx');
         return { ok: false, message: 'Lighter error ' + (code != null ? code : ('HTTP ' + (r.status || 0))) + (msg ? ' — ' + msg : '') };
       } catch (e) {
         drop();
@@ -13110,9 +13391,11 @@ function createTradeNative(opts) {
     return { ok: true, pu: pu };
   }
 
-  // Open positions from the PUBLIC /account blob (engine parity: sign<0 =
-  // Sell, size = |position|; no mark in this blob).
-  async function ltPositions(cc, route) {
+  // The PUBLIC /account blob — positions AND the collateral/assets figures in
+  // ONE request. Every caller that needs any of it goes through here so the
+  // venue never sees two GETs where one answers (#2338: its REST budget is
+  // small and shared with order placement).
+  async function ltAccountBlob(cc, route) {
     let r;
     try {
       r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/account',
@@ -13123,7 +13406,23 @@ function createTradeNative(opts) {
     let d = null;
     try { d = JSON.parse(r.text); } catch (e) { d = null; }
     const acc = d && Array.isArray(d.accounts) && d.accounts[0];
+    // #2349: a refused read speaks the SAME uniform language as every other
+    // venue wrapper ("Rate limited by <venue>" + the explicit flag), so the
+    // shared acct-read guard cools Lighter down off its own table entry
+    // instead of retrying straight back into the venue's refusal.
+    if (!acc && ltRlHit(r.status, r.text)) {
+      return { ok: false, rateLimited: true,
+               message: 'Rate limited by Lighter — retry shortly' };
+    }
     if (!acc) return { ok: false, message: 'Lighter account fetch failed (HTTP ' + (r.status || 0) + ')' };
+    return { ok: true, acc: acc };
+  }
+  // Open positions from the PUBLIC /account blob (engine parity: sign<0 =
+  // Sell, size = |position|; no mark in this blob).
+  async function ltPositions(cc, route) {
+    const b = await ltAccountBlob(cc, route);
+    if (!b.ok) return b;
+    const acc = b.acc;
     const rows = [];
     for (const p of (acc.positions || [])) {
       const sz = Number(p && p.position);
@@ -13642,6 +13941,7 @@ function createTradeNative(opts) {
     if (intent.venue === 'bitmex') return await execBitmexAcctRead(intent);
     if (intent.venue === 'asterdex') return await execAsterdexAcctRead(intent);
     if (intent.venue === 'kraken') return await execKrakenAcctRead(intent);
+    if (intent.venue === 'lighter') return await execLighterAcctRead(intent);
     if (intent.venue !== 'bybit') return { ok: false, message: 'native account reads not supported for this venue' };
     const creds = credsGet(intent.credSlot || intent.venue);
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
@@ -14839,6 +15139,50 @@ function createTradeNative(opts) {
              futOrders: Array.isArray(fo.data) ? fo.data : [],
              spotBalances: ((spotAcc.data || {}).balances) || [],
              spotOrders: Array.isArray(so.data) ? so.data : [] };
+  }
+
+  // Lighter native account read (#2338). Deliberately NOT shaped like the ten
+  // above: this venue already has a private WS lane carrying balance,
+  // positions, orders and fills, so a second full polling lane would spend a
+  // small REST budget re-fetching what is already in memory. Instead the read
+  // (a) keeps that lane warm, like every other push venue's acct read does,
+  // (b) answers ORDERS from the lane's own tracked open set — the venue's REST
+  // order endpoint is market_id-scoped, so a full snapshot costs one signed
+  // GET per listed market — and (c) spends ONE bounded request on the public
+  // /account blob, which carries positions AND collateral together and is the
+  // only source that still answers when the lane has not come up yet.
+  // The exclusion this replaces claimed only the server SDK could mint
+  // Lighter's auth token; ltAuthToken mints it here, offline, from the same
+  // bundled signer the lane authenticates with.
+  async function execLighterAcctRead(intent) {
+    const slot = intent.credSlot || 'lighter';
+    const creds = credsGet(slot);
+    if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
+    const route = routeNorm(intent.route);
+    const cc = await ltClient(creds);
+    if (!cc.ok) return cc;
+    let s = null;
+    try { s = ltPushEnsure(slot, creds, route); } catch (e) { /* reconcile-only */ }
+    const A = s ? s.fut : null;
+    const b = await ltAccountBlob(cc, route);
+    if (!b.ok) return b;
+    // Orders ship RAW but stamped (_sym / _mid / _maxLev) exactly as the push
+    // frames do, so the panel maps a reconciled row and a pushed row through
+    // the same normalizer and can never render them as different chips.
+    const orders = [];
+    if (A) {
+      for (const oid of Object.keys(A.orders)) {
+        const o = A.orders[oid];
+        if (o) orders.push(ltPushStamp({ row: o, mid: o.market_id }));
+      }
+    }
+    const acc = b.acc;
+    return { ok: true,
+             account: { collateral: acc.collateral,
+                        available_balance: acc.available_balance,
+                        assets: Array.isArray(acc.assets) ? acc.assets : [] },
+             positions: Array.isArray(acc.positions) ? acc.positions : [],
+             orders: orders };
   }
 
   // Kraken native account read (#1716): dual-scope. Futures flex account
@@ -19417,6 +19761,24 @@ module.exports = {
   acctRlHit,
   acctRlWaitMs,
   acctReadGuard,
+  // pure — #2349 Lighter rolling rate budget
+  LT_RL_TIERS,
+  LT_RL_TIER,
+  LT_RL_WIN_MS,
+  LT_RL_RING_MAX,
+  ltRlCaps,
+  ltRlMake,
+  ltRlTrim,
+  ltRlCount,
+  ltRlFreesInMs,
+  ltRlNote,
+  ltRlRetryMs,
+  ltRlMsg,
+  ltRlHit,
+  ltRlRefuse,
+  ltRlSnap,
+  ltRlIdle,
+  ltRlSig,
   // pure — #2131 hot-venue acct-read priority
   ACCT_HOT_MS,
   ACCT_IDLE_YIELD_MS,

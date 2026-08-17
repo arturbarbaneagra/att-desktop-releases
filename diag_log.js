@@ -21,6 +21,8 @@
 // enforce DIAG_TOTAL_CAP bytes across the folder (oldest deleted first).
 // Runtime caps: per-event-key rate limit (a flapping feed cannot blow the file
 // up) + a per-launch byte cap (past it, one final "capped" line, then silence).
+// The per-key allowance is admin-tunable without a build (settings.diag.rlMax,
+// read at launch); the BYTE cap is the real ceiling whatever it is set to.
 //
 // Pure helpers (diagSanitize, diagLine, rate-limit math) are exported for the
 // node tests; only createDiagLogger touches the filesystem.
@@ -31,8 +33,18 @@ const path = require('path');
 const DIAG_KEEP_FILES = 10;                 // launches kept (incl. the new one)
 const DIAG_TOTAL_CAP = 50 * 1024 * 1024;    // folder-wide byte cap
 const DIAG_FILE_CAP = 10 * 1024 * 1024;     // per-launch byte cap
-const DIAG_RL_MAX = 30;                     // events per key per window
+// #2340: default events per key per window. 30/min could not survive an active
+// trading burst — one 13-minute field session lost 15,203 lines to THIS
+// throttle (not to any venue), and the densest keys are exactly the evidence a
+// forensic read needs. The per-launch byte cap below is the real ceiling, so
+// raising this trades "silent per-key loss all session" for "full detail until
+// the file cap, then one honest capped marker".
+const DIAG_RL_MAX = 300;
 const DIAG_RL_WINDOW_MS = 60 * 1000;        // rate-limit window
+// Bounds for the admin-configurable allowance (settings.diag.rlMax): a typo
+// must not silence the log nor uncap the limiter outright.
+const DIAG_RL_MAX_MIN = 1;
+const DIAG_RL_MAX_LIMIT = 5000;
 const DIAG_STR_MAX = 400;                   // max chars for any logged string
 
 // Key names whose VALUES must never be written (case-insensitive substring
@@ -145,22 +157,39 @@ function diagRotate(dir, keepFiles, totalCap) {
 
 // Per-event-key rate limiter state machine (pure — injected clock, node-tested).
 // Key = cat|ev|k (k is an optional caller-chosen sub-key, e.g. a conn key or
-// host). Allows DIAG_RL_MAX per rolling window; the first suppressed event
-// emits ONE marker ({e:'rl', key, n}) when the window rolls over.
+// host). Allows the configured max per rolling window; the first suppressed
+// event emits ONE marker ({e:'rl', rk, dropped, max}) when the window rolls
+// over. The marker's key field is `rk`, NOT `key`: the sanitizer redacts
+// secret-shaped names wholesale and `key` is one of them, so the one line whose
+// job is to name the flooding event used to redact its own subject (#2340).
 // #1864: events exempt from the rate limiter — each must be provably
 // self-bounded where it is emitted (kr_ws_lag: one per minute per scope).
 const DIAG_RL_EXEMPT = { kr_ws_lag: 1 };
+
+// PURE: resolve the per-key allowance from admin config (settings.diag.rlMax),
+// so the cap is tunable without shipping a build. Read once at construction —
+// like the enabled toggle, a change takes effect on the NEXT launch (a file
+// covers a whole launch under one cap or none of it). Absent, unparseable,
+// zero/negative → the shipped default; absurd values clamp to DIAG_RL_MAX_LIMIT
+// so a stray hand-edit can never disable the limiter.
+function diagRlMaxFrom(raw) {
+  const n = typeof raw === 'string' ? Number(raw.trim()) : raw;
+  if (typeof n !== 'number' || !isFinite(n)) return DIAG_RL_MAX;
+  const v = Math.floor(n);
+  if (v < DIAG_RL_MAX_MIN) return DIAG_RL_MAX;
+  return Math.min(v, DIAG_RL_MAX_LIMIT);
+}
 
 function diagRateLimiter(maxPerWindow, windowMs) {
   const max = maxPerWindow > 0 ? maxPerWindow : DIAG_RL_MAX;
   const win = windowMs > 0 ? windowMs : DIAG_RL_WINDOW_MS;
   const st = {};   // key → { t0, n, dropped }
   // returns: {ok:true} — write it; {ok:false} — drop silently;
-  //          {ok:true, note:{key,dropped}} — write it, PLUS a rollover marker.
+  //          {ok:true, note:{rk,dropped,max}} — write it, PLUS a rollover marker.
   return function allow(key, now) {
     let s = st[key];
     if (!s || now - s.t0 >= win) {
-      const note = (s && s.dropped > 0) ? { key: key, dropped: s.dropped } : null;
+      const note = (s && s.dropped > 0) ? { rk: key, dropped: s.dropped, max: max } : null;
       s = st[key] = { t0: now, n: 1, dropped: 0 };
       return note ? { ok: true, note: note } : { ok: true };
     }
@@ -241,7 +270,10 @@ function createDiagLogger(opts) {
       const key = cat + '|' + ev + '|' + String((data && data.k) || '');
       const a = allow(key, t);
       if (!a.ok) return;
-      if (a.note) writeLine(diagLine(t, 'main', 'diag', 'rl', { key: a.note.key, dropped: a.note.dropped }));
+      // #2340: `rk`, never `key` — a field literally named `key` is redacted by
+      // the sanitizer's secret-name rule, which blanked the very subject this
+      // marker exists to report. The rule itself stays untouched.
+      if (a.note) writeLine(diagLine(t, 'main', 'diag', 'rl', { rk: a.note.rk, dropped: a.note.dropped, max: a.note.max }));
       writeLine(diagLine(t, win, cat, ev, data));
     },
     close: function () {
@@ -257,6 +289,7 @@ module.exports = {
   diagLine,
   diagRotate,
   diagRateLimiter,
+  diagRlMaxFrom,
   diagFileName,
   diagKeyIsSecret,
   diagTruncAddr,
@@ -264,6 +297,8 @@ module.exports = {
   DIAG_TOTAL_CAP,
   DIAG_FILE_CAP,
   DIAG_RL_MAX,
+  DIAG_RL_MAX_MIN,
+  DIAG_RL_MAX_LIMIT,
   DIAG_RL_WINDOW_MS,
   DIAG_RL_EXEMPT,
 };

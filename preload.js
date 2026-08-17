@@ -196,11 +196,21 @@ try {
       try { ipcRenderer.send('att:ledger-sub'); } catch (e) { /* old shell */ }
       ipcRenderer.on('att:ledger-push', (e, p) => { try { cb(p); } catch (err) { /* page handler */ } });
     },
+    // #2349 Lighter rate-budget lane: the shell counts every Lighter request
+    // and order submission the WHOLE APP sends (one budget per IP / L1
+    // address, shared by every window) and broadcasts the rolling tally on a
+    // ~1s tick. Receive-only on purpose — the badge must never read the main
+    // process synchronously from a render path, and a dropped frame is free.
+    // Registering subscribes this window so main can skip silent ones.
+    onRateBudget: (cb) => {
+      try { ipcRenderer.send('att:rlb-sub'); } catch (e) { /* old shell */ }
+      ipcRenderer.on('att:rl-budget', (e, p) => { try { cb(p); } catch (err) { /* page handler */ } });
+    },
     // Capability list (#1713): the panel probes this to decide which NEW
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe
     // for the pre-#1713 features.
-    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:mexc2', 'cat:arcus', 'cat:http', 'lblot:binance', 'lblot:kraken', 'lblot:hyperliquid', 'lblot:bybit', 'lblot:gate', 'lblot:bitget', 'lblot:kucoin', 'lblot:asterdex', 'lblot:lighter', 'lblotri'],
+    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'acct:lighter', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:mexc2', 'cat:arcus', 'cat:http', 'lblot:binance', 'lblot:kraken', 'lblot:hyperliquid', 'lblot:bybit', 'lblot:gate', 'lblot:bitget', 'lblot:kucoin', 'lblot:asterdex', 'lblot:lighter', 'lblotri', 'rlb:lighter'],
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 

@@ -86,7 +86,7 @@ function dynFeatureWinCount() {
 // from a prior admin session — no role known = no logger, no files). dlog()
 // is the zero-overhead guard every call site rides.
 // ---------------------------------------------------------------------------
-const { createDiagLogger } = require('./diag_log');
+const { createDiagLogger, diagRlMaxFrom } = require('./diag_log');
 let diag = null;
 function dlog(win, cat, ev, data) {
   if (!diag) return;
@@ -107,10 +107,14 @@ function diagSettings() {
 // Construct the logger for this launch — ONLY when a prior session proved the
 // user is admin AND the toggle isn't off. Toggle changes take effect next
 // launch by design (the file covers a whole launch or none of it).
+// #2340: settings.diag.rlMax tunes the per-event-key allowance per minute
+// without shipping a build (hand-edit settings.json; same next-launch rule).
+// Out-of-range/garbage falls back to the shipped default inside diagRlMaxFrom,
+// and the per-launch byte cap stays the real ceiling whatever it is set to.
 function initDiag() {
   const d = diagSettings();
   if (!(d.admin === true && d.enabled !== false)) return;
-  try { diag = createDiagLogger({ dir: diagDir() }); } catch (e) { diag = null; }
+  try { diag = createDiagLogger({ dir: diagDir(), rlMax: diagRlMaxFrom(d.rlMax) }); } catch (e) { diag = null; }
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,7 +1453,7 @@ const NATIVE_WS_HOSTS = new Set([
   'fstream.binance.com',        // USDT-M futures combined streams
   'stream.binance.com',         // spot combined streams (:9443)
   'data-stream.binance.com',    // spot market-data mirror
-  'nbstream.binance.com',       // Binance Alpha wsa combined streams (WS only — bapi REST stays browser-side)
+  'nbstream.binance.com',       // Binance Alpha wsa combined streams (WS only — the bapi REST host www.binance.com rides the cat_http GET bridge, NEVER this WS allowlist: separate gates on purpose)
   'api.gateio.ws',              // Gate spot market data WS (wss only — REST on this host is NOT reachable via this shim)
   'fx-ws.gateio.ws',            // Gate USDT-futures market data WS
   'ws.bitget.com',              // Bitget spot + USDT-M futures market data WS
@@ -1821,6 +1825,19 @@ ipcMain.on('att:ledger-sub', (event) => {
   ledgerSubs.add(id);
   try { wc.once('destroyed', () => ledgerSubs.delete(id)); } catch (e) { /* already gone */ }
 });
+// #2349 Lighter rate-budget subscribers — same registration discipline as the
+// ledger lane above (a window joins the first time it installs a handler;
+// until any window has, the broadcast stays open to all so an older panel
+// keeps working).
+const rlBudgetSubs = new Set();
+ipcMain.on('att:rlb-sub', (event) => {
+  if (!nativeWsSenderOk(event)) return;
+  const wc = event.sender;
+  const id = wc.id;
+  if (rlBudgetSubs.has(id)) return;
+  rlBudgetSubs.add(id);
+  try { wc.once('destroyed', () => rlBudgetSubs.delete(id)); } catch (e) { /* already gone */ }
+});
 const tradeNative = createTradeNative({
   ipcMain,
   safeStorage,
@@ -1863,6 +1880,25 @@ const tradeNative = createTradeNative({
       try {
         if (gate && !ledgerSubs.has(w.webContents.id)) continue;
         w.webContents.send('att:ledger-push', wire);
+      } catch (e) { /* window closing */ }
+    }
+  },
+  // #2349 Lighter rate-budget lane: the shell counts every Lighter request and
+  // every order submission this app makes (the venue meters its budget per IP
+  // and per L1 address, so ALL windows share one allowance) and hands the
+  // rolling tally here on a ~1s tick, only when it changed. Broadcast-only by
+  // design — the badge is a display, a dropped frame costs nothing, and a
+  // renderer must never read the main process synchronously to paint it.
+  // Same serialize-once + subscribed-windows-only discipline as the ledger lane.
+  pushRlBudget: (snap) => {
+    let wire;
+    try { wire = JSON.stringify(snap); } catch (e) { return; }
+    const gate = rlBudgetSubs.size > 0;
+    for (const w of [mainWindow, ...featureWindows.values()]) {
+      if (!w || w.isDestroyed()) continue;
+      try {
+        if (gate && !rlBudgetSubs.has(w.webContents.id)) continue;
+        w.webContents.send('att:rl-budget', wire);
       } catch (e) { /* window closing */ }
     }
   },
