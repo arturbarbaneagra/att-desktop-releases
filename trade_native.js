@@ -1180,6 +1180,37 @@ const ASTER_FUT_WS_BASE = 'wss://fstream.asterdex.com/ws/';
 const ASTER_SPOT_WS_BASE = 'wss://sstream.asterdex.com/ws/';
 const AST_LK_KEEPALIVE_MS = 30 * 60 * 1000;   // Aster listenKey expiry: 60 min
 const AST_UDS_FILLS_CAP = 400;
+// #2315 leverage-bracket cache (tier caps almost never move — one signed
+// read per symbol per TTL keeps the popover instant and the venue quiet).
+const AST_LEV_BRK_TTL_MS = 60 * 60 * 1000;
+const astLevBrkCache = {};   // SYMBOL → { t, max, tiers }
+
+// #2315 pure: /fapi/v3/leverageBracket rows → { max, tiers } for `symbol`.
+// Binance-family shape (the engine's bn_brackets_parse twin): each row is
+// { symbol, brackets: [{ initialLeverage, notionalCap }] }. The max leverage
+// never depends on notionalCap (a tier with no cap still proves the lev);
+// tiers keep only cap-bearing rows, which is what the popover's exchange-cap
+// line reads. Junk rows are skipped; an unknown symbol reads { max: null,
+// tiers: [] } — never a throw (the caller treats it as "no cap published").
+function astBracketsParse(rows, symbol) {
+  const sym = String(symbol || '').toUpperCase();
+  const list = Array.isArray(rows) ? rows : [rows];
+  for (const r of list) {
+    if (!r || typeof r !== 'object') continue;
+    if (String(r.symbol || '').toUpperCase() !== sym) continue;
+    const tiers = [];
+    let mx = 0;
+    for (const b of (r.brackets || [])) {
+      const lev = Math.floor(Number((b || {}).initialLeverage) || 0);
+      if (!(lev > 0)) continue;
+      if (lev > mx) mx = lev;
+      const cap = Number((b || {}).notionalCap) || 0;
+      if (cap > 0) tiers.push({ lev: lev, cap: cap });
+    }
+    return { max: mx > 0 ? String(mx) : null, tiers: tiers };
+  }
+  return { max: null, tiers: [] };
+}
 
 // One user-stream frame → the bare event dict. Aster pushes bare {e:...} on
 // BOTH scopes (no ws-api envelope); anything without an event type is null.
@@ -12017,6 +12048,7 @@ function createTradeNative(opts) {
     'GET /fapi/v1/positionSide/dual': '/fapi/v3/positionSide/dual',
     'POST /fapi/v1/positionSide/dual': '/fapi/v3/positionSide/dual',
     'POST /fapi/v1/leverage': '/fapi/v3/leverage',   // #2307 native leverage SET
+    'GET /fapi/v1/leverageBracket': '/fapi/v3/leverageBracket',   // #2315 tier caps
     'DELETE /api/v3/openOrders': '/api/v3/allOpenOrders',
     // #2306 user-stream + fills history (engine AsterAdapter._PATHS twin)
     'POST /fapi/v1/listenKey': '/fapi/v3/listenKey',
@@ -14902,11 +14934,14 @@ function createTradeNative(opts) {
   async function execAsterLeverage(intent) {
     const _dgT0 = Date.now();
     const _dgLine = (res) => {
-      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+      tdiag('lev', 'native_op', { v: 'asterdex',   // #2315 venue stamp (10-venue logs)
+        k: String(intent.symbol || ''),
         what: intent.what === 'set' ? 'set' : 'get',
         sym: String(intent.symbol || '').toUpperCase(),
         ok: res && res.ok ? 1 : 0,
         lev: res && res.ok ? String(res.leverage || '') : undefined,
+        max: res && res.ok && res.max ? String(res.max) : undefined,
+        nt: res && res.ok && Array.isArray(res.brackets) ? res.brackets.length : undefined,
         err: res && !res.ok ? String(res.message || 'error') : undefined,
         ms: Date.now() - _dgT0 });
       return res;
@@ -14938,7 +14973,34 @@ function createTradeNative(opts) {
       lev = levOf(p);
       if (lev != null) break;
     }
-    return _dgLine({ ok: true, symbol: sym, leverage: lev });
+    // #2315 leverage CAP + tier table: positionRisk carries only the CURRENT
+    // leverage, and the AsterDex product catalog publishes no max leverage —
+    // with max 0 the panel popover drops the slider and the "Max leverage"
+    // label and the Exchange-cap line stays "—" (the server path returned
+    // both, this native read did not). The venue serves the Binance-family
+    // /fapi/v3/leverageBracket; read it BEST-EFFORT (engine lev_bracket_info
+    // parity: any failure just means no max/tiers, never a failed read) and
+    // cache it per symbol — tier caps almost never move.
+    let mx = null, tiers = null;
+    try {
+      const cb = astLevBrkCache[sym.toUpperCase()];
+      if (cb && Date.now() - cb.t < AST_LEV_BRK_TTL_MS) { mx = cb.max; tiers = cb.tiers; }
+      else {
+        const rb = await asterRequest(creds, 'GET', 'futures', '/fapi/v1/leverageBracket',
+          [['symbol', sym]], route);
+        if (rb.ok) {
+          const pb = astBracketsParse(rb.data, sym);
+          mx = pb.max; tiers = pb.tiers;
+          if (mx != null || (tiers && tiers.length)) {
+            astLevBrkCache[sym.toUpperCase()] = { t: Date.now(), max: mx, tiers: tiers };
+          }
+        }
+      }
+    } catch (e) { /* best-effort — the chip simply shows no max */ }
+    const out = { ok: true, symbol: sym, leverage: lev };
+    if (mx != null) out.max = mx;
+    if (tiers && tiers.length) out.brackets = tiers;
+    return _dgLine(out);
   }
 
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
