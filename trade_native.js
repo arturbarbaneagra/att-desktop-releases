@@ -1166,6 +1166,59 @@ function bnFillIngest(fills, prefix, tradeId) {
   return fid;
 }
 
+// --- #2306 AsterDex shell user-data streams (pure helpers) ------------------
+// The EIGHTH fast-native venue. Aster speaks the Binance user-stream dialect
+// but is NOT Binance, and #2306 keeps the seven existing fast venues
+// byte-stable — so it owns these helpers outright. Never fold them back into
+// the bn* twins.
+//   BOTH markets ride a real listenKey on a plain /ws/<key> URL (spot has no
+//   ws-api signature-subscribe frame), and EVERY signed call — the listenKey
+//   create and keepalive included — is EIP-712 signed through asterRequest;
+//   there is no API-key header to fall back on. Same facts the server engine
+//   path (AsterAdapter.listen_key / AsterPrivateCache) already carries.
+const ASTER_FUT_WS_BASE = 'wss://fstream.asterdex.com/ws/';
+const ASTER_SPOT_WS_BASE = 'wss://sstream.asterdex.com/ws/';
+const AST_LK_KEEPALIVE_MS = 30 * 60 * 1000;   // Aster listenKey expiry: 60 min
+const AST_UDS_FILLS_CAP = 400;
+
+// One user-stream frame → the bare event dict. Aster pushes bare {e:...} on
+// BOTH scopes (no ws-api envelope); anything without an event type is null.
+function astWsEvent(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  if (msg.e) return msg;
+  return null;
+}
+
+// Order lifecycle classification for executionReport / ORDER_TRADE_UPDATE
+// status X. 'add' keeps/creates the ledger row, 'gone' removes it (push
+// 'ordgone'), null = no order-state mutation.
+function astOrdEffect(X) {
+  const s = String(X || '');
+  if (s === 'NEW' || s === 'PARTIALLY_FILLED') return 'add';
+  if (s === 'FILLED' || s === 'CANCELED' || s === 'EXPIRED' ||
+      s === 'REJECTED' || s === 'EXPIRED_IN_MATCH') return 'gone';
+  return null;
+}
+
+// Exactly-once fill ingest at the shell boundary: one seen-map per scope keyed
+// by the venue trade id namespace ('s:<t>' spot / 'f:<t>' futures) — a WS
+// redelivery after a reconnect can never double-apply. Returns the fid when
+// the row is NEW (caller records + pushes), null when already seen.
+function astFillIngest(fills, prefix, tradeId) {
+  if (!fills || tradeId == null || tradeId === '') return null;
+  const fid = prefix + ':' + String(tradeId);
+  if (fills.seen[fid]) return null;
+  fills.seen[fid] = 1;
+  if (Object.keys(fills.seen).length > 4000) {
+    // bounded: keep the ids of the retained rows only
+    const keep = {};
+    for (const r of fills.rows) if (r && r._fid) keep[r._fid] = 1;
+    keep[fid] = 1;
+    fills.seen = keep;
+  }
+  return fid;
+}
+
 // --- #1969 device-local blotter (pure) --------------------------------------
 // Local "Your trades" store for NATIVE-armed venues: the shell keeps a
 // persistent per-scope fills archive on the device and the panel renders the
@@ -1408,6 +1461,27 @@ function lbNormBnSpotRest(r) {
     ts: Math.floor(Number(r.time) || 0),
     exec_id: String(r.id != null ? r.id : ''),
   };
+}
+// #2306 AsterDex fills — Binance-family payloads with the venue restamped.
+// This is the ONE place #2306 deliberately leans on the bn* code instead of
+// duplicating it: the engine does exactly the same thing (AsterAdapter
+// inherits BinanceAdapter's normalizers and restamps venue='asterdex', and
+// AsterPrivateCache restamps the bn_*_apply staged fills), so the exec-id
+// space is IDENTICAL across the shell-push path and the server path and an
+// explicit save-to-server ingests without duplicate legs.
+function lbAstStamp(fills) {
+  for (const f of (fills || [])) if (f) f.venue = 'asterdex';
+  return fills || [];
+}
+function lbNormAstFut(o, evTs) {
+  const f = lbNormBnFut(o, evTs);
+  if (f) f.venue = 'asterdex';
+  return f;
+}
+function lbNormAstSpot(m) {
+  const f = lbNormBnSpot(m);
+  if (f) f.venue = 'asterdex';
+  return f;
 }
 // #2051 One Bybit V5 execution row (WS `execution` topic and REST
 // /v5/execution/list share field names) → the fill schema. Twin of the
@@ -5631,6 +5705,7 @@ function createTradeNative(opts) {
     try { krWsCloseAll(venue); } catch (e) { /* no session */ }
     try { bnUdsClose(venue); } catch (e) { /* no session */ }
     try { hlPushClose(venue); } catch (e) { /* no session */ }
+    try { astUdsClose(venue); } catch (e) { /* no session */ }   // #2306
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
@@ -5644,6 +5719,7 @@ function createTradeNative(opts) {
     try { if (venue) gatePushClose(venue); else gatePushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bgPushClose(venue); else bgPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) kcPushClose(venue); else kcPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) astUdsClose(venue); else astUdsCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -11940,9 +12016,19 @@ function createTradeNative(opts) {
     'DELETE /fapi/v1/allOpenOrders': '/fapi/v3/allOpenOrders',
     'GET /fapi/v1/positionSide/dual': '/fapi/v3/positionSide/dual',
     'POST /fapi/v1/positionSide/dual': '/fapi/v3/positionSide/dual',
+    'POST /fapi/v1/leverage': '/fapi/v3/leverage',   // #2307 native leverage SET
     'DELETE /api/v3/openOrders': '/api/v3/allOpenOrders',
+    // #2306 user-stream + fills history (engine AsterAdapter._PATHS twin)
+    'POST /fapi/v1/listenKey': '/fapi/v3/listenKey',
+    'PUT /fapi/v1/listenKey': '/fapi/v3/listenKey',
+    'GET /fapi/v1/userTrades': '/fapi/v3/userTrades',
+    'GET /api/v3/myTrades': '/api/v3/userTrades',
   };
-  async function asterRequest(creds, method, market, reqPath, params, route) {
+  // #2306 `capBytes` (optional, additive): the httpJson default is 256 KB —
+  // a full 1000-row userTrades/myTrades backfill page blows past it and the
+  // clipped body fails JSON.parse as "unreadable response". Trading-path
+  // callers pass nothing and stay byte-identical.
+  async function asterRequest(creds, method, market, reqPath, params, route, capBytes) {
     // Creds slots: key = user wallet address, secret = API signer private
     // key, pass = signer address (mirrors the engine's 3-slot blob).
     reqPath = ASTER_PATHS[method + ' ' + reqPath] || reqPath;
@@ -11960,8 +12046,11 @@ function createTradeNative(opts) {
     let r;
     try {
       r = await httpJson(market === 'futures' ? ASTER_FUT_HOST : ASTER_SPOT_HOST,
-                         method, reqPath, query, null, {}, route);
+                         method, reqPath, query, null, {}, route, capBytes);
     } catch (e) { return transportFail(e, 'Aster'); }
+    // a body clipped at the cap must fail HONESTLY — never parse a partial
+    // page into what the caller will treat as complete venue truth.
+    if (r.tr) return { ok: false, message: 'Aster response truncated at byte cap', code: null };
     if (r.status === 429 || r.status === 418) {
       return { ok: false, message: 'Rate limited by Aster — retry shortly', code: null };
     }
@@ -12013,6 +12102,8 @@ function createTradeNative(opts) {
     return { ok: true, orderID: oid || null, clOrdID: clOrdID };
   }
   async function execAster(creds, intent, route) {
+    // #2306: warm the user-data streams for this slot (push-driven display)
+    try { astUdsEnsure(intent.credSlot || 'asterdex', creds, route); } catch (e) { /* REST-only */ }
     const market = intent.market === 'spot' ? 'spot' : 'futures';
     const fetchPos = async () => {
       // Explicit symbol (Binance-family): the symbol-less list grows with
@@ -12063,6 +12154,274 @@ function createTradeNative(opts) {
                                { reduceOnly: true, trigger: intent.trigger, closePosition: true });
     if (!r.ok) return r;
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // --- #2306 AsterDex user-data streams (shell push runtime) ------------------
+  // AsterDex was already fully native for WRITES (EIP-712 device-key orders,
+  // native SL/TP, reduce-only close) and for account READS, but its private
+  // stream still ran server-side in the engine — so every fill, badge,
+  // position step and fill sound reached the panel over the network. On the
+  // native account-data axis the panel consumes no engine account state at
+  // all, so the engine→panel push lane never fires there: moving the stream
+  // into the shell is the ONLY path that delivers instant display.
+  //
+  // Per armed slot: one listenKey session per market (spot and futures are
+  // independent scopes — different hosts, different keys, independent
+  // lifecycles), local-first ledger maps (orders + a tradeId seen-set), a
+  // per-scope seq bumped on every mutation (generic krLseq) and coalesced
+  // venue-tagged events on the shared att:ledger-push fan-out.
+  // NO silent fallback: a down socket leaves the panel on its existing REST
+  // poll (unchanged) and the reconnect is visible in the diag log.
+  const astUdsSessions = {};
+  const astPushPend = {};
+  let astPushTimer = null;
+  function astPushFlush() {
+    astPushTimer = null;
+    const evs = krPushDrain(astPushPend, (key) => {
+      const ix = key.indexOf('|');
+      const s = astUdsSessions[key.slice(0, ix)];
+      const sc = s && (key.slice(ix + 1) === 'fut' ? s.fut : s.spot);
+      return sc ? sc.lseq : 0;
+    }, Date.now(), 'asterdex');
+    const tBust = lbT();
+    for (const ev of evs) {
+      // memo-bust so the push-triggered acct_read observes the mutation
+      try { execAcctRead.bust('asterdex', ev.slot); } catch (e) { /* best-effort */ }
+      try { execAcctRead.markHot('asterdex'); } catch (e) { /* #2131 hot lane */ }
+      tdiag('acct', 'ast_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    lbTap('push.bust', tBust);
+    // ONE batched fan-out per drain tick (#2212 shape) — main.js unwraps a
+    // 1-event array back to the bare single shape for older panels.
+    if (evs.length) {
+      const tB = lbT();
+      try { pushLedgerCb(evs); } catch (e) { /* window gone */ }
+      lbTap('push.bcast', tB);
+    }
+  }
+  function astPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(astPushPend, scope._pk, kind, id, row);
+    if (!astPushTimer) {
+      astPushTimer = setTimeout(astPushFlush, KR_PUSH_COALESCE_MS);
+      if (astPushTimer && typeof astPushTimer.unref === 'function') astPushTimer.unref();
+    }
+  }
+  function astUdsScope() {
+    return { running: false, up: false, ws: null, err: null, lastMsg: 0,
+             lseq: 0, orders: {}, fills: { rows: [], seen: {} }, _pk: null };
+  }
+  function astUdsClose(slot) {
+    const s = astUdsSessions[slot];
+    if (!s) return;
+    s.closed = true;
+    for (const sc of [s.spot, s.fut]) {
+      try { if (sc.ws) sc.ws.terminate(); } catch (e) { /* already gone */ }
+      sc.ws = null; sc.up = false;
+    }
+    delete astUdsSessions[slot];
+  }
+  function astUdsCloseAll() {
+    for (const k of Object.keys(astUdsSessions)) astUdsClose(k);
+  }
+  function astUdsEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key || !creds.secret) return null;
+    slot = String(slot || 'asterdex');
+    let s = astUdsSessions[slot];
+    if (s && s.tail !== creds.key) { astUdsClose(slot); s = null; }
+    if (!s) {
+      s = astUdsSessions[slot] = {
+        tail: creds.key, closed: false, route: route,
+        spot: astUdsScope(), fut: astUdsScope(),
+      };
+      s.spot._pk = slot + '|spot';
+      s.fut._pk = slot + '|fut';
+    }
+    s.route = route;   // latest route pick wins for the next (re)dial
+    if (!s.spot.running) astUdsLoop(slot, s, creds, 'spot');
+    if (!s.fut.running) astUdsLoop(slot, s, creds, 'fut');
+    return s;
+  }
+  function astUdsLoop(slot, s, creds, which) {
+    const A = which === 'fut' ? s.fut : s.spot;
+    A.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (astUdsSessions[slot] === s && !s.closed) {
+        const t0 = Date.now();
+        try {
+          await astUdsConn(slot, s, creds, which);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          A.err = 'Aster ' + which + ' stream: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'ast_uds_err', { w: which, m: String(A.err).slice(0, 120) });
+          // A nonce/timestamp rejection on the EIP-712 signed listenKey call
+          // means a poisoned clock offset — invalidate so the redial
+          // re-probes instead of re-signing ahead for the whole session.
+          if (clkTsReject(null, e && e.message)) {
+            clkInvalidate('asterdex', which === 'fut' ? 'futures' : 'spot');
+          }
+        }
+        A.up = false; A.ws = null;
+        if (s.closed || astUdsSessions[slot] !== s) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      A.running = false;
+    })().catch(() => { A.running = false; });
+  }
+  // listenKey create / keepalive. UNLIKE Binance there is no API-key header
+  // path: USER_STREAM is a signed scope on Aster, so both calls ride
+  // asterRequest (EIP-712, offset-corrected µs nonce). Futures POST/PUT
+  // /fapi/v1/listenKey (ASTER_PATHS rewrites to v3); spot POST/PUT
+  // /api/v3/listenKey and only the SPOT keepalive carries the key as a param.
+  async function astListenKey(creds, route, market, method, lk) {
+    const reqPath = market === 'futures' ? '/fapi/v1/listenKey' : '/api/v3/listenKey';
+    const params = (market === 'spot' && method === 'PUT' && lk)
+      ? [['listenKey', String(lk)]] : [];
+    const r = await asterRequest(creds, method || 'POST', market, reqPath, params, route);
+    if (!r.ok) return { ok: false, message: r.message || 'listenKey failed' };
+    return { ok: true, key: String(((r.data) || {}).listenKey || '') };
+  }
+  async function astUdsConn(slot, s, creds, which) {
+    const market = which === 'fut' ? 'futures' : 'spot';
+    const lk = await astListenKey(creds, s.route, market, 'POST');
+    if (!lk.ok || !lk.key) throw new Error('listenKey: ' + (lk.message || 'empty'));
+    return new Promise((resolve, reject) => {
+      const base = which === 'fut' ? ASTER_FUT_WS_BASE : ASTER_SPOT_WS_BASE;
+      const ws = krWsDial(base + lk.key, s.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      const A = which === 'fut' ? s.fut : s.spot;
+      A.ws = ws;
+      let settled = false;
+      // keepalive PUT every 30 min (60 min expiry) — a failed keepalive tears
+      // the conn down for a clean redial with a FRESH key (never a silent
+      // half-dead socket). Interval pacing keeps REST churn at 2 calls/hour.
+      const kaT = setInterval(async () => {
+        try {
+          const ka = await astListenKey(creds, s.route, market, 'PUT', lk.key);
+          if (!ka.ok) done(new Error('listenKey keepalive: ' + (ka.message || 'failed')));
+        } catch (e) { /* transient — next tick retries */ }
+      }, AST_LK_KEEPALIVE_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        A.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      ws.on('open', () => {
+        A.up = true; A.err = null; A.lastMsg = Date.now();
+        tdiag('acct', 'ast_uds_up', { w: which });
+      });
+      ws.on('ping', () => { A.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        A.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const ev = astWsEvent(msg);
+        if (!ev) return;
+        try {
+          if (which === 'fut') astFutEvApply(A, ev, done);
+          else astSpotEvApply(A, ev, done);
+        } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  // In-band expiry / termination on EITHER scope tears the socket down so the
+  // loop redials with a fresh listenKey (engine AsterPrivateCache twin).
+  function astUdsTerm(t) {
+    return t === 'listenKeyExpired' || t === 'eventStreamTerminated'
+        || t === 'serverShutdown';
+  }
+  function astSpotEvApply(A, ev, done) {
+    const t = String(ev.e || '');
+    if (astUdsTerm(t)) { done(new Error('stream ' + t)); return; }
+    if (t === 'outboundAccountPosition' || t === 'balanceUpdate') {
+      // ship the changed wallet rows (B: [{a,f,l}]) so spot wallets/posrow
+      // step on the push beat; balanceUpdate ({a,d} delta) stays kind-only.
+      const bs = Array.isArray(ev.B) ? ev.B : [];
+      krLseq(A);
+      if (bs.length) { for (const b of bs) astPushSc(A, 'bal', null, b); }
+      else astPushSc(A, 'bal');
+      return;
+    }
+    if (t !== 'executionReport') return;
+    if (String(ev.x) === 'TRADE' && Number(ev.l) > 0) {
+      const fid = astFillIngest(A.fills, 's', ev.t);
+      if (fid) {
+        // the RAW executionReport rides the push (row → frows) — commission
+        // (n) + commissionAsset (N) included, so the panel's cost-basis
+        // replay carries the fee the same beat. Never slim this row.
+        const row = Object.assign({ _fid: fid }, ev);
+        A.fills.rows.push(row);
+        if (A.fills.rows.length > AST_UDS_FILLS_CAP) {
+          A.fills.rows.splice(0, A.fills.rows.length - AST_UDS_FILLS_CAP);
+        }
+        lbSrcTouch(A.fills);   // #2230 no-news gate
+        krLseq(A); astPushSc(A, 'fill', fid, ev);
+      }
+    }
+    const oid = String(ev.i != null ? ev.i : '');
+    const eff = astOrdEffect(ev.X);
+    if (!oid || !eff) return;
+    if (eff === 'add') {
+      A.orders[oid] = ev;
+      krLseq(A); astPushSc(A, 'order', null, ev);
+    } else {
+      if (A.orders[oid]) delete A.orders[oid];
+      krLseq(A); astPushSc(A, 'ordgone', oid);
+    }
+  }
+  function astFutEvApply(A, ev, done) {
+    const t = String(ev.e || '');
+    if (astUdsTerm(t)) { done(new Error('stream ' + t)); return; }
+    if (t === 'ACCOUNT_UPDATE') {
+      // ship the actual mutated rows (a.P positions / a.B balances) so the
+      // posrow steps on the push beat instead of waiting out the REST re-read.
+      const a = ev.a || {};
+      const ps = Array.isArray(a.P) ? a.P : [];
+      const bs = Array.isArray(a.B) ? a.B : [];
+      krLseq(A);
+      if (ps.length) { for (const p of ps) astPushSc(A, 'pos', null, p); }
+      else astPushSc(A, 'pos');
+      krLseq(A);
+      if (bs.length) { for (const b of bs) astPushSc(A, 'bal', null, b); }
+      else astPushSc(A, 'bal');
+      return;
+    }
+    if (t !== 'ORDER_TRADE_UPDATE') return;
+    const o = ev.o || {};
+    if (String(o.x) === 'TRADE' && Number(o.l) > 0) {
+      const fid = astFillIngest(A.fills, 'f', o.t);
+      if (fid) {
+        // stamp the event ts on the `o` payload (normalizer fallback) and
+        // push it RAW — commission (n) + commissionAsset (N) included.
+        const row = Object.assign({ _fid: fid }, o);
+        if (row.T == null && ev.T != null) row.T = ev.T;
+        A.fills.rows.push(row);
+        if (A.fills.rows.length > AST_UDS_FILLS_CAP) {
+          A.fills.rows.splice(0, A.fills.rows.length - AST_UDS_FILLS_CAP);
+        }
+        lbSrcTouch(A.fills);   // #2230 no-news gate
+        krLseq(A); astPushSc(A, 'fill', fid, row);
+      }
+      krLseq(A); astPushSc(A, 'pos');   // a fill moves the position — refresh
+    }
+    const oid = String(o.i != null ? o.i : '');
+    const eff = astOrdEffect(o.X);
+    if (!oid || !eff) return;
+    if (eff === 'add') {
+      A.orders[oid] = o;
+      krLseq(A); astPushSc(A, 'order', null, o);
+    } else {
+      if (A.orders[oid]) delete A.orders[oid];
+      krLseq(A); astPushSc(A, 'ordgone', oid);
+    }
   }
 
   // --- Arcus (perp DEX — Ed25519-signed writes, futures-only) -----------------
@@ -13820,6 +14179,8 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'asterdex');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
+    // #2306: acct reads keep the user-data streams warm (push-driven display)
+    try { astUdsEnsure(intent.credSlot || 'asterdex', creds, route); } catch (e) { /* REST-only */ }
     const futBal = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/balance', [], route);
     if (!futBal.ok) return futBal;
     const pos = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk', [], route);
@@ -14528,6 +14889,56 @@ function createTradeNative(opts) {
       null, route);
     if (!r.ok) return _dgLine(r);
     return _dgLine({ ok: true, symbol: sym, leverage: levOf((r.data || {}).data) });
+  }
+
+  // #2307 AsterDex futures leverage GET/SET (device-signed EIP-712 through
+  // asterRequest — there is no api-key header path). Engine twin: AsterAdapter
+  // inherits BinanceAdapter.leverage_config / set_leverage, so the read picks
+  // the symbol's row off /fapi/v2/positionRisk and the write posts
+  // {symbol, leverage} to /fapi/v1/leverage — ASTER_PATHS maps both onto the
+  // venue's /fapi/v3/* twins. One-way cross by terminal convention (the
+  // position-mode guard lives on the order path). A symbol the venue returns
+  // no row for reads null (the chip shows the venue default), never an error.
+  async function execAsterLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'asterdex');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '');
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    const levOf = (p) => {
+      const v = bnNum((p || {}).leverage);
+      return v != null && Number(v) > 0 ? v : null;
+    };
+    if (intent.what === 'set') {
+      const lev = parseFloat(intent.leverage);
+      if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+      if (Math.floor(lev) !== lev) return _dgLine({ ok: false, message: 'Leverage must be a whole number' });
+      const r = await asterRequest(creds, 'POST', 'futures', '/fapi/v1/leverage',
+        [['symbol', sym], ['leverage', String(lev)]], route);
+      if (!r.ok) return _dgLine(r);
+      return _dgLine({ ok: true, symbol: sym, leverage: levOf(r.data) || String(lev) });
+    }
+    const r = await asterRequest(creds, 'GET', 'futures', '/fapi/v2/positionRisk',
+      [['symbol', sym]], route);
+    if (!r.ok) return _dgLine(r);
+    let lev = null;
+    for (const p of (Array.isArray(r.data) ? r.data : [])) {
+      if (String((p || {}).symbol || '').toUpperCase() !== sym.toUpperCase()) continue;
+      lev = levOf(p);
+      if (lev != null) break;
+    }
+    return _dgLine({ ok: true, symbol: sym, leverage: lev });
   }
 
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
@@ -15385,6 +15796,13 @@ function createTradeNative(opts) {
       const s = gatePushSessions[slot];
       return s ? rn(s.sp) + '/' + rn(s.fu) : '-';
     }
+    // #2306: AsterDex is a PUSH-SESSION venue — astUdsSessions[slot] wraps its
+    // two per-market rings in `.fills` exactly like the Binance session above,
+    // so it belongs HERE with `rn` and never in the bare-ring branch below.
+    if (venue === 'asterdex') {
+      const s = astUdsSessions[slot];
+      return s ? rn(s.spot) + '/' + rn(s.fut) : '-';
+    }
     // ⚠️ SHAPE (#2303) — everything BELOW hands this gate the RING ITSELF, not
     // a push session. A push session wraps its ring in `.fills` (that is all
     // `rn` above does); a bgFillRings/kcFillRings slot is `{ sp, fu, … }` where
@@ -15513,6 +15931,17 @@ function createTradeNative(opts) {
           return lbNormGateFill(r, 'futures', mult);
         });
       }
+    } else if (venue === 'asterdex') {
+      // #2306: two per-market raw rings on the shell's user-data sessions
+      // (spot executionReport / futures ORDER_TRADE_UPDATE `o` payloads).
+      // The normalizers are the Binance ones with the venue restamped — the
+      // SAME exec-id space the engine's AsterAdapter produces, so a device
+      // row and a server row dedupe to one.
+      const sess = astUdsSessions[slot];
+      if (sess) {
+        ring('ast.spot', sess.spot.fills, (r) => lbNormAstSpot(r));
+        ring('ast.fut', sess.fut.fills, (r) => lbNormAstFut(r, r.T));
+      }
     } else if (venue === 'bitget') {
       // #2246: two per-market REST-poll rings (lbBgLive). Rows are RAW
       // venue fill rows — the market comes from the RING, never from the
@@ -15587,7 +16016,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -16263,6 +16692,59 @@ function createTradeNative(opts) {
         _dgSpotRows = rawSpot.length;
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'asterdex') {
+        // #2306 AsterDex is Binance-family over the wire — SAME window walk,
+        // SAME exec-id space — but every signed call is EIP-712 through
+        // asterRequest (ASTER_PATHS maps /fapi/v1/userTrades → v3 and spot
+        // myTrades → userTrades). Without this arm the venue would fall into
+        // the bare Binance `else` below and sign Aster creds as HMAC.
+        const futFrm = bfFrm('futures', 'futures');
+        const spotFrom = {};
+        const symSet = {};
+        for (const f of sc.rows) {
+          if (f.market !== 'spot') continue;
+          symSet[f.symbol] = 1;
+          const eid = Math.floor(Number(f.exec_id) || 0);
+          if (eid > (spotFrom[f.symbol] || 0)) spotFrom[f.symbol] = eid;
+        }
+        const extra = Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [];
+        for (const s of extra) if (s) symSet[String(s).toUpperCase()] = 1;
+        const astReq = (mkt, reqPath, params) => {
+          if (mkt === 'spotPub') {
+            // unsigned public GET (spot exchangeInfo), big cap + honest
+            // truncation — same discipline as the Binance arm.
+            return httpJson(ASTER_SPOT_HOST, 'GET', reqPath, formEnc(params || []),
+                            null, {}, route, 64 * 1024 * 1024)
+              .then((r) => {
+                if (r.tr) return { ok: false, message: 'AsterDex response truncated at byte cap' };
+                let d = null;
+                try { d = JSON.parse(r.text); } catch (e) { d = null; }
+                return (r.status < 400 && d) ? { ok: true, data: d }
+                  : { ok: false, message: 'AsterDex returned HTTP ' + r.status };
+              })
+              .catch((e) => transportFail(e, 'AsterDex'));
+          }
+          return asterRequest(creds, 'GET', mkt, reqPath, params, route, 16 * 1024 * 1024);
+        };
+        const uni = await lbBnSpotUniverse(astReq, Object.keys(symSet));
+        let spotList = Object.keys(symSet);
+        if (uni.ok) spotList = uni.syms;
+        else { covOk = false; gap = true; notes.push('spot coverage unknown — ' + (uni.message || 'account read failed')); }
+        const r = await lbBnBackfill(astReq, futFrm, now, spotList, spotFrom, HB_PAGE_GAP_MS);
+        if (!r.ok) {
+          sc.bf = { ts: now, ok: false, msg: r.message || 'backfill failed' };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now,
+            err: String(r.message || 'backfill failed') });
+          return { ok: false, message: r.message || 'backfill failed' };
+        }
+        if (r.gap) gap = true;
+        if (r.covOk === false) covOk = false;
+        for (const n of r.notes) notes.push(n);
+        _dgFetched = (r.fills || []).length;
+        // the shared normalizers stamp venue='binance' — restamp, exactly
+        // like the engine's AsterAdapter.fetch_fills.
+        added = lbScopeMerge(sc, lbAstStamp(r.fills));
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -16628,6 +17110,92 @@ function createTradeNative(opts) {
           }
         }
         for (const f of rawSpot) { const n = lbNormKucoinFill(f, 'spot', null); if (n) fills.push(n); }
+      } else if (venue === 'asterdex') {
+        // #2306 asterdex: the Binance-family time-window walk driven through
+        // the EIP-712 signed helper. Without this arm the venue would fall
+        // into the bare Binance `else` below and sign Aster creds as HMAC.
+        const astFills = [];
+        let astFutN = 0, astSpotN = 0;
+        const astReq = (mkt, reqPath, params) => {
+          if (mkt === 'spotPub') {
+            return httpJson(ASTER_SPOT_HOST, 'GET', reqPath, formEnc(params || []),
+                            null, {}, route, 64 * 1024 * 1024)
+              .then((r) => {
+                if (r.tr) return { ok: false, message: 'AsterDex response truncated at byte cap' };
+                let d = null;
+                try { d = JSON.parse(r.text); } catch (e) { d = null; }
+                return (r.status < 400 && d) ? { ok: true, data: d }
+                  : { ok: false, message: 'AsterDex returned HTTP ' + r.status };
+              })
+              .catch((e) => transportFail(e, 'AsterDex'));
+          }
+          return asterRequest(creds, 'GET', mkt, reqPath, params, route, 16 * 1024 * 1024);
+        };
+        let calls = 0;
+        let astSyms = [];
+        if (market !== 'futures') {
+          const symSet = {};
+          for (const f of lbScope(slot).rows) {
+            if (f.market === 'spot' && f.symbol) symSet[String(f.symbol).toUpperCase()] = 1;
+          }
+          for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
+            if (s) symSet[String(s).toUpperCase()] = 1;
+          }
+          const uni = await lbBnSpotUniverse(astReq, Object.keys(symSet));
+          if (!uni.ok) return riFail('AsterDex spot universe: ' + (uni.message || 'account read failed'));
+          astSyms = uni.syms.filter((s) => /^[A-Za-z0-9]{1,32}$/.test(String(s)));
+          if (astSyms.length > LB_BN_SPOT_SYM_CAP) return riFail('Too many spot pairs (' + astSyms.length + ') — re-import futures and spot separately or reduce holdings pairs');
+        }
+        const pcAst = lbBnRiPrecheck(market, w.frm, w.to, astSyms.length);
+        if (pcAst) return riFail(pcAst.msg);
+        if (market !== 'spot') {
+          let t0 = Math.max(0, Math.floor(w.frm));
+          while (t0 < w.to) {
+            if (++calls > LB_BN_MAX_CALLS) return riFail('Window too large — fill history exceeds the call cap; narrow the date range');
+            const t1 = Math.min(t0 + LB_BN_FUT_WIN_MS, w.to);
+            if (calls > 1) await sleep(HB_PAGE_GAP_MS);
+            const r = await astReq('futures', '/fapi/v1/userTrades',
+              [['startTime', String(t0)], ['endTime', String(t1)], ['limit', '1000']]);
+            if (!r || !r.ok) return riFail('AsterDex futures: ' + ((r && r.message) || 'request failed'));
+            const rows = Array.isArray(r.data) ? r.data : [];
+            let lastTs = 0;
+            for (const raw of rows) {
+              const f = lbNormBnFutRest(raw);
+              if (f) { astFills.push(f); if (f.ts > lastTs) lastTs = f.ts; }
+            }
+            astFutN += rows.length;
+            const stp = lbBnWinStep(rows.length, lastTs, t0, t1, 1000);
+            if (stp.stuck) return riFail('AsterDex futures: a full trades page could not advance past one timestamp — history too dense for time paging in this window');
+            t0 = stp.next;
+          }
+        }
+        if (market !== 'futures') {
+          for (const sym of astSyms) {
+            let t0 = Math.max(0, Math.floor(w.frm));
+            while (t0 < w.to) {
+              if (++calls > LB_BN_MAX_CALLS) return riFail('Window too large for the pair count — narrow the date range');
+              const t1 = Math.min(t0 + LB_RI_BN_SPOT_WIN_MS, w.to);
+              if (calls > 1) await sleep(HB_PAGE_GAP_MS);
+              const r = await astReq('spot', '/api/v3/myTrades',
+                [['symbol', sym], ['startTime', String(t0)], ['endTime', String(t1)], ['limit', '1000']]);
+              if (!r || !r.ok) return riFail('AsterDex spot (' + sym + '): ' + ((r && r.message) || 'request failed'));
+              const rows = Array.isArray(r.data) ? r.data : [];
+              let lastTs = 0;
+              for (const raw of rows) {
+                const f = lbNormBnSpotRest(raw);
+                if (f) { astFills.push(f); if (f.ts > lastTs) lastTs = f.ts; }
+              }
+              astSpotN += rows.length;
+              const stp = lbBnWinStep(rows.length, lastTs, t0, t1, 1000);
+              if (stp.stuck) return riFail('AsterDex spot (' + sym + '): a full trades page could not advance past one timestamp — history too dense for time paging in this window');
+              t0 = stp.next;
+            }
+          }
+        }
+        riFutRows = astFutN; riSpotRows = astSpotN;
+        // shared normalizers stamp venue='binance' — restamp before merge so
+        // the rows land in the SAME exec-id space as the live drain lane.
+        for (const f of lbAstStamp(astFills)) fills.push(f);
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -16788,6 +17356,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'gate') return await execGateLeverage(intent);   // #2153
       if (intent.venue === 'bitget') return await execBitgetLeverage(intent);   // #2247
       if (intent.venue === 'kucoin') return await execKucoinLeverage(intent);   // #2272
+      if (intent.venue === 'asterdex') return await execAsterLeverage(intent);   // #2307
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -17163,6 +17732,20 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'kucoin') continue;
             const c = credsGet(k);
             if (c) { try { kcPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2306: same one-time kick for the AsterDex user-data streams (TWO
+      // listenKey conns — spot and futures live on different hosts and keep
+      // independent keys); loops self-maintain.
+      if (venue === 'asterdex') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'asterdex') continue;
+            const c = credsGet(k);
+            if (c) { try { astUdsEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
@@ -17796,6 +18379,14 @@ module.exports = {
   bnWsEvent,
   bnOrdEffect,
   bnFillIngest,
+  // pure — #2306 AsterDex shell user-data push
+  ASTER_FUT_WS_BASE,
+  ASTER_SPOT_WS_BASE,
+  AST_LK_KEEPALIVE_MS,
+  AST_UDS_FILLS_CAP,
+  astWsEvent,
+  astOrdEffect,
+  astFillIngest,
   // pure — #1969 device-local blotter
   lbNum,
   lbFmt,
@@ -17809,6 +18400,9 @@ module.exports = {
   lbNormBnSpot,
   lbNormBnFutRest,
   lbNormBnSpotRest,
+  lbAstStamp,
+  lbNormAstFut,
+  lbNormAstSpot,
   lbFillKey,
   lbScopeMerge,
   lbHwm,

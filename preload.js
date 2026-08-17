@@ -200,7 +200,7 @@ try {
     // shell-backed axes to offer (absent on old shells → axes stay hidden →
     // server path, graceful degradation). Presence-of-method stays the probe
     // for the pre-#1713 features.
-    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:mexc2', 'cat:arcus', 'cat:http', 'lblot:binance', 'lblot:kraken', 'lblot:hyperliquid', 'lblot:bybit', 'lblot:gate', 'lblot:bitget', 'lblot:kucoin', 'lblotri'],
+    caps: ['acct:bybit', 'acct:phemex', 'acct:binance', 'acct:okx', 'acct:gate', 'acct:bitget', 'acct:mexc', 'acct:kucoin', 'acct:bitmex', 'acct:kraken', 'acct:asterdex', 'cat:phemex', 'cat:kucoin', 'cat:gate', 'cat:bitmex', 'cat:kraken', 'cat:mexc', 'cat:mexc2', 'cat:arcus', 'cat:http', 'lblot:binance', 'lblot:kraken', 'lblot:hyperliquid', 'lblot:bybit', 'lblot:gate', 'lblot:bitget', 'lblot:kucoin', 'lblot:asterdex', 'lblotri'],
   });
 } catch (e) { /* non-fatal — bridge unavailable, panel keeps Server trading */ }
 
