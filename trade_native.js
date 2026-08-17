@@ -874,6 +874,12 @@ function venueClkOffset(serverMs, t0, t1) {
   return Number(serverMs) - (Number(t0) + Number(t1)) / 2;
 }
 
+// #2323 ping-rt memory: per-host cadence floor that prevents the latency-chip
+// ping from hammering the same REST endpoint at window-count × cadence rate.
+// 30 s is large enough that five windows on 15 s cadences collapse to one call
+// per 30 s instead of five — the same endpoint the clock probe depends on.
+const PING_RT_MIN_GAP_MS = 30000;
+
 // #2012 clock-probe 429 backoff (Aster field test: 113 probes, 54× 429 —
 // force=true warm-up bursts kept hammering a rate-limited /time endpoint
 // every ~60s). On a 429 the probe backs off exponentially (≥5 min, capped
@@ -5958,6 +5964,11 @@ function createTradeNative(opts) {
   // TTL; probe failure keeps the last offset (0 initially — old behavior).
   // Probes ride the SAME httpJson + route as the venue's orders.
   const venueClk = {};                 // probeKey → { offsetMs, ts }
+  // #2323 ping-rt per-host state: keyed by host+'|'+('p'|'d') (proxy vs
+  // direct). Shared across ALL renderer windows in this shell process — the
+  // single-flight and the cadence floor make the cost O(1) per host even when
+  // N windows each send a ping on their own schedule.
+  const pingRtSt = {};                 // stKey → { ts, ok, inflight }
   // force=true (warm-up path only) skips the fresh-return so the probe GET
   // actually rides the wire (re-warming the keep-alive socket) AND refreshes
   // the offset; the TTL stamp still updates, so signed calls stay probe-free.
@@ -17466,22 +17477,66 @@ function createTradeNative(opts) {
     }
     if (intent && typeof intent === 'object' && intent.op === 'ping_rt') {
       if (TRADE_VENUES.indexOf(intent.venue) < 0) return { ok: false, message: 'venue not supported natively' };
-      const tgt = pingRtTarget(intent.venue, intent.market === 'spot' ? 'spot' : 'futures');
+      const mk = intent.market === 'spot' ? 'spot' : 'futures';
+      const tgt = pingRtTarget(intent.venue, mk);
       if (!tgt) return { ok: false, message: 'no probe target for this venue' };
       const route = routeNorm(intent.route);
-      try {
-        const r = await httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, route);
-        // Any answer from the venue host < 500 counts — the probe measures the
-        // path, not the endpoint's semantics.
-        if (!r || !r.status || r.status >= 500) {
-          return { ok: false, message: 'venue ping failed (HTTP ' + ((r && r.status) || 0) + ')' };
-        }
-        return { ok: true };
-      } catch (e) {
-        const em = (e && e.message) || 'error';
-        if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
-        return { ok: false, message: 'venue ping failed: ' + em };
+      // #2323 state key: host + route suffix ('p' for proxy, 'd' for direct).
+      // routeNorm() returns the truthy STRING 'proxy' or 'direct' — the key
+      // MUST use an explicit === comparison, not a truthiness check, or both
+      // routes collapse to the same key and a direct ping sees a cached proxy
+      // result (or vice versa), reporting the wrong transport for 30 seconds.
+      const stKey = tgt.host + '|' + (route === 'proxy' ? 'p' : 'd');
+      // #2323 clock-backoff gate: when the venue's time endpoint is already
+      // backed off (another call or the clock probe itself hit a 429), the
+      // latency-chip ping must not add more calls to the pile — serve from the
+      // last known state so the chip still reflects whether the path is alive,
+      // without calling the endpoint that caused the backoff.
+      const clkKey = venueTimeProbeKey(intent.venue, mk);
+      if (clkKey && clkProbeBlocked(venueClk[clkKey], Date.now())) {
+        const stBo = pingRtSt[stKey];
+        if (stBo && stBo.ok) return { ok: true };
+        return { ok: false, message: 'venue clock backing off (429); chip suppressed' };
       }
+      // #2323 single-flight + cadence floor: collapse concurrent callers (N
+      // windows due on the same tick) into ONE wire call, and skip the wire
+      // entirely when the result is still fresh from a recent call.
+      const st = pingRtSt[stKey] || (pingRtSt[stKey] = { ts: 0, ok: false, inflight: null });
+      const now = Date.now();
+      if (st.inflight) return st.inflight;
+      if (st.ts && now - st.ts < PING_RT_MIN_GAP_MS) return { ok: st.ok };
+      st.ts = now;
+      st.inflight = (async () => {
+        try {
+          const r = await httpJson(tgt.host, tgt.method, tgt.path, '', tgt.body, {}, route);
+          // #2323: 429 / 418 = venue refusing = chip failure (not success).
+          // The old '<500 = fine' rule let a rate-limit response appear healthy.
+          // Also arm the clock backoff so the probe does not walk into the same
+          // limit immediately after the ping already exhausted it.
+          if (r && (r.status === 429 || r.status === 418)) {
+            if (clkKey) {
+              const ck = venueClk[clkKey] || (venueClk[clkKey] = { offsetMs: 0, ts: 0 });
+              clkProbe429(ck, Date.now());
+            }
+            st.ok = false;
+            return { ok: false, message: 'venue ping refused (HTTP ' + r.status + ')' };
+          }
+          if (!r || !r.status || r.status >= 500) {
+            st.ok = false;
+            return { ok: false, message: 'venue ping failed (HTTP ' + ((r && r.status) || 0) + ')' };
+          }
+          st.ok = true;
+          return { ok: true };
+        } catch (e) {
+          const em = (e && e.message) || 'error';
+          st.ok = false;
+          if (em === 'proxy-unavailable') return { ok: false, message: 'Proxy is enabled but unavailable' };
+          return { ok: false, message: 'venue ping failed: ' + em };
+        } finally {
+          st.inflight = null;
+        }
+      })();
+      return st.inflight;
     }
     const verr = validateIntent(intent);
     if (verr) return { ok: false, message: verr };
@@ -18197,6 +18252,7 @@ module.exports = {
   warmTargetsFor,
   rewarmDue,
   WARM_MIN_GAP_MS,
+  PING_RT_MIN_GAP_MS,
   phemexErrorMessage,
   phemexSymbolRequired,
   // shared keep-alive agent cache (used by main.js's native-WS bridge too)
