@@ -704,6 +704,177 @@ function ltBoundUnits(pxUnits, buySide) {
   return b > 0 ? b : null;
 }
 
+// ---------------------------------------------------------------------------
+// Lighter private WS push lane (#2326) — PURE frame helpers.
+//
+// The /stream endpoint the panel already dials for order books ALSO serves
+// per-account channels. Two carry everything the terminal displays:
+//   • account_all/<idx>        — positions + assets + trades (+ funding).
+//                                PUBLIC. Snapshot on subscribe, then DELTA
+//                                updates: only the CHANGED market_ids appear
+//                                and `assets` is null when unchanged. Fires
+//                                on every mark move (hundreds of frames a
+//                                minute on a busy account) → every push must
+//                                be gated on an identity signature.
+//   • account_all_orders/<idx> — orders across every market. AUTHENTICATED:
+//                                the token rides a TOP-LEVEL `auth` field on
+//                                the subscribe frame (missing → venue error
+//                                20001, bogus → 20013).
+// Reply envelopes carry the ACTION in `type` ('subscribed' = snapshot,
+// 'update' = delta) and the CHANNEL in `msg.channel`, spelled with a COLON
+// (`account_all:702384`) even though the subscribe used a slash. Some frames
+// additionally echo the channel kind after a slash inside `type`
+// (`update/account_all`) — the panel's own order-book parser therefore reads
+// the action as a `type` PREFIX and the kind from `channel`, and this lane
+// must parse identically or a bare `{"type":"update"}` frame goes unread and
+// the whole lane silently delivers nothing. `{"type":"ping"}` MUST be
+// answered with `{"type":"pong"}` — idle sockets are dropped after ~2 min.
+// ---------------------------------------------------------------------------
+const LT_WS_URL = 'wss://' + LIGHTER_HOST + '/stream';
+const LT_PUSH_PING_MS = 20000;          // well inside the ~2 min idle limit
+const LT_PUSH_TOKEN_TTL_S = 6 * 3600;   // ltAuthToken deadline (parity)
+const LT_PUSH_TOKEN_EARLY_MS = 600000;  // redial 10 min before expiry
+const LT_PUSH_FILLS_CAP = 200;
+
+// Subscribe frame for one account channel. `auth` is TOP-LEVEL (not nested in
+// the channel string) — the shape the venue actually accepts.
+function ltPushSubFrame(chan, acct, auth) {
+  const f = { type: 'subscribe', channel: String(chan) + '/' + String(acct) };
+  if (auth) f.auth = String(auth);
+  return f;
+}
+
+// One reply frame → {ev:'snap'|'upd', chan} for the two account channels;
+// null for everything else (order-book frames, pong, errors).
+//
+// _ltConnMsg (the panel's Lighter order-book parser) is the reference shape:
+// the action is a PREFIX of `type` and the channel kind comes out of
+// `msg.channel`, delimited by ':' OR '/'. Reading the kind only out of a
+// slash inside `type` would drop every bare `{type:'update',
+// channel:'account_all:702384'}` frame — i.e. the entire lane. `channel`
+// wins when present; the slash suffix in `type` is the fallback.
+function ltPushChanKind(s) {
+  const v = String(s || '');
+  const ci = v.search(/[:\/]/);
+  return ci < 0 ? v : v.slice(0, ci);
+}
+function ltPushEnv(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  const t = String(msg.type || '');
+  const ix = t.indexOf('/');
+  const ev = ix < 0 ? t : t.slice(0, ix);
+  if (ev !== 'subscribed' && ev !== 'update') return null;
+  let chan = ltPushChanKind(msg.channel);
+  if (!chan && ix >= 0) chan = ltPushChanKind(t.slice(ix + 1));
+  if (chan !== 'account_all' && chan !== 'account_all_orders') return null;
+  return { ev: ev === 'subscribed' ? 'snap' : 'upd', chan: chan };
+}
+
+// Lighter spells its ids BOTH as a JSON number and a `_str` twin, and the
+// numbers (order / trade / client ids) exceed 2^53 — the string ALWAYS wins,
+// or the id the badge keys on drifts from the engine's exact one.
+// Engine parity: a falsy id ('' / 0 / null) reads as ABSENT.
+function ltIdStr(o, k) {
+  if (!o || typeof o !== 'object') return '';
+  const s = o[k + '_str'];
+  if (s != null && s !== '' && s !== '0' && s !== 0) return String(s);
+  const v = o[k];
+  if (v == null || v === '' || v === 0 || v === '0') return '';
+  return String(v);
+}
+
+// A Lighter order row is GONE (badge clears) once the venue stops counting it
+// as live. 'in-progress' / 'pending' / 'open' stay. An UNRECOGNISED status
+// stays OPEN — a vocabulary change must never silently erase a live badge
+// (the REST auditor removes it a beat later if it really is gone).
+function ltPushOrdOpen(o) {
+  const s = String((o && o.status) || '').toLowerCase();
+  if (!s) return true;
+  if (s === 'filled' || s === 'expired' || s === 'rejected') return false;
+  return s.indexOf('cancel') !== 0;
+}
+
+// A channel payload → flat [{mid, row}]. The venue ships positions/trades as
+// a dict keyed by market_id (single object OR list per key) and may ship
+// orders as either that dict or a bare list — accept every shape so a payload
+// change can't silently blank the badges.
+function ltPushRowList(payload) {
+  const out = [];
+  const one = (mid, r) => {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return;
+    const m = r.market_index != null ? r.market_index
+            : (r.market_id != null ? r.market_id : mid);
+    const n = (m == null || m === '') ? NaN : Number(m);
+    out.push({ mid: Number.isFinite(n) ? n : null, row: r });
+  };
+  const take = (mid, v) => {
+    if (Array.isArray(v)) { for (const r of v) one(mid, r); } else one(mid, v);
+  };
+  if (Array.isArray(payload)) take(null, payload);
+  else if (payload && typeof payload === 'object') {
+    for (const k of Object.keys(payload)) take(k, payload[k]);
+  }
+  return out;
+}
+
+// Identity signature over the position rows — krFutPosSig twin for the
+// Lighter row shape. `update/account_all` re-delivers a position on every
+// mark move, so a 'pos' push fires only when something the posrow can SEE
+// changed (instrument / size / direction / entry / leverage / margin mode).
+// unrealized_pnl and liquidation_price are DELIBERATELY excluded: they
+// repaint continuously and the REST auditor refreshes them on its own beat.
+// PER-ROW on purpose. An update frame carries only the markets that MOVED, so
+// hashing the frame's whole row set and comparing it to the previous frame's
+// hash makes two markets taking turns on mark-only updates look like a change
+// every single time — the suppression this signature exists for evaporates
+// exactly on the accounts that need it most. The caller keeps one signature
+// per market_id instead.
+function ltPushPosSig(row) {
+  const p = row || {};
+  return [p.symbol || '',
+          p.position != null ? p.position : '',
+          p.sign != null ? p.sign : '',
+          p.avg_entry_price != null ? p.avg_entry_price : '',
+          p.initial_margin_fraction != null ? p.initial_margin_fraction : '',
+          p.margin_mode != null ? p.margin_mode : ''].join(':');
+}
+
+// Identity signature over the `assets` map (asset_id → balance row). Null on
+// a delta frame means UNCHANGED — never a wipe.
+function ltPushBalSig(assets) {
+  if (!assets || typeof assets !== 'object') return null;
+  const parts = [];
+  for (const k of Object.keys(assets)) {
+    const a = assets[k] || {};
+    parts.push(String(k) + ':' + String(a.balance != null ? a.balance : '')
+               + ':' + String(a.available_balance != null ? a.available_balance : ''));
+  }
+  parts.sort();
+  return parts.join('|');
+}
+
+// One trade row → the legs THIS account owns. A self-match is ONE trade row
+// but TWO fills (buy + sell); dropping the second leg sticks the blotter
+// trade OPEN forever — the bug engine norm_lighter_fills memorializes.
+function ltPushTradeLegs(t, acct) {
+  const out = [];
+  if (!t || typeof t !== 'object') return out;
+  const a = Number(acct);
+  if (!Number.isFinite(a)) return out;
+  const bid = t.bid_account_id != null ? Number(t.bid_account_id) : NaN;
+  const ask = t.ask_account_id != null ? Number(t.ask_account_id) : NaN;
+  if (bid === a) out.push({ side: 'buy', oid: ltIdStr(t, 'bid_id') });
+  if (ask === a) out.push({ side: 'sell', oid: ltIdStr(t, 'ask_id') });
+  return out;
+}
+
+// Side-INCLUSIVE dedup key: one trade_id, two fills on a self-match, so a
+// bare exec id would swallow the second leg.
+function ltPushFillKey(t, side) {
+  const id = ltIdStr(t, 'trade_id') || ltIdStr(t, 'tx_hash');
+  return id ? (id + ':' + String(side)) : '';
+}
+
 // ===========================================================================
 // Multi-venue rollout (Binance, Bybit, OKX, Gate, Bitget — spot + USDT-M
 // futures). Same discipline as the Phemex section: everything below is PURE
@@ -1519,6 +1690,61 @@ function lbNormAstSpot(m) {
   const f = lbNormBnSpot(m);
   if (f) f.venue = 'asterdex';
   return f;
+}
+// #2327 One Lighter /trades row → the fill schema. Twin of the engine's
+// norm_lighter_fills, field for field, so a device row and a server row share
+// ONE exec-id space and an explicit save-to-server ingests without duplicate
+// legs. Returns a LIST because a self-match (own buy limit crossing own sell
+// — bid_account_id == ask_account_id == acct) is ONE row but TWO fills; an
+// if/elif here silently dropped the second leg and the blotter trade stuck
+// OPEN forever. perp-only → market 'futures'. fee '0' is Lighter's OWN
+// reported schedule, not an assumption: the venue publishes a fee RATE per
+// market (/orderBooks taker_fee/maker_fee, decimal strings) and every live
+// market reads "0.0000". It reports no per-fill fee AMOUNT — the integer
+// taker_fee/maker_fee on this row are fee TICKS (tier indices, the unit
+// /accountLimits calls current_taker_fee_tick), NOT quote amounts: one
+// account's value is identical on a $0.19 fill and a $10,171 fill, so
+// reading them as money would invent a fee.
+// `symbol` comes from the CALLER: /trades rows (and account_all trade frames)
+// are market_id-keyed, so the market_id → symbol catalog resolves it.
+function lbNormLtFills(t, acct, symbol) {
+  const out = [];
+  if (!t || typeof t !== 'object') return out;
+  const sym = String(symbol || '');
+  const qty = lbNum(t.size);
+  if (!sym || qty == null || !(Number(qty) > 0)) return out;
+  const a = Number(acct);
+  if (!Number.isFinite(a)) return out;
+  const px = lbNum(t.price) || '0';
+  let ts = Math.floor(Number(t.timestamp) || 0);
+  if (ts > 0 && ts < 1e12) ts *= 1000;          // seconds → ms (engine parity)
+  const eid = ltIdStr(t, 'trade_id') || ltIdStr(t, 'tx_hash');
+  for (const leg of ltPushTradeLegs(t, a)) {
+    out.push({
+      venue: 'lighter', market: 'futures', symbol: sym,
+      side: leg.side, posSide: '',
+      order_px: '', exec_px: px, qty: qty,
+      value: lbFmt(Number(qty) * Number(px)),
+      fee: '0', closed_pnl: '0',
+      exec_id: String(eid || ''),
+      order_id: String(leg.oid || ''),
+      ts: ts, type: 'Trade',
+    });
+  }
+  return out;
+}
+// One shell-STAMPED account_all trade row (ltPushStamp: _side/_acct/_sym) →
+// ONE fill. The push lane already split a self-match into two stamped rows
+// (side-inclusive _fid), so this picks the leg its row was stamped for. The
+// symbol is passed in rather than read off `_sym`: a row stamped while the
+// catalog was still cold carries none, and the drain's retry sweep must be
+// able to re-normalize it once the market_id → symbol index warms.
+function lbNormLtFill(r, symbol) {
+  if (!r || typeof r !== 'object') return null;
+  const want = String(r._side || '').toLowerCase();
+  const rows = lbNormLtFills(r, r._acct, symbol || r._sym || r.symbol || '');
+  for (const f of rows) if (f.side === want) return f;
+  return null;
 }
 // #2051 One Bybit V5 execution row (WS `execution` topic and REST
 // /v5/execution/list share field names) → the fill schema. Twin of the
@@ -5743,6 +5969,7 @@ function createTradeNative(opts) {
     try { bnUdsClose(venue); } catch (e) { /* no session */ }
     try { hlPushClose(venue); } catch (e) { /* no session */ }
     try { astUdsClose(venue); } catch (e) { /* no session */ }   // #2306
+    try { ltPushClose(venue); } catch (e) { /* no session */ }   // #2326
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
@@ -5757,6 +5984,7 @@ function createTradeNative(opts) {
     try { if (venue) bgPushClose(venue); else bgPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) kcPushClose(venue); else kcPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) astUdsClose(venue); else astUdsCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) ltPushClose(venue); else ltPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -12733,35 +12961,60 @@ function createTradeNative(opts) {
 
   // Perp catalog (public /orderBookDetails), 10-min cache — engine parity
   // fields: market_id + price/size_decimals.
-  async function ltSpec(symbol, route) {
-    if (!_ltProds.map || Date.now() - _ltProds.ts > PRODUCTS_TTL_MS) {
-      let r;
-      try {
-        r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/orderBookDetails', '', null, {}, route, 8 * 1024 * 1024);
-      } catch (e) {
-        return { ok: false, message: 'Lighter catalog fetch failed: ' + ((e && e.message) || 'error') };
-      }
-      let rows = null;
-      try { rows = JSON.parse(r.text).order_book_details; } catch (e) { rows = null; }
-      if (!Array.isArray(rows)) {
-        return { ok: false, message: 'Lighter catalog unavailable (HTTP ' + (r.status || 0) + ')' };
-      }
-      const map = {};
-      for (const d of rows) {
-        const sym = String((d && d.symbol) || '');
-        if (!sym) continue;
-        if (d.market_type != null && String(d.market_type) !== 'perp') continue;
-        if (d.status != null && String(d.status) !== 'active') continue;
-        const pd = d.price_decimals != null ? Number(d.price_decimals) : Number(d.supported_price_decimals);
-        const sd = d.size_decimals != null ? Number(d.size_decimals) : Number(d.supported_size_decimals);
-        const mid = Number(d.market_id);
-        if (!Number.isInteger(pd) || !Number.isInteger(sd) || !Number.isInteger(mid)) continue;
-        map[sym.toLowerCase()] = { mid: mid, pd: pd, sd: sd, symbol: sym };
-      }
-      _ltProds.map = map; _ltProds.ts = Date.now();
+  // #2326: the catalog load is its OWN function so the private WS push lane
+  // can warm the market_id → symbol index without asking for a symbol it
+  // doesn't have yet (trade/order frames are market_id-keyed).
+  async function ltCatalog(route) {
+    if (_ltProds.map && Date.now() - _ltProds.ts <= PRODUCTS_TTL_MS) {
+      return { ok: true, map: _ltProds.map };
     }
-    const s = _ltProds.map[String(symbol || '').toLowerCase()];
+    let r;
+    try {
+      r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/orderBookDetails', '', null, {}, route, 8 * 1024 * 1024);
+    } catch (e) {
+      return { ok: false, message: 'Lighter catalog fetch failed: ' + ((e && e.message) || 'error') };
+    }
+    let rows = null;
+    try { rows = JSON.parse(r.text).order_book_details; } catch (e) { rows = null; }
+    if (!Array.isArray(rows)) {
+      return { ok: false, message: 'Lighter catalog unavailable (HTTP ' + (r.status || 0) + ')' };
+    }
+    const map = {}, byMid = {};
+    for (const d of rows) {
+      const sym = String((d && d.symbol) || '');
+      if (!sym) continue;
+      if (d.market_type != null && String(d.market_type) !== 'perp') continue;
+      if (d.status != null && String(d.status) !== 'active') continue;
+      const pd = d.price_decimals != null ? Number(d.price_decimals) : Number(d.supported_price_decimals);
+      const sd = d.size_decimals != null ? Number(d.size_decimals) : Number(d.supported_size_decimals);
+      const mid = Number(d.market_id);
+      if (!Number.isInteger(pd) || !Number.isInteger(sd) || !Number.isInteger(mid)) continue;
+      // max leverage = 10000 // min_initial_margin_fraction (BASIS points on
+      // the catalog row — the position row's own imf is a PERCENT string).
+      // Engine lighter spec_for parity; feeds the native leverage-chip read.
+      const imf = Number(d.min_initial_margin_fraction || 0);
+      const spec = { mid: mid, pd: pd, sd: sd, symbol: sym };
+      if (Number.isFinite(imf) && imf > 0) {
+        spec.maxLev = String(Math.max(1, Math.floor(10000 / imf)));
+      }
+      map[sym.toLowerCase()] = spec;
+      byMid[String(mid)] = spec;
+    }
+    _ltProds.map = map; _ltProds.byMid = byMid; _ltProds.ts = Date.now();
+    return { ok: true, map: map };
+  }
+  async function ltSpec(symbol, route) {
+    const c = await ltCatalog(route);
+    if (!c.ok) return c;
+    const s = c.map[String(symbol || '').toLowerCase()];
     return s ? { ok: true, spec: s } : { ok: false, message: 'Unknown Lighter symbol ' + symbol };
+  }
+  // market_id → catalog spec, from whatever ltCatalog last loaded ('' when the
+  // catalog has not landed yet — the caller falls back to the row's own field).
+  function ltSpecByMid(mid) {
+    const m = _ltProds.byMid;
+    if (!m || mid == null || mid === '') return null;
+    return m[String(mid)] || null;
   }
 
   // Auth token for the one authenticated read (accountActiveOrders). Signed
@@ -13019,6 +13272,352 @@ function createTradeNative(opts) {
                             null, intent.clOrdID, { reduceOnly: true });
     if (!r.ok) return r;
     return { ok: true, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // --- Lighter private WS push lane (#2326) ---------------------------------
+  // Lighter was the last native venue on REST-poll-only display (engine
+  // LighterPrivateCache: positions 4s, orders 3s over an 8-markets-per-tick
+  // rotation, fills 10s). ONE socket per armed slot carries both account
+  // channels; every mutation is normalized onto the SAME push kinds the other
+  // eight venues emit (order / ordgone / pos / bal / fill), so the panel needs
+  // no new vocabulary. The engine pollers stay on as a slower AUDITOR — the
+  // panel overlays these pushes on top of the server section and drops each
+  // overlay once the server snapshot agrees.
+  const ltPushPend = {};
+  let ltPushTimer = null;
+  const ltPushSessions = {};
+  const LT_PUSH_SEEN_CAP = 4000;
+
+  function ltPushFlush() {
+    ltPushTimer = null;
+    const evs = krPushDrain(ltPushPend, (key) => {
+      const s = ltPushSessions[key.slice(0, key.indexOf('|'))];
+      return s ? s.fut.lseq : 0;
+    }, Date.now(), 'lighter');
+    for (const ev of evs) {
+      tdiag('acct', 'lt_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+    // ONE batched fan-out per drain tick (#2212 shape).
+    if (evs.length) {
+      const tB = lbT();
+      try { pushLedgerCb(evs); } catch (e) { /* window gone */ }
+      lbTap('push.bcast', tB);
+    }
+  }
+  function ltPushSc(A, kind, id, row) {
+    if (!pushLedgerCb || !A || !A._pk) return;
+    krPushMark(ltPushPend, A._pk, kind, id, row);
+    if (!ltPushTimer) {
+      ltPushTimer = setTimeout(ltPushFlush, KR_PUSH_COALESCE_MS);
+      if (ltPushTimer && typeof ltPushTimer.unref === 'function') ltPushTimer.unref();
+    }
+  }
+  function ltPushScope() {
+    return { running: false, up: false, ws: null, err: null, lastMsg: 0, lseq: 0,
+             orders: {}, fills: { rows: [], seen: {} },
+             // gen: successful-connect counter. The local blotter reads it to
+             // tell a steady lane from one that redialed (#2327) — a reconnect
+             // means fills may have happened while nothing was recording, so
+             // the outage window has to be re-walked over REST.
+             posSig: {}, balSig: null, _pk: null, gen: 0 };   // posSig: market_id → identity
+  }
+  // Side-inclusive fill dedup, bounded to the retained rows (astFillIngest twin).
+  function ltFillIngest(F, key) {
+    if (!F || !key) return false;
+    if (F.seen[key]) return false;
+    F.seen[key] = 1;
+    if (Object.keys(F.seen).length > LT_PUSH_SEEN_CAP) {
+      const keep = {};
+      for (const r of F.rows) if (r && r._fid) keep[r._fid] = 1;
+      keep[key] = 1;
+      F.seen = keep;
+    }
+    return true;
+  }
+  // Lane STATE → panel, deliberately outside the row coalescer: a lane event
+  // must not wait on a flush that may never come, and must never be batched
+  // behind rows from the very account it invalidates.
+  //   'up'/'down' — socket health. The session lives on and redials, so the
+  //     panel keeps its overlays (the reconnect snapshot reconciles them) and
+  //     only reports the lane honestly.
+  //   'gone' — a CREDENTIAL boundary: the key was replaced or wiped. Every row
+  //     this lane asserted belongs to an account that is no longer being
+  //     traded, and the next session starts with an EMPTY tracked set, so it
+  //     cannot tombstone them — nothing else ever would. The panel wipes.
+  function ltPushLane(slot, ev) {
+    if (!pushLedgerCb) return;
+    try {
+      pushLedgerCb([{ venue: 'lighter', slot: String(slot || 'lighter'),
+                      scope: 'fut', seq: 0, ts: Date.now(),
+                      kinds: ['lane'], lane: String(ev) }]);
+    } catch (e) { /* window gone */ }
+  }
+  function ltPushClose(slot) {
+    const s = ltPushSessions[slot];
+    if (!s) return;
+    s.closed = true;
+    try { if (s.fut.ws) s.fut.ws.terminate(); } catch (e) { /* already gone */ }
+    s.fut.ws = null; s.fut.up = false;
+    delete ltPushSessions[slot];
+    ltPushLane(slot, 'gone');
+  }
+  function ltPushCloseAll() {
+    for (const k of Object.keys(ltPushSessions)) ltPushClose(k);
+  }
+  function ltPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key || !creds.secret) return null;
+    slot = String(slot || 'lighter');
+    if (!ltParseKey(creds.key)) return null;
+    let s = ltPushSessions[slot];
+    if (s && s.tail !== String(creds.key)) { ltPushClose(slot); s = null; }
+    if (!s) {
+      s = ltPushSessions[slot] = {
+        tail: String(creds.key), closed: false, route: route, creds: creds,
+        fut: ltPushScope(),
+      };
+      s.fut._pk = slot + '|fut';
+    }
+    s.route = route; s.creds = creds;   // latest route/creds win on the next dial
+    if (!s.fut.running) ltPushLoop(slot, s);
+    return s;
+  }
+  function ltPushLoop(slot, s) {
+    const A = s.fut;
+    A.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (ltPushSessions[slot] === s && !s.closed) {
+        const t0 = Date.now();
+        try {
+          await ltPushConn(slot, s);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          A.err = 'Lighter stream: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'lt_push_err', { m: String(A.err).slice(0, 120) });
+        }
+        A.up = false; A.ws = null;
+        ltPushLane(slot, 'down');   // socket lost — the session redials below
+        if (s.closed || ltPushSessions[slot] !== s) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      A.running = false;
+    })().catch(() => { A.running = false; });
+  }
+  async function ltPushConn(slot, s) {
+    const A = s.fut;
+    const cc = await ltClient(s.creds);
+    if (!cc.ok) throw new Error(cc.message || 'Lighter signer unavailable');
+    // account_all_orders is AUTHENTICATED; the token is minted OFFLINE by the
+    // same wasm signer (and shares ltAuthToken's cache with the REST read, so
+    // the lane costs no extra signing).
+    const tk = ltAuthToken(cc);
+    if (!tk.ok) throw new Error(tk.message || 'Lighter auth token failed');
+    // Warm the market_id → symbol index; trade and order frames are
+    // market_id-keyed and the panel has no Lighter catalog of its own.
+    try { await ltCatalog(s.route); } catch (e) { /* rows ship without _sym */ }
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(LT_WS_URL, s.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      A.ws = ws;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        A.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      // Keepalive well inside the venue's ~2 min idle limit. It is the
+      // APPLICATION frame {type:'ping'} → {type:'pong'} that counts, exactly
+      // as the panel's public Lighter socket already sends: this venue runs
+      // its idle timer at the protocol level it speaks, and a control-frame
+      // ping is handled beneath that — an idle account would be dropped every
+      // couple of minutes and reconnect in a loop. The control ping stays as
+      // an additive TCP-path keepalive only.
+      // The same tick drops the socket once the auth token is inside its
+      // refresh window — the redial mints a fresh one and resubscribes (a
+      // token that expires under a live subscription would go quietly stale).
+      const kaT = setInterval(() => {
+        if (Date.now() > _ltAuth.exp - LT_PUSH_TOKEN_EARLY_MS) {
+          done(new Error('auth token refresh')); return;
+        }
+        if (!A.up || !ws || ws.readyState !== 1) return;
+        try { ws.send(JSON.stringify({ type: 'ping' })); } catch (e) { /* close fires */ }
+        try { ws.ping(); } catch (e) { /* close fires */ }
+      }, LT_PUSH_PING_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      const subscribe = () => {
+        try {
+          ws.send(JSON.stringify(ltPushSubFrame('account_all', cc.acct, null)));
+          ws.send(JSON.stringify(ltPushSubFrame('account_all_orders', cc.acct, tk.token)));
+        } catch (e) { done(e || new Error('subscribe failed')); }
+      };
+      ws.on('open', () => {
+        A.up = true; A.err = null; A.lastMsg = Date.now();
+        // #2327 connect generation — see ltLblotStream. A SECOND connect is a
+        // redial: fills during the outage reached nobody, so the local
+        // blotter's "caught up" stamp has to be invalidated (ltLblotRedialClear).
+        A.gen = (A.gen | 0) + 1;
+        if ((A.gen | 0) > 1) A.redial = 1;
+        tdiag('acct', 'lt_push_up', {});
+        ltPushLane(slot, 'up');
+      });
+      ws.on('ping', () => { A.lastMsg = Date.now(); });
+      ws.on('pong', () => { A.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        A.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const t = String((msg && msg.type) || '');
+        // Subscriptions are sent only after the server's 'connected' hello —
+        // frames sent before it are dropped server-side.
+        if (t === 'connected') { subscribe(); return; }
+        if (t === 'ping') {
+          try { ws.send(JSON.stringify({ type: 'pong' })); } catch (e) { /* close fires */ }
+          return;
+        }
+        // Venue error frame (20001 = auth field required, 20013 = invalid
+        // auth). FATAL for this dial — fail-visible, and the redial re-mints.
+        if (t === 'error' || (t === '' && msg && msg.code != null)) {
+          const code = (msg && msg.code != null) ? String(msg.code) + ' ' : '';
+          done(new Error(code + String((msg && (msg.message || msg.error)) || 'stream error')));
+          return;
+        }
+        const env = ltPushEnv(msg);
+        if (!env) return;
+        try {
+          if (env.chan === 'account_all') ltPushAcctAll(A, cc, msg, env.ev === 'snap');
+          else ltPushAcctOrders(A, msg, env.ev === 'snap');
+        } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  // Stamp the resolved symbol / market_id (and the catalog's max leverage) on
+  // a RAW venue row. Rows ship raw — never slimmed — so the panel's cost-basis
+  // replay and the leverage chip both read the venue's own fields.
+  function ltPushStamp(it, extra) {
+    const row = Object.assign({}, it.row, extra || {});
+    const spec = ltSpecByMid(it.mid);
+    if (!row._sym) {
+      const sym = row.symbol || (spec ? spec.symbol : '');
+      if (sym) row._sym = String(sym);
+    }
+    if (row._mid == null && it.mid != null) row._mid = it.mid;
+    if (row._maxLev == null && spec && spec.maxLev) row._maxLev = spec.maxLev;
+    return row;
+  }
+  // account_all — positions + assets + trades. Snapshot frames SEED SILENTLY
+  // (dedup + signature only): replaying a snapshot would ring the fill chime
+  // for history. Update frames are DELTAS — only the changed market_ids are
+  // present and `assets` is null when unchanged, so a missing key is never a
+  // wipe.
+  // A subscribe SNAPSHOT re-asserts STATE (positions, balances) but never
+  // replays EVENTS (fills). State is idempotent — the overlay it feeds is
+  // monotonic and retires the moment the server section agrees — so pushing it
+  // makes the position row, equity AND the native leverage chip paint on the
+  // very first frame instead of waiting for the first market that happens to
+  // move. Suppressing it (as "seed silently" naively reads) leaves a freshly
+  // connected account with NO leverage source at all, which is a dead "—×"
+  // chip for a device-key-only user until something moves.
+  function ltPushAcctAll(A, cc, msg, isSnap) {
+    const posRows = ltPushRowList(msg.positions);
+    const pchg = [];
+    // The snapshot is the WHOLE account, so a market missing from it is flat
+    // and its stale identity has to go — otherwise re-opening that position at
+    // the same size later reads as "unchanged" and never pushes. A delta frame
+    // implies no such thing: it carries only what moved.
+    if (isSnap && msg.positions && typeof msg.positions === 'object') {
+      const live = {};
+      for (const it of posRows) live[String(it.mid)] = 1;
+      for (const k of Object.keys(A.posSig)) {
+        if (live[k]) continue;
+        delete A.posSig[k];
+        // …and SAY SO. Dropping the local identity silently is only half the
+        // reconciliation: a position that closed while the socket was down
+        // leaves a panel overlay standing, and the overlay outlives the REST
+        // auditor (which cannot retire it — an absent row reads as
+        // "disagrees") until it ages out minutes later. Push it flat.
+        pchg.push({ mid: Number(k),
+                    row: { market_id: Number(k), position: '0', sign: 1 } });
+      }
+    }
+    for (const it of posRows) {
+      const k = String(it.mid), sig = ltPushPosSig(it.row);
+      if (A.posSig[k] === sig) continue;   // mark-only repaint → no push
+      A.posSig[k] = sig;
+      pchg.push(it);
+    }
+    if (pchg.length) {
+      krLseq(A);
+      for (const it of pchg) ltPushSc(A, 'pos', null, ltPushStamp(it));
+    }
+    const bsig = ltPushBalSig(msg.assets);
+    if (bsig != null && bsig !== A.balSig) {
+      A.balSig = bsig;
+      krLseq(A); ltPushSc(A, 'bal', null, { assets: msg.assets });
+    }
+    const trRows = ltPushRowList(msg.trades);
+    let fills = 0;
+    for (const it of trRows) {
+      const t = it.row;
+      for (const leg of ltPushTradeLegs(t, cc.acct)) {
+        const key = ltPushFillKey(t, leg.side);
+        if (!ltFillIngest(A.fills, key)) continue;
+        if (isSnap) continue;                       // seeded, never replayed
+        const row = ltPushStamp(it, { _fid: key, _side: leg.side,
+                                      _oid: leg.oid, _acct: cc.acct });
+        A.fills.rows.push(row);
+        if (A.fills.rows.length > LT_PUSH_FILLS_CAP) {
+          A.fills.rows.splice(0, A.fills.rows.length - LT_PUSH_FILLS_CAP);
+        }
+        lbSrcTouch(A.fills);   // bounded ring: length alone never proves a push
+        krLseq(A); ltPushSc(A, 'fill', key, row);
+        fills++;
+      }
+    }
+    // A fill moves the position even when the delta frame carried no position
+    // row yet — mark the kind so the panel re-reads on the same beat.
+    if (fills) { krLseq(A); ltPushSc(A, 'pos'); }
+  }
+  // account_all_orders — orders across every market. The snapshot ASSERTS the
+  // open set (state, same rule as positions: badges paint on the first frame
+  // and a reconnect re-badges instantly) but never emits a tombstone: a
+  // closed row inside a snapshot is history, not proof that an order the panel
+  // still shows was just cancelled. Deltas badge and unbadge both ways.
+  function ltPushAcctOrders(A, msg, isSnap) {
+    const openNow = {};
+    for (const it of ltPushRowList(msg.orders)) {
+      const o = it.row;
+      const oid = ltIdStr(o, 'order_index') || ltIdStr(o, 'order_id');
+      if (!oid) continue;
+      if (ltPushOrdOpen(o)) {
+        openNow[oid] = 1;
+        A.orders[oid] = o;
+        krLseq(A); ltPushSc(A, 'order', null, ltPushStamp(it));
+      } else if (!isSnap) {
+        if (A.orders[oid]) delete A.orders[oid];
+        krLseq(A); ltPushSc(A, 'ordgone', oid);
+      }
+      // A CLOSED row inside a SNAPSHOT decides nothing by itself — it is
+      // history, and tombstoning off it would kill a badge this lane never
+      // even claimed. The reconcile below rules on it instead.
+    }
+    // Reconnect reconciliation: the snapshot is the whole open set, so an id
+    // this lane still holds open and that is absent from it stopped being open
+    // while the socket was down. That tombstone is drawn from OUR OWN tracked
+    // state, never from a row in the payload — without it a cancel or fill
+    // missed during an outage keeps its badge until the overlay ages out.
+    if (isSnap && msg.orders && typeof msg.orders === 'object') {
+      for (const oid of Object.keys(A.orders)) {
+        if (openNow[oid]) continue;
+        delete A.orders[oid];
+        krLseq(A); ltPushSc(A, 'ordgone', oid);
+      }
+    }
   }
 
   // One intent → executed result (renderer-facing shape mirrors the engine).
@@ -15876,6 +16475,13 @@ function createTradeNative(opts) {
       const s = astUdsSessions[slot];
       return s ? rn(s.spot) + '/' + rn(s.fut) : '-';
     }
+    // #2327: Lighter is a PUSH-SESSION venue too — ltPushSessions[slot].fut is
+    // an ltPushScope whose ring hangs off `.fills`, so it belongs HERE with
+    // `rn` and never in the bare-ring branch below (see the shape warning).
+    if (venue === 'lighter') {
+      const s = ltPushSessions[slot];
+      return s ? rn(s.fut) : '-';
+    }
     // ⚠️ SHAPE (#2303) — everything BELOW hands this gate the RING ITSELF, not
     // a push session. A push session wraps its ring in `.fills` (that is all
     // `rn` above does); a bgFillRings/kcFillRings slot is `{ sp, fu, … }` where
@@ -16047,6 +16653,29 @@ function createTradeNative(opts) {
           return lbNormKucoinFill(r, 'futures', mult);
         });
       }
+    } else if (venue === 'lighter') {
+      // #2327: ONE account-wide raw ring on the private WS push session
+      // (account_all `trades` — Lighter is perp-only, no spot leg). Rows are
+      // the venue's own trade rows, shell-stamped with the leg this account
+      // sat on. The market_id → symbol index comes from the CATALOG, never
+      // from the row: a cold catalog skips the row THIS drain and fires a
+      // best-effort warm (gate/HL/KuCoin recipe — the raw row stays cached
+      // and the retry sweep re-normalizes it once the index landed).
+      const sess = ltPushSessions[slot];
+      if (sess) {
+        ring('lt.fut', sess.fut.fills, (r) => {
+          let sym = String((r && (r._sym || r.symbol)) || '');
+          if (!sym) {
+            const sp = ltSpecByMid(r && (r._mid != null ? r._mid : r.market_id));
+            sym = sp ? String(sp.symbol || '') : '';
+          }
+          if (!sym) {
+            ltCatalog(sess.route).catch(() => { /* warm */ });
+            return null;
+          }
+          return lbNormLtFill(r, sym);
+        });
+      }
     }
     cur.skip = skipped;
     if (aid) for (const f of fills) f.aid = aid;
@@ -16089,7 +16718,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex' || venue === 'lighter'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -16221,6 +16850,41 @@ function createTradeNative(opts) {
   // displayMap is only applied at recompute; poll paths pass none.
   const _lbTrCache = {};
   let _lbTrRev = 0;
+  // #2327 Lighter local-blotter stream health, per credential slot.
+  //
+  // Lighter is the ONE local-blotter venue with no REST fill lane behind its
+  // push stream: Bitget and KuCoin recover a missed push through lbBgLive/
+  // lbKcLive on every read, and the acct-native venues re-read their fills
+  // natively, but Lighter's /trades is auth-walled AND market-scoped, so the
+  // private WS is the only thing recording fills as they happen. A slot whose
+  // socket is down records NOTHING — and if the panel had already gone ACTIVE
+  // it would also have dropped the /state fills demand, leaving server and
+  // device both blind for the outage. So the panel gates ACTIVATION on this,
+  // and it has to be shell truth: only the shell knows the per-slot socket,
+  // and every window and pop-out must agree on the same answer.
+  function ltLblotStream(slot) {
+    const s = ltPushSessions[String(slot)];
+    const A = s && s.fut;
+    return { up: !!(A && A.up), gen: (A && A.gen) | 0, running: !!(A && A.running) };
+  }
+  // A redial is the dangerous case: the socket is up again, so the slot looks
+  // eligible, but the fills that happened while it was down were pushed to
+  // nobody (Lighter's WS sends no fill snapshot on connect). "Backfilled up to
+  // here" is therefore no longer true — drop the slot's backfill stamp so
+  // every window leaves ready and one of them re-runs the bounded market walk
+  // across the outage window. Cleared here rather than in the socket callback:
+  // this is the first place after a redial that already holds the scope, so no
+  // store load is forced onto the WS thread.
+  function ltLblotRedialClear(slot, sc) {
+    const s = ltPushSessions[String(slot)];
+    const A = s && s.fut;
+    if (!A || !A.redial) return;
+    A.redial = 0;
+    if (sc && sc.bf) {
+      sc.bf = null;
+      tdiag('lblot', 'lt_redial_bf_clear', { k: String(slot), gen: (A.gen | 0) });
+    }
+  }
   async function execLblotTrades(intent) {
     // Drain + replay: the local fills → OPEN/CLOSED trade rows via the
     // engine-twin lbReconstruct (grouping parity test-guarded). One replay
@@ -16234,6 +16898,7 @@ function createTradeNative(opts) {
     await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
+    if (venue === 'lighter') ltLblotRedialClear(slot, sc);   // #2327
     const dmSig = intent.displayMap ? JSON.stringify(intent.displayMap) : '';
     // #2230 one serialization for the whole app. Every open window polls this
     // op, and a fill invalidates the rev in all of them at once (push kick) —
@@ -16326,6 +16991,112 @@ function createTradeNative(opts) {
   // on the scope (`bf`) so every window/pop-out can surface it.
   const LB_BF_OVERLAP_MS = 10 * 60 * 1000;   // re-fetch overlap — dedupe absorbs it
   const LB_BF_DEFAULT_MS = 7 * 86400 * 1000; // empty store: last 7d + gap note
+
+  // ── #2327 Lighter fill history (backfill + re-import share this) ──────────
+  // Lighter has NO account-wide fills read: /api/v1/trades is market_id-scoped
+  // (account-filtered, behind the auth token) and the exchange lists 200+ perp
+  // markets, so enumerating the catalog would cost one signed call per market
+  // on every pass. The market set is therefore BOUNDED to the ones this
+  // account can plausibly have traded — its open positions, every market
+  // already in the local store, and every market the live push ring has seen
+  // — and that bound is REPORTED as a coverage note, never hidden behind a
+  // short list that reads as complete.
+  const LT_BF_PAGE = 100;         // venue page cap for /api/v1/trades (engine parity)
+  const LT_BF_MARKET_CAP = 40;    // signed calls per pass — bounded, never the catalog
+  async function ltBfMarkets(cc, sc, slot, route) {
+    const c = await ltCatalog(route);
+    if (!c.ok) return { ok: false, message: c.message || 'Lighter catalog unavailable' };
+    const mids = {};
+    const notes = [];
+    let covOk = true;
+    const bySym = (s) => c.map[String(s || '').toLowerCase()];
+    // (a) every market already recorded locally — this is also what makes a
+    // re-import safe: a market with local rows is always re-read.
+    for (const f of (sc && sc.rows) || []) {
+      if (!f || f.venue !== 'lighter') continue;
+      const sp = bySym(f.symbol);
+      if (sp) mids[String(sp.mid)] = sp;
+    }
+    // (b) markets the live push ring has seen but the store has not stored yet
+    const sess = ltPushSessions[slot];
+    for (const r of ((sess && sess.fut && sess.fut.fills && sess.fut.fills.rows) || [])) {
+      const sp = ltSpecByMid(r && (r._mid != null ? r._mid : r.market_id));
+      if (sp) mids[String(sp.mid)] = sp;
+    }
+    // (c) OPEN positions — a position opened on another device is the one
+    // market whose fills this store has never seen at all, and the one whose
+    // absence would leave a blotter trade stuck open.
+    const pr = await ltPositions(cc, route);
+    if (pr.ok) {
+      for (const p of pr.rows) { const sp = bySym(p.symbol); if (sp) mids[String(sp.mid)] = sp; }
+    } else {
+      covOk = false;
+      notes.push('open-position read failed — market coverage unknown ('
+                 + (pr.message || 'account read failed') + ')');
+    }
+    const specs = Object.keys(mids).map((k) => mids[k]);
+    specs.sort((a, b) => a.mid - b.mid);   // stable call order across passes
+    return { ok: true, specs: specs, notes: notes, covOk: covOk };
+  }
+  // One page of account-filtered fills for ONE market, newest-first.
+  async function ltFillsPage(cc, auth, spec, route) {
+    let r;
+    try {
+      r = await httpJson(LIGHTER_HOST, 'GET', '/api/v1/trades',
+        'market_id=' + spec.mid + '&account_index=' + cc.acct
+        + '&sort_by=timestamp&sort_dir=desc&limit=' + LT_BF_PAGE
+        + '&auth=' + encodeURIComponent(auth), null, {}, route, 8 * 1024 * 1024);
+    } catch (e) {
+      return { ok: false, message: 'Lighter fills fetch failed: ' + ((e && e.message) || 'error') };
+    }
+    let d = null;
+    try { d = JSON.parse(r.text); } catch (e) { d = null; }
+    const rows = d && Array.isArray(d.trades) ? d.trades : null;
+    if (!rows) {
+      const msg = (d && (d.message || d.msg)) || ('HTTP ' + (r.status || 0));
+      return { ok: false, message: 'Lighter fills fetch failed (' + msg + ')' };
+    }
+    return { ok: true, rows: rows, full: rows.length >= LT_BF_PAGE };
+  }
+  // Window-filtered fills across the bounded market set. A FULL page whose
+  // oldest row never reached `frm` means the window is deeper than one page:
+  // /trades pages by cursor, not by time, so depth cannot be proven from here
+  // — honest possible-gap verdict, never a silently shortened list.
+  async function ltFillsCollect(cc, specs, frm, to, route, gapMs) {
+    const auth = ltAuthToken(cc);
+    if (!auth.ok) return { ok: false, message: auth.message || 'Lighter auth token failed' };
+    const fills = [];
+    const notes = [];
+    let gap = false, raw = 0, calls = 0;
+    for (const sp of specs) {
+      if (calls >= LT_BF_MARKET_CAP) {
+        gap = true;
+        notes.push('market call cap reached — ' + (specs.length - calls) + ' market(s) not read');
+        break;
+      }
+      if (calls) await new Promise((rs) => setTimeout(rs, gapMs));
+      calls++;
+      const pg = await ltFillsPage(cc, auth.token, sp, route);
+      if (!pg.ok) return { ok: false, message: pg.message };
+      raw += pg.rows.length;
+      let oldest = Infinity;
+      for (const t of pg.rows) {
+        for (const f of lbNormLtFills(t, cc.acct, sp.symbol)) {
+          if (f.ts > 0 && (f.ts < frm || f.ts > to)) continue;
+          fills.push(f);
+        }
+        let ms0 = Math.floor(Number(t && t.timestamp) || 0);
+        if (ms0 > 0 && ms0 < 1e12) ms0 *= 1000;
+        if (ms0 > 0 && ms0 < oldest) oldest = ms0;
+      }
+      if (pg.full && oldest > frm) {
+        gap = true;
+        notes.push(sp.symbol + ' fill history deeper than one page — older fills may be missing');
+      }
+    }
+    return { ok: true, fills: fills, notes: notes, gap: gap, raw: raw, calls: calls };
+  }
+
   let _lbBfBusy = {};
   async function execLblotBackfill(intent) {
     const venue = String(intent.venue || '');
@@ -16818,6 +17589,38 @@ function createTradeNative(opts) {
         // the shared normalizers stamp venue='binance' — restamp, exactly
         // like the engine's AsterAdapter.fetch_fills.
         added = lbScopeMerge(sc, lbAstStamp(r.fills));
+      } else if (venue === 'lighter') {
+        // #2327 Lighter: perp-only, so ONE window (no spot leg), served per
+        // market behind the auth token — the bounded market set above, one
+        // signed page each. Without this arm the venue would fall into the
+        // bare Binance `else` below and sign Lighter creds as HMAC.
+        const ltFail = (msg) => {
+          sc.bf = { ts: now, ok: false, msg: msg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(msg) });
+          return { ok: false, message: msg };
+        };
+        const cc = await ltClient(creds);
+        if (!cc.ok) return ltFail(cc.message || 'Lighter signer unavailable');
+        const frm = bfFrm('futures', 'futures');
+        const mk = await ltBfMarkets(cc, sc, slot, route);
+        if (!mk.ok) return ltFail(mk.message || 'Lighter market set unavailable');
+        for (const n of mk.notes) notes.push(n);
+        if (mk.covOk === false) { covOk = false; gap = true; }
+        // The market set is a BOUND, not a proof of completeness — a market
+        // this account traded in, closed, and that left no local row is not
+        // discoverable from here. Always say so: a short list must never read
+        // as the whole history.
+        gap = true;
+        notes.push('Lighter serves fill history per market — coverage spans open positions, '
+                   + 'locally recorded markets and the live stream (' + mk.specs.length + ' market(s))');
+        const cl = await ltFillsCollect(cc, mk.specs, frm, now, route, HB_PAGE_GAP_MS);
+        if (!cl.ok) return ltFail(cl.message || 'Lighter fills fetch failed');
+        if (cl.gap) gap = true;
+        for (const n of cl.notes) notes.push(n);
+        _dgFutRows = cl.raw;
+        _dgFetched = cl.fills.length;
+        added = lbScopeMerge(sc, cl.fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -17269,6 +18072,26 @@ function createTradeNative(opts) {
         // shared normalizers stamp venue='binance' — restamp before merge so
         // the rows land in the SAME exec-id space as the live drain lane.
         for (const f of lbAstStamp(astFills)) fills.push(f);
+      } else if (venue === 'lighter') {
+        // #2327 Lighter: perp-only, per-market pages behind the auth token
+        // (same bounded market set as the backfill). A spot-only request has
+        // nothing to fetch — fail visibly instead of returning an empty
+        // success that reads as "no trades in this window".
+        if (market === 'spot') return riFail('Lighter has no spot market');
+        const cc = await ltClient(creds);
+        if (!cc.ok) return riFail(cc.message || 'Lighter signer unavailable');
+        const mk = await ltBfMarkets(cc, lbScope(slot), slot, route);
+        if (!mk.ok) return riFail(mk.message || 'Lighter market set unavailable');
+        for (const n of mk.notes) notes.push(n);
+        gap = true;   // per-market bound (backfill twin) — never silently short
+        notes.push('Lighter serves fill history per market — ' + mk.specs.length
+                   + ' market(s) read (open positions, locally recorded markets and the live stream)');
+        const cl = await ltFillsCollect(cc, mk.specs, w.frm, w.to, route, HB_PAGE_GAP_MS);
+        if (!cl.ok) return riFail(cl.message || 'Lighter fills fetch failed');
+        if (cl.gap) gap = true;
+        for (const n of cl.notes) notes.push(n);
+        riFutRows = cl.raw;
+        for (const f of cl.fills) fills.push(f);
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -17444,7 +18267,16 @@ function createTradeNative(opts) {
       return await execLblotRead(intent);
     }
     if (intent && typeof intent === 'object' && intent.op === 'lblot_trades') {
-      return await execLblotTrades(intent);
+      const r = await execLblotTrades(intent);
+      // #2327 Lighter stream health rides EVERY reply shape, including the
+      // `unchanged` short-circuit: the panel gates local-blotter ACTIVATION on
+      // it, so a stamp that only shipped with a payload rev bump would leave a
+      // dropped socket invisible for as long as the store stays quiet — which
+      // is exactly the state a dropped socket produces.
+      if (r && r.ok && String(intent.venue || '') === 'lighter') {
+        r.stream = ltLblotStream(String(intent.credSlot || 'lighter'));
+      }
+      return r;
     }
     if (intent && typeof intent === 'object' && intent.op === 'lblot_ingest') {
       return await execLblotIngest(intent);
@@ -17866,6 +18698,21 @@ function createTradeNative(opts) {
           }
         } catch (e) { /* non-fatal */ }
       }
+      // #2326: same one-time kick for the Lighter private stream (ONE conn
+      // carrying account_all + account_all_orders); the loop self-maintains.
+      // Lighter is NOT on the native acct-read axis, so this arm-time kick is
+      // the ONLY thing that starts its push lane.
+      if (venue === 'lighter') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'lighter') continue;
+            const c = credsGet(k);
+            if (c) { try { ltPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
     } catch (e) { /* non-fatal */ }
   }
 
@@ -18274,6 +19121,17 @@ module.exports = {
   ltCoi,
   ltUnits,
   ltBoundUnits,
+  // pure — Lighter private WS push lane (#2326)
+  LT_WS_URL,
+  ltPushSubFrame,
+  ltPushEnv,
+  ltIdStr,
+  ltPushOrdOpen,
+  ltPushRowList,
+  ltPushPosSig,
+  ltPushBalSig,
+  ltPushTradeLegs,
+  ltPushFillKey,
   // pure — venue time sync (offset math + probe registry)
   VENUE_TIME_PROBES,
   venueTimeProbe,
@@ -18521,6 +19379,8 @@ module.exports = {
   lbAstStamp,
   lbNormAstFut,
   lbNormAstSpot,
+  lbNormLtFills,
+  lbNormLtFill,
   lbFillKey,
   lbScopeMerge,
   lbHwm,
