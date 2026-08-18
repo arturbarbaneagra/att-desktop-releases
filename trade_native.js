@@ -352,6 +352,28 @@ function phOrdOpen(status) {
   const s = String(status || '');
   return s === 'New' || s === 'PartiallyFilled' || s === 'Untriggered' || s === 'Created';
 }
+// #2397 Spot pairs whose BASE currency this account holds a nonzero amount of
+// — the acct-read's #1722 symbol-required rule as a pure twin, so the history
+// walks and the account read derive the SAME spot universe from the SAME two
+// sources (/spot/wallets rows × the products catalog). Ev and Rv balance
+// variants both count as held; a pair whose base the wallet does not hold
+// cannot carry an unseen holding. Never throws on a malformed row.
+function phSpotSymsHeld(wallets, rawProducts) {
+  const curs = {};
+  for (const w of (wallets || [])) {
+    const nz = (Number(w && w.balanceEv) || 0)
+             + (Number(w && w.lockedTradingBalanceEv) || 0)
+             + (Number(w && w.lockedWithdrawEv) || 0)
+             + (Number(w && w.balanceRv) || 0);
+    if (nz) curs[String((w && w.currency) || '')] = 1;
+  }
+  const out = [];
+  for (const p of ((rawProducts && rawProducts.products) || [])) {
+    if (p && String(p.type) === 'Spot' && p.symbol
+        && curs[String(p.baseCurrency || '')]) out.push(String(p.symbol));
+  }
+  return out;
+}
 // Engine _lev_cap twin: positive integer cap from maxLeverage, else its float
 // twin maxOpenPosLeverage. null when neither parses (cap unknown → no clamp).
 function phLevCap(maxLev, maxOpenPosLev) {
@@ -14484,8 +14506,9 @@ function createTradeNative(opts) {
           } catch (e) { done(e); return; }
           sess.up = true; sess.err = null; sess.laneT = Date.now();
           tdiag('acct', 'ph_push_up', { s: slot });
-          // The private channels DO snapshot on subscribe, but this lane never
-          // applies a snapshot as rows — the panel owes itself a signed read.
+          // The private channels snapshot on subscribe; #2397 applies those
+          // rows too (idempotent upserts) while this lane hint keeps the
+          // panel's signed read as the removal-by-absence safety net.
           phPushLane(slot, 'up');
           if (!sess.reauthOff) {
             authT = setInterval(() => {
@@ -14522,14 +14545,20 @@ function createTradeNative(opts) {
     const wo = ('wallets' in msg) || ('orders' in msg);
     if (!aop && !wo) return;
     if (String(msg.type || '') === 'snapshot') {
-      // Full-truth frame: removals ride ABSENCE, which an upsert lane cannot
-      // express. Ask the panel for a signed read instead of inventing rows.
+      // #2397 A snapshot's ROWS now ride the lane like any other frame. They
+      // carry the same shapes, every consumer upserts them and every fill
+      // path de-dupes on the side-inclusive exec id, so applying them is
+      // idempotent — while DROPPING them was why a position row, a size
+      // change or an armed conditional order could sit unseen behind the
+      // throttled lane hint until the ≥15 s signed read caught up.
+      // What an upsert lane still cannot express is removal-by-ABSENCE, so
+      // the throttled lane 'up' rides along unchanged and the panel's signed
+      // read stays the safety net that retires rows the snapshot omits.
       const now = Date.now();
       if (now - (sess.laneT || 0) >= PH_PUSH_LANE_MIN_GAP_MS) {
         sess.laneT = now;
         phPushLane(slot, 'up');
       }
-      return;
     }
     const PF = sess.fu, PS = sess.sp;
     if (aop) {
@@ -15015,6 +15044,94 @@ function createTradeNative(opts) {
       }
     }
     return { ok: true, syms: out, full: true, pages: pages };   // budget hit
+  }
+  // #2397 SPOT symbol universe — WITHOUT the account-wide order-history call.
+  // Phemex refuses /api-data/spots/orders unless a symbol is given ("412
+  // Missing parameter - symbol"), so phHistSymbols can never resolve the spot
+  // universe: every spot backfill reported it unresolved (covOk:false ⇒ the
+  // local store never activated) and every re-import failed on it. The set is
+  // assembled from the reads that DO answer account-wide:
+  //   • the caller's seed — locally recorded symbols, this session's push
+  //     hints, and the spot boards the panel has open;
+  //   • the account's OPEN spot orders (/spot/orders, no symbol needed);
+  //   • every catalogued spot pair whose BASE currency the wallet holds
+  //     (/spot/wallets × the products catalog — phSpotSymsHeld).
+  // The two account reads are its PROOF: if either fails the universe is
+  // UNRESOLVED and the caller must report incomplete coverage exactly as it
+  // did for the 412. A symbol-required refusal of the open-orders leg is not a
+  // failure: those deployments answer only the per-symbol form, and a resting
+  // order on a base the wallet holds is already in the set (a resting order
+  // has no fills of its own).
+  // HONESTY: this set is INFERRED, never proven. A pair the account traded and
+  // sold back to ZERO before this device recorded it holds no base, has no
+  // resting order and has no local row — it is in none of these sources, and
+  // Phemex offers no call that would name it (the server-side blotter is blind
+  // to it for the very same reason: its discovery IS the refused call). So a
+  // run that resolved the universe this way reports `gap` — the local store
+  // still serves (like every other bounded-history venue) but the trades pane
+  // shows ⚠ with phSpotInfNote. Only the user can close it, by naming the set
+  // in the re-import Symbols field (intent.spotSymsUser), which suppresses the
+  // note for that run and for every later backfill the panel seeds with it.
+  const PH_SPOT_INF_NOTE = 'spot pairs are discovered from holdings, open '
+    + 'orders and recorded trades — a pair sold out before this device '
+    + 'recorded it is only walked if you name it in the re-import Symbols field';
+  // User-asserted spot symbols riding an intent (re-import field, or the panel
+  // replaying the list the user saved there). Non-empty = the run's universe
+  // is explicit, so the inferred-gap note does not apply.
+  function phSpotUserSyms(intent) {
+    const out = [];
+    for (const s of (Array.isArray(intent && intent.spotSymsUser) ? intent.spotSymsUser : [])) {
+      const v = String(s || '').trim();
+      if (v && /^[A-Za-z0-9]{1,32}$/.test(v)) out.push(v);
+    }
+    return out;
+  }
+  async function phSpotUniverse(creds, route, seed) {
+    const syms = {};
+    for (const s of (seed || [])) { const v = String(s || ''); if (v) syms[v] = 1; }
+    const sorted = () => Object.keys(syms).sort();
+    let calls = 0;
+    let oo;
+    try {
+      oo = await signedRequest(creds, {
+        method: 'GET', path: '/spot/orders', query: '', body: null }, route);
+    } catch (e) {
+      oo = { ok: false, message: (e && e.message) || 'spot open-orders fetch failed' };
+    }
+    calls++;
+    if (oo && oo.ok) {
+      const lst = (oo.data && oo.data.rows) || (Array.isArray(oo.data) ? oo.data : []);
+      for (const o of (Array.isArray(lst) ? lst : [])) {
+        const s = String((o && o.symbol) || '');
+        if (s) syms[s] = 1;
+      }
+    } else if (!phemexSymbolRequired(oo)) {
+      return { ok: false, syms: sorted(), calls: calls,
+               message: 'open spot orders: ' + ((oo && oo.message) || 'request failed') };
+    }
+    let wl;
+    try {
+      wl = await signedRequest(creds, {
+        method: 'GET', path: '/spot/wallets', query: '', body: null }, route);
+    } catch (e) {
+      wl = { ok: false, message: (e && e.message) || 'spot wallets fetch failed' };
+    }
+    calls++;
+    if (!wl || !wl.ok) {
+      return { ok: false, syms: sorted(), calls: calls,
+               message: 'spot wallets: ' + ((wl && wl.message) || 'request failed') };
+    }
+    // Shape-tolerant like the acct read: bare list today, {rows:[…]} tolerated.
+    const wallets = Array.isArray(wl.data) ? wl.data
+      : (wl.data && Array.isArray(wl.data.rows)) ? wl.data.rows : [];
+    let pr = null;
+    try { pr = await phemexProducts(route); } catch (e) { pr = null; }
+    if (!pr || !pr.raw) {
+      return { ok: false, syms: sorted(), calls: calls,
+               message: 'product catalog unavailable — held spot pairs unknown' };
+    }
+    for (const s of phSpotSymsHeld(wallets, pr.raw)) syms[s] = 1;
+    return { ok: true, syms: sorted(), calls: calls };
   }
   // Paced live refresh for ONE Phemex slot. Single-flight + TTL-gated (N
   // windows polling the same slot in one beat cost ONE pass). Best-effort by
@@ -18793,10 +18910,15 @@ function createTradeNative(opts) {
         // account-wide walk that can prove completeness on its own. Coverage
         // is assembled from three bounded sources and every one of them
         // reports honestly when it cannot prove what it returned:
-        //   • the account-wide ORDER-history feed (engine discover_symbols
-        //     twin) — the only way to learn about a symbol the local store
-        //     has never seen. A failed or capped discovery is an UNRESOLVED
-        //     symbol universe ⇒ covOk:false.
+        //   • FUTURES: the account-wide ORDER-history feed (engine
+        //     discover_symbols twin) — the only way to learn about a symbol
+        //     the local store has never seen. A failed or capped discovery is
+        //     an UNRESOLVED symbol universe ⇒ covOk:false.
+        //   • SPOT (#2397): the same feed REFUSES an account-wide call ("412
+        //     Missing parameter - symbol"), so the universe comes from the
+        //     account reads that do answer — open spot orders + held bases ×
+        //     the catalog (phSpotUniverse). A failed source read there is the
+        //     same unresolved universe ⇒ covOk:false.
         //   • locally recorded symbols and the live ring's session hints.
         //   • one offset walk per symbol per ≤7-day chunk (the engine's
         //     proven HIST_WINDOW span). A walk that exhausts its page budget
@@ -18827,19 +18949,45 @@ function createTradeNative(opts) {
           const symSet = {};
           for (const s in symHwm[mk]) symSet[s] = 1;
           if (Rh) for (const s in Rh.hint[mk]) symSet[s] = 1;
-          const dsc = await phHistSymbols(creds, mk, mFrm, now + 1000, route,
-            Math.min(PH_BF_DISC_PAGES, Math.max(1, PH_BF_CALL_CAP - calls)), HB_PAGE_GAP_MS);
-          calls += dsc.pages | 0;
-          if (!dsc.ok) {
-            gap = true; covOk = false;
-            notes.push(mk + ' symbol universe unresolved ('
-                       + (dsc.message || 'order history read failed')
-                       + ') — history is incomplete');
-          } else {
-            for (const s of dsc.syms) symSet[s] = 1;
-            if (dsc.full) {
+          // #2397 the panel seeds the spot boards it has open — a pair the
+          // user is trading right now belongs in the universe even before its
+          // first local row exists.
+          if (mk === 'spot') {
+            for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
+              const v = String(s || ''); if (v) symSet[v] = 1;
+            }
+            for (const s of phSpotUserSyms(intent)) symSet[s] = 1;
+          }
+          if (mk === 'spot') {
+            const uni = await phSpotUniverse(creds, route, Object.keys(symSet));
+            calls += uni.calls | 0;
+            for (const s of uni.syms) symSet[s] = 1;
+            if (!uni.ok) {
               gap = true; covOk = false;
-              notes.push(mk + ' order history exceeded the symbol discovery cap — history is incomplete');
+              notes.push(mk + ' symbol universe unresolved ('
+                         + (uni.message || 'account read failed')
+                         + ') — history is incomplete');
+            } else if (!phSpotUserSyms(intent).length) {
+              // resolved, but by INFERENCE — honest ⚠ without keeping the
+              // server copy (which is blind to the same pair, see the note).
+              gap = true;
+              notes.push(mk + ' ' + PH_SPOT_INF_NOTE);
+            }
+          } else {
+            const dsc = await phHistSymbols(creds, mk, mFrm, now + 1000, route,
+              Math.min(PH_BF_DISC_PAGES, Math.max(1, PH_BF_CALL_CAP - calls)), HB_PAGE_GAP_MS);
+            calls += dsc.pages | 0;
+            if (!dsc.ok) {
+              gap = true; covOk = false;
+              notes.push(mk + ' symbol universe unresolved ('
+                         + (dsc.message || 'order history read failed')
+                         + ') — history is incomplete');
+            } else {
+              for (const s of dsc.syms) symSet[s] = 1;
+              if (dsc.full) {
+                gap = true; covOk = false;
+                notes.push(mk + ' order history exceeded the symbol discovery cap — history is incomplete');
+              }
             }
           }
           const syms = Object.keys(symSet)
@@ -19385,12 +19533,31 @@ function createTradeNative(opts) {
             if ((f.market === 'spot' ? 'spot' : 'futures') === mk) symSet[f.symbol] = 1;
           }
           if (Rh) for (const s in Rh.hint[mk]) symSet[s] = 1;
-          const dsc = await phHistSymbols(creds, mk, w.frm, w.to, route,
-                                          PH_RI_DISC_PAGES, HB_PAGE_GAP_MS);
-          calls += dsc.pages | 0;
-          if (!dsc.ok) return riFail('Phemex ' + mk + ' order history: ' + (dsc.message || 'request failed'));
-          if (dsc.full) return riFail('Window too large — more traded symbols than the discovery cap; narrow the date range');
-          for (const s of dsc.syms) symSet[s] = 1;
+          if (mk === 'spot') {
+            // #2397 the account-wide spot order-history feed answers 412
+            // (symbol required), so the universe comes from open spot orders +
+            // held bases × the catalog, seeded with the panel's open boards.
+            // A failed SOURCE read is still a hard failure: a re-import that
+            // silently missed a symbol leaves its tombstones in place.
+            for (const s of (Array.isArray(intent.spotSymbols) ? intent.spotSymbols : [])) {
+              const v = String(s || ''); if (v) symSet[v] = 1;
+            }
+            const usr = phSpotUserSyms(intent);
+            for (const s of usr) symSet[s] = 1;
+            const uni = await phSpotUniverse(creds, route, Object.keys(symSet));
+            calls += uni.calls | 0;
+            if (!uni.ok) return riFail('Phemex spot symbol universe unresolved: ' + (uni.message || 'account read failed'));
+            for (const s of uni.syms) symSet[s] = 1;
+            // inferred universe ⇒ the run cannot claim it saw every pair
+            if (!usr.length) { gap = true; notes.push('spot ' + PH_SPOT_INF_NOTE); }
+          } else {
+            const dsc = await phHistSymbols(creds, mk, w.frm, w.to, route,
+                                            PH_RI_DISC_PAGES, HB_PAGE_GAP_MS);
+            calls += dsc.pages | 0;
+            if (!dsc.ok) return riFail('Phemex ' + mk + ' order history: ' + (dsc.message || 'request failed'));
+            if (dsc.full) return riFail('Window too large — more traded symbols than the discovery cap; narrow the date range');
+            for (const s of dsc.syms) symSet[s] = 1;
+          }
           const syms = Object.keys(symSet)
             .filter((s) => /^[A-Za-z0-9]{1,32}$/.test(s)).sort();
           for (const sym of syms) {
