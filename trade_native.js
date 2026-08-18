@@ -14561,13 +14561,22 @@ function createTradeNative(opts) {
       }
     }
     const PF = sess.fu, PS = sess.sp;
+    // #2401 A snapshot is a WHOLE-ACCOUNT picture, a delta is per-symbol truth,
+    // and round 4 shipped them down one lane with nothing to tell them apart.
+    // Phemex's snapshot carries a row for every symbol the account has ever
+    // touched — nearly all size 0 — so the panel's per-symbol drain read each
+    // one as "this symbol just went flat" and deleted the live position row.
+    // The flag rides the ROW (not the event): one coalesced push beat can carry
+    // both a snapshot and a live delta, and the live delta must keep its full
+    // upsert-and-delete authority.
+    const _snap = String(msg.type || '') === 'snapshot';
     if (aop) {
       for (const a of (msg.accounts_p || [])) {
         if (a && typeof a === 'object') { krLseq(PF); phPushSc(PF, 'bal', null, a); }
       }
       for (const p of (msg.positions_p || [])) {
         if (p && typeof p === 'object' && p.symbol) {
-          krLseq(PF); phPushSc(PF, 'pos', null, p);
+          krLseq(PF); phPushSc(PF, 'pos', null, _snap ? Object.assign({}, p, { _snap: 1 }) : p);
           phSymHint(slot, 'futures', p.symbol);   // #2385 live-poll symbol bound
         }
       }
