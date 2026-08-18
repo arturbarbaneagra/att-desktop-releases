@@ -326,6 +326,62 @@ function phemexExpiry(nowSec, offsetSec) {
 }
 
 // ---------------------------------------------------------------------------
+// #2384 Phemex private-WS + leverage primitives (pure — engine parity)
+// ---------------------------------------------------------------------------
+// Engine ws_auth_signature twin: HMAC-SHA256 over key+expiry, hex.
+function phWsAuthSig(key, secret, expiry) {
+  return crypto.createHmac('sha256', String(secret))
+    .update(String(key) + String(expiry), 'utf8').digest('hex');
+}
+// The authenticate frame. Params order is positional and NOT negotiable:
+// ["API", <key>, <signature>, <expiry-unix-seconds>].
+function phWsAuthFrame(key, secret, expiry, id) {
+  return { id: id == null ? 1 : id, method: 'user.auth',
+           params: ['API', String(key), phWsAuthSig(key, secret, expiry), expiry] };
+}
+// The two private subscriptions, sent (in this order) ONLY after the auth ack:
+// aop_p = futures accounts/positions/orders, wo = spot wallets/orders.
+function phWsSubFrames() {
+  return [{ id: 2, method: 'aop_p.subscribe', params: [] },
+          { id: 3, method: 'wo.subscribe', params: [] }];
+}
+// Engine _OPEN_ORD_STATUSES twin — the statuses whose row still holds a badge.
+// Everything else (Filled/Canceled/Rejected/Triggered/Deactivated) removes it,
+// which is what makes a TRIGGERED stop stop showing the moment it fires.
+function phOrdOpen(status) {
+  const s = String(status || '');
+  return s === 'New' || s === 'PartiallyFilled' || s === 'Untriggered' || s === 'Created';
+}
+// Engine _lev_cap twin: positive integer cap from maxLeverage, else its float
+// twin maxOpenPosLeverage. null when neither parses (cap unknown → no clamp).
+function phLevCap(maxLev, maxOpenPosLev) {
+  for (const v of [maxLev, maxOpenPosLev]) {
+    if (v == null) continue;
+    const n = Math.trunc(Number(v));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+// Engine signed_leverage twin. Phemex encodes the MARGIN MODE in the SIGN of
+// leverageRr (negative = cross, positive = isolated), so a leverage change
+// must never invent a sign: keep the sign of the symbol's currently configured
+// leverage, fall back to the product default's sign, and only then to positive
+// (isolated — Phemex's own default for a never-configured symbol). Magnitude
+// is what the user asked for. Returns null for a non-positive magnitude.
+function phLevSigned(magnitude, curLev, defaultLev) {
+  const mag = Math.abs(Number(magnitude));
+  if (!Number.isFinite(mag) || mag <= 0) return null;
+  let neg = false;
+  const cur = Number(curLev);
+  if (curLev != null && Number.isFinite(cur) && cur !== 0) neg = cur < 0;
+  else {
+    const dfl = Number(defaultLev);
+    if (defaultLev != null && Number.isFinite(dfl) && dfl !== 0) neg = dfl < 0;
+  }
+  return neg ? -mag : mag;
+}
+
+// ---------------------------------------------------------------------------
 // Phemex order-body builders (pure — parity with terminal_engine.py)
 // ---------------------------------------------------------------------------
 const PHE_TYPE_MAP = { market: 'Market', limit: 'Limit', stop: 'Stop',
@@ -2117,6 +2173,142 @@ function lbNormKucoinFill(f, market, multiplier) {
   }
   return out;
 }
+// ── #2385 Phemex device-local blotter normalizers ───────────────────────────
+// Engine twins of PhemexAdapter.fut_fill_norm / spot_fill_norm — SAME exec-id
+// space, SAME field truth, so a device row and a server-recorded row dedupe to
+// one and an explicit "save to server" cannot double a trade.
+// Fill timestamp → MILLISECONDS. Phemex stamps `transactTimeNs` in NANOseconds
+// on the /api-data feeds, but the private WS rows in the same family carry a
+// millisecond stamp in a sibling field (and some order echoes a second one),
+// so the fold is per-VALUE by magnitude rather than per-source: a nanosecond
+// stamp read as ms parks the fill in the year 57000 and the chart bucket, the
+// poll cursor and the store high-water mark all follow it there.
+function lbPhTsMs(r) {
+  for (const k of ['transactTimeNs', 'transactTimeMs', 'transactTime',
+                   'createTimeNs', 'actionTimeNs', 'ts']) {
+    const v = Math.floor(Number((r || {})[k] || 0));
+    if (!Number.isFinite(v) || v <= 0) continue;
+    if (v > 1e15) return Math.floor(v / 1e6);   // nanoseconds
+    if (v > 1e12) return v;                     // milliseconds
+    if (v > 1e9) return v * 1000;               // seconds
+    return v;
+  }
+  return 0;
+}
+// spot_from_scaled twin: an E-scaled integer → its real decimal string. Done
+// by DECIMAL SHIFT on the digit string, never `/ Math.pow(10, n)`, so a
+// 1e8-scaled quote value comes back as '0.3' and not '0.30000000000000004'
+// (the engine divides Decimals; a float twin would break replay parity).
+function lbPhScaled(v, scale) {
+  const n = Number(scale);
+  const sc = Number.isInteger(n) && n >= 0 && n <= 18 ? n : 8;
+  let s = String(v == null || v === '' ? 0 : v).trim();
+  if (!/^[+-]?\d+$/.test(s)) {
+    // Python's int(value or 0) would raise on a non-integer wire value; the
+    // engine catches that as a junk row. Keep it lossy-but-finite here.
+    const f = Number(s);
+    if (!Number.isFinite(f)) return '0';
+    return lbFmt(f / Math.pow(10, sc));
+  }
+  let neg = false;
+  if (s[0] === '+') s = s.slice(1);
+  else if (s[0] === '-') { neg = true; s = s.slice(1); }
+  s = s.replace(/^0+(?=\d)/, '');
+  let out;
+  if (sc === 0) out = s;
+  else {
+    while (s.length <= sc) s = '0' + s;
+    out = (s.slice(0, s.length - sc) + '.' + s.slice(s.length - sc))
+      .replace(/0+$/, '').replace(/\.$/, '');
+  }
+  if (out === '' || out === '0') return '0';
+  return (neg ? '-' : '') + out;
+}
+// Per-currency valueScale lookup (cur_scale twin) — default 8.
+function lbPhCurScale(curScales, ccy) {
+  const v = Number((curScales || {})[String(ccy || '')]);
+  return Number.isInteger(v) && v >= 0 && v <= 18 ? v : 8;
+}
+// fut_fill_norm twin. USDT-M futures Rp/Rq/Rv fields are REAL decimals (no
+// descaling); a `tradeType: Funding` row is a funding charge, not a trade.
+// The MARKET comes from the caller, never the row — the futures and spot
+// /api-data trade rows are shape-similar enough to cross over.
+function lbNormPhemexFut(r, symbol) {
+  if (!r || typeof r !== 'object') return null;
+  const sym = String(symbol || r.symbol || '');
+  if (!sym) return null;
+  const sd = String(r.side || '').toLowerCase();
+  const side = sd === 'buy' ? 'buy' : (sd === 'sell' ? 'sell' : sd);
+  const isFunding = String(r.tradeType || 'Trade').toLowerCase() === 'funding';
+  const fee = lbNum(r.execFeeRv) || '0';
+  // REST /api-data rows name it execQtyRq; the private-WS aop_p execution row
+  // names it execQty (engine norm_ws_fut_fill). ONE normalizer reads both, so
+  // the poll lane and the push lane land in the same exec-id space.
+  const qty = lbNum(r.execQtyRq) || lbNum(r.execQty) || '0';
+  const eid = String(r.execID || r.execId || '');
+  // A row with neither an exec id nor a size is junk, not a fill: it would key
+  // on ts alone and collide with the next such row.
+  if (!eid && !(Number(qty) > 0)) return null;
+  return {
+    venue: 'phemex', market: 'futures', symbol: sym,
+    side: side, posSide: String(r.posSide || ''),
+    order_px: lbNum(r.priceRp) || '',
+    exec_px: lbNum(r.execPriceRp) || '0',
+    qty: qty,
+    value: lbNum(r.execValueRv) || '0',
+    fee: fee,
+    closed_pnl: lbNum(r.closedPnlRv) || '0',
+    kind: isFunding ? 'funding' : 'trade',
+    funding: isFunding ? fee : '0',
+    ts: lbPhTsMs(r),
+    exec_id: eid,
+  };
+}
+// spot_fill_norm twin. EVERY spot field is e-scaled, and the base quantity's
+// scale is the BASE CURRENCY's own valueScale — never a flat 1e8 (1000MOG=4,
+// PEPE=2, SHIB=2). A flat default sizes a PEPE fill 1,000,000× wrong. The fee
+// is charged in `feeCurrency` at THAT currency's scale and converted to quote
+// units by ×price when the two differ. Spot has no funding — such a row is
+// dropped, exactly like the engine's.
+function lbNormPhemexSpot(r, symbol, spec, curScales) {
+  if (!r || typeof r !== 'object') return null;
+  const sym = String(symbol || r.symbol || '');
+  if (!sym) return null;
+  if (String(r.tradeType || 'Trade').toLowerCase() === 'funding') return null;
+  const sd = String(r.side || '').toLowerCase();
+  const side = sd === 'buy' ? 'buy' : (sd === 'sell' ? 'sell' : sd);
+  const execPx = lbPhScaled(r.execPriceEp, 8);
+  let orderEp = r.priceEp;
+  if (orderEp === undefined || orderEp === null) orderEp = r.priceEP;
+  const orderPx = (orderEp === undefined || orderEp === null) ? '' : lbPhScaled(orderEp, 8);
+  const baseVs = Number((spec || {}).value_scale);
+  const baseQty = lbPhScaled(r.execBaseQtyEv,
+                             Number.isInteger(baseVs) ? baseVs : 8);
+  const quoteQty = lbPhScaled(r.execQuoteQtyEv, 8);
+  const quote = String((spec || {}).quote || 'USDT');
+  const feeCcy = String(r.feeCurrency || '');
+  const feeRaw = lbPhScaled(r.execFeeEv,
+                            feeCcy ? lbPhCurScale(curScales, feeCcy) : 8);
+  let feeUsd;
+  if (feeCcy && feeCcy === quote) feeUsd = feeRaw;
+  else if (feeCcy) feeUsd = lbFmt(Number(feeRaw) * Number(execPx));
+  else feeUsd = feeRaw;
+  const eid = String(r.execId || r.execID || '');
+  if (!eid && !(Number(baseQty) > 0)) return null;
+  return {
+    venue: 'phemex', market: 'spot', symbol: sym,
+    side: side, posSide: '',
+    order_px: orderPx,
+    exec_px: execPx,
+    qty: baseQty,
+    value: quoteQty,
+    fee: feeUsd,
+    closed_pnl: '0',
+    kind: 'trade', funding: '0',
+    ts: lbPhTsMs(r),
+    exec_id: eid,
+  };
+}
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
 function lbFillKey(f) {
@@ -2761,8 +2953,14 @@ function lbReconstruct(fills, displayMap) {
         // every row read a flat 0. The `closed_pnl === 0` gate is what keeps a
         // venue-REPORTED value authoritative: the day a venue starts sending
         // realized PnL it supersedes this derive with no other change.
+        // #2385 phemex joined: it DOES stamp closedPnlRv per closing fill, so
+        // the `closed_pnl === 0` gate keeps the venue's own number
+        // authoritative in the normal case. This only takes over when the
+        // venue reported nothing at all — and then a truncated history must
+        // read BLANK rather than a plausible-looking −fees.
         if ((tr.venue === 'bybit' || tr.venue === 'kucoin' || tr.venue === 'bitmex'
-             || tr.venue === 'kraken' || tr.venue === 'gate' || tr.venue === 'lighter')
+             || tr.venue === 'kraken' || tr.venue === 'gate' || tr.venue === 'lighter'
+             || tr.venue === 'phemex')
             && tr.closed_pnl === 0 && tr.close_qty > 0) {
           // The derive is exact ONLY when this round trip's own opening fills
           // are in the stored history: closed qty fully matched by opened qty,
@@ -6164,6 +6362,7 @@ function createTradeNative(opts) {
     try { hlPushClose(venue); } catch (e) { /* no session */ }
     try { astUdsClose(venue); } catch (e) { /* no session */ }   // #2306
     try { ltPushClose(venue); } catch (e) { /* no session */ }   // #2326
+    try { phPushClose(venue); } catch (e) { /* no session */ }   // #2384
     return { ok: true, tail: venues[venue].tail };
   }
   function credsWipe(venue) {
@@ -6179,6 +6378,7 @@ function createTradeNative(opts) {
     try { if (venue) kcPushClose(venue); else kcPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) astUdsClose(venue); else astUdsCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) ltPushClose(venue); else ltPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) phPushClose(venue); else phPushCloseAll(); } catch (e) { /* no session */ }
     return { ok: true };
   }
   function credsStatus() {
@@ -6601,8 +6801,13 @@ function createTradeNative(opts) {
         // pscale (#1713): per-symbol e-scale of spot kline prices — needed by
         // the panel's phKlineBars twin (futures rows are real numbers, 0/0).
         const ps = Number(p.priceScale);
+        // #2385 `quote` rides along (additive): the local-blotter spot fill
+        // normalizer needs the quote currency to decide whether a fee charged
+        // in feeCurrency is already in quote units or must be ×price'd — the
+        // engine's spot_fill_norm reads it off the same product spec.
         spot[p.symbol] = { value_scale: Number.isInteger(vs) ? vs : 8,
-                           pscale: Number.isInteger(ps) && ps >= 0 ? ps : 0 };
+                           pscale: Number.isInteger(ps) && ps >= 0 ? ps : 0,
+                           quote: p.quoteCurrency || 'USDT' };
       }
       products.spot = spot;
       products.curScales = curScales;
@@ -14026,6 +14231,388 @@ function createTradeNative(opts) {
     return out;
   }
 
+  // #2384 Phemex leverage GET/SET on device keys — the engine's
+  // PhemexAdapter.leverage_config / set_leverage twin, so the leverage chip
+  // works with NO server key. Phemex has one leverage per SYMBOL (one-way
+  // USDT-M) and encodes the margin mode in the sign of leverageRr: the SET
+  // reads the current signed value first and reuses its sign, so a cross
+  // account stays cross and an isolated one stays isolated. The chip only
+  // ever shows/sends the MAGNITUDE. Old shells reject op:'leverage' for
+  // phemex with 'unknown op' and the panel falls back to the server path.
+  async function execPhemexLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'phemex');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '').toUpperCase();
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    // Current signed leverage — from the raw accountPositions rows, which
+    // report a symbol's configuration even when FLAT (engine parity).
+    const curRead = async () => {
+      const r = await signedRequest(creds, { method: 'GET', path: '/g-accounts/accountPositions',
+                                             query: 'currency=USDT', body: null }, route);
+      if (!r.ok) return r;
+      let cur = null;
+      const ps = (r.data && r.data.positions) || [];
+      for (const p of (Array.isArray(ps) ? ps : [])) {
+        if (p && String(p.symbol || '') === sym) { cur = p.leverageRr; break; }
+      }
+      return { ok: true, cur: cur };
+    };
+    if (intent.what !== 'set') {
+      const c = await curRead();
+      if (!c.ok) return _dgLine(c);
+      const n = Number(c.cur);
+      return _dgLine({ ok: true, symbol: sym,
+                       leverage: (c.cur != null && Number.isFinite(n) && n !== 0)
+                         ? String(Math.abs(n)) : null });
+    }
+    const mag = Math.abs(Number(intent.leverage));
+    if (!Number.isFinite(mag) || mag <= 0) return _dgLine({ ok: false, message: 'Leverage must be positive' });
+    // Exchange cap (risk tier ladder's top): reject BEFORE the write so the
+    // chip says why instead of surfacing a raw venue code.
+    let spec = null;
+    try {
+      const pr = await phemexProducts(route);
+      for (const p of ((pr && pr.raw && pr.raw.perpProductsV2) || [])) {
+        if (p && String(p.symbol || '') === sym) { spec = p; break; }
+      }
+    } catch (e) { /* catalog cold — the venue still enforces its own cap */ }
+    const cap = spec ? phLevCap(spec.maxLeverage, spec.maxOpenPosLeverage) : null;
+    if (cap && mag > cap) {
+      return _dgLine({ ok: false, message: 'Leverage exceeds the ' + cap + 'x maximum for ' + sym });
+    }
+    const c = await curRead();
+    if (!c.ok) return _dgLine(c);
+    const signed = phLevSigned(mag, c.cur, spec ? spec.defaultLeverage : null);
+    if (signed == null) return _dgLine({ ok: false, message: 'Invalid leverage' });
+    const r = await signedRequest(creds, { method: 'PUT', path: '/g-positions/leverage',
+      query: 'symbol=' + sym + '&leverageRr=' + String(signed), body: null }, route);
+    if (!r.ok) return _dgLine(r);
+    return _dgLine({ ok: true, symbol: sym, leverage: String(Math.abs(signed)) });
+  }
+
+  // --- #2384 Phemex account push lane -----------------------------------------
+  // Phemex private WS (wss://ws.phemex.com) — the engine's PrivateWsCache twin
+  // moved shell-side, so the device-key path stops waiting for the next signed
+  // account read to repaint a badge. Sequence (engine _connect_once parity):
+  // {id:1,"user.auth",["API",key,HMAC-SHA256(key+expiry),expiry]}, then on the
+  // id-1 ack aop_p.subscribe (id 2 — futures accounts/positions/orders) and
+  // wo.subscribe (id 3 — spot wallets/orders); {id:9,"server.ping"} every 5s.
+  // ONE socket, TWO scopes ('fut'|'spot'): Phemex order ids come from separate
+  // per-market endpoints, and the panel needs the market to place a badge or a
+  // tombstone. Auth expiry is 60s, so the session re-auths at 45s — a REJECTED
+  // re-auth tears the conn down ONCE for a clean full re-auth and latches the
+  // periodic refresh off (engine behaviour) so it can never become a redial
+  // loop. SNAPSHOT frames carry no incremental semantics (they express
+  // removals by ABSENCE, which an upsert lane cannot say): they emit a lane
+  // 'up' instead, and the panel answers with a fresh signed read. Rides the
+  // proxy agent like all shell traffic (krWsDial); shared backoff ladder.
+  const PH_PUSH_WS_URL = 'wss://ws.phemex.com';
+  const PH_PUSH_AUTH_EXPIRY_S = 60;    // engine PRIV_WS_AUTH_EXPIRY_S
+  const PH_PUSH_REAUTH_MS = 45000;     // refresh BEFORE the 60s expiry lapses
+  const PH_PUSH_PING_MS = 5000;        // engine PRIV_WS_PING_S
+  const PH_PUSH_STALL_MS = 30000;      // 6 unanswered pings = dead socket
+  const PH_PUSH_LANE_MIN_GAP_MS = 3000;
+  const PH_PUSH_SEEN_CAP = 600;
+  const phPushSessions = {};
+  const phPushPend = {};
+  let phPushTimer = null;
+  function phPushFlush() {
+    phPushTimer = null;
+    const evs = krPushDrain(phPushPend, (key) => {
+      const sess = phPushSessions[key.slice(0, key.indexOf('|'))];
+      if (!sess) return 0;
+      return key.slice(key.indexOf('|') + 1) === 'spot' ? sess.sp.lseq : sess.fu.lseq;
+    }, Date.now(), 'phemex');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      // a mutation observed on the push beat invalidates the acct-read memo
+      // (Binance flush pattern) so the push-kicked read never serves stale.
+      try { execAcctRead.bust('phemex', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('phemex'); } catch (e) { /* #2131 hot lane */ }
+      tdiag('acct', 'ph_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+  }
+  function phPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(phPushPend, scope._pk, kind, id, row);
+    if (!phPushTimer) {
+      phPushTimer = setTimeout(phPushFlush, KR_PUSH_COALESCE_MS);
+      if (phPushTimer && typeof phPushTimer.unref === 'function') phPushTimer.unref();
+    }
+  }
+  // Out-of-band lane frame (Lighter pattern): liveness, NOT rows. 'up' = the
+  // session is authed+subscribed (or re-snapshotted) and the panel owes itself
+  // one fresh signed read; 'down' = socket lost, poll honestly; 'gone' = the
+  // credentials behind this lane were replaced/wiped.
+  function phPushLane(slot, ev) {
+    if (!pushLedgerCb) return;
+    try {
+      pushLedgerCb([{ venue: 'phemex', slot: String(slot || 'phemex'),
+                      scope: 'fut', seq: 0, ts: Date.now(),
+                      kinds: ['lane'], lane: String(ev) }]);
+    } catch (e) { /* window gone */ }
+    // the panel answers a lane frame with a fresh signed read — that read must
+    // never be served from the acct-read memo it is meant to invalidate.
+    try { execAcctRead.bust('phemex', String(slot || 'phemex')); } catch (e) { /* no memo */ }
+  }
+  function phPushScope(pk) {
+    return { lseq: 0, _pk: pk };
+  }
+  function phPushClose(slot) {
+    const sess = phPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    try { if (sess.ws) sess.ws.terminate(); } catch (e) { /* gone */ }
+    sess.ws = null; sess.up = false;
+    delete phPushSessions[slot];
+    // the rows this lane asserted belong to credentials that are no longer
+    // the ones being traded — tell the panel to drop them (never age out).
+    phPushLane(slot, 'gone');
+  }
+  function phPushCloseAll() {
+    for (const k of Object.keys(phPushSessions)) phPushClose(k);
+  }
+  function phPushEnsure(slot, creds, route) {
+    if (!WSC || !creds || !creds.key) return null;
+    slot = String(slot || 'phemex');
+    let sess = phPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { phPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = phPushSessions[slot] = {
+        tail: creds.key, closed: false, route: route, creds: creds,
+        running: false, up: false, ws: null, err: null, lastMsg: 0,
+        reauthOff: false, laneT: 0,
+        seen: {}, seenQ: [],
+        fu: phPushScope(slot + '|fut'),
+        sp: phPushScope(slot + '|spot'),
+      };
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    if (!sess.running) phPushLoop(slot, sess);
+    return sess;
+  }
+  // Bounded exec-id dedup. Phemex re-sends an order row on every state change,
+  // so the SAME execution can ride two frames; a self-match ships both legs
+  // under one execID with opposite sides (phemex-api-quirks) — key on both.
+  function phSeenFill(sess, eid) {
+    if (!eid) return true;
+    if (sess.seen[eid]) return true;
+    sess.seen[eid] = 1;
+    sess.seenQ.push(eid);
+    if (sess.seenQ.length > PH_PUSH_SEEN_CAP) {
+      for (const d of sess.seenQ.splice(0, sess.seenQ.length - PH_PUSH_SEEN_CAP)) delete sess.seen[d];
+    }
+    return false;
+  }
+  function phPushLoop(slot, sess) {
+    sess.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (phPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          await phPushConn(slot, sess);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          sess.err = 'Phemex push: ' + ((e && e.message) || 'error');
+          tdiag('acct', 'ph_push_err', { m: String(sess.err).slice(0, 120) });
+        }
+        // A dropped socket is a GAP: everything that changed while it was
+        // down went unobserved, so the panel must stop trusting push-only
+        // operation until a signed read proves the state.
+        if (sess.up) phPushLane(slot, 'down');
+        sess.up = false; sess.ws = null;
+        if (sess.closed || phPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      sess.running = false;
+    })().catch(() => { sess.running = false; });
+  }
+  function phPushConn(slot, sess) {
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(PH_PUSH_WS_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      sess.ws = ws;
+      let settled = false, authT = null;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        if (authT) clearInterval(authT);
+        sess.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      const sendAuth = (id) => {
+        const expiry = Math.floor(Date.now() / 1000) + PH_PUSH_AUTH_EXPIRY_S;
+        ws.send(JSON.stringify(
+          phWsAuthFrame(sess.creds.key, sess.creds.secret, expiry, id)));
+      };
+      const kaT = setInterval(() => {
+        try { ws.send('{"id":9,"method":"server.ping","params":[]}'); } catch (e) { /* dying */ }
+        if (Date.now() - (sess.lastMsg || 0) > PH_PUSH_STALL_MS) done(new Error('stream stalled'));
+      }, PH_PUSH_PING_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      ws.on('open', () => {
+        sess.lastMsg = Date.now();
+        try { sendAuth(1); } catch (e) { done(e); return; }
+      });
+      ws.on('ping', () => { sess.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        sess.lastMsg = Date.now();
+        let msg = null;
+        try { msg = JSON.parse(buf.toString()); } catch (e) { return; }
+        const id = msg && msg.id;
+        if (id === 1) {
+          if (msg.error) { done(new Error('auth rejected: ' + JSON.stringify(msg.error).slice(0, 120))); return; }
+          try {
+            for (const f of phWsSubFrames()) ws.send(JSON.stringify(f));
+          } catch (e) { done(e); return; }
+          sess.up = true; sess.err = null; sess.laneT = Date.now();
+          tdiag('acct', 'ph_push_up', { s: slot });
+          // The private channels DO snapshot on subscribe, but this lane never
+          // applies a snapshot as rows — the panel owes itself a signed read.
+          phPushLane(slot, 'up');
+          if (!sess.reauthOff) {
+            authT = setInterval(() => {
+              try { sendAuth(4); } catch (e) { /* dying — kaT tears down */ }
+            }, PH_PUSH_REAUTH_MS);
+            if (authT && typeof authT.unref === 'function') authT.unref();
+          }
+          return;
+        }
+        if (id === 4) {
+          // Refresh rejected: redial ONCE for a clean full auth, and stop
+          // refreshing on later conns (fail-visible, never a redial loop).
+          if (msg.error) {
+            sess.reauthOff = true;
+            tdiag('acct', 'ph_push_reauth_err', { m: JSON.stringify(msg.error).slice(0, 90) });
+            done(new Error('re-auth rejected'));
+          }
+          return;
+        }
+        if (id === 2 || id === 3) {
+          if (msg.error) { done(new Error('subscribe rejected: ' + JSON.stringify(msg.error).slice(0, 120))); return; }
+          return;
+        }
+        if (id === 9 || msg.result === 'pong') return;
+        try { phPushEvApply(slot, sess, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  function phPushEvApply(slot, sess, msg) {
+    if (!msg || typeof msg !== 'object') return;
+    const aop = ('accounts_p' in msg) || ('positions_p' in msg) || ('orders_p' in msg);
+    const wo = ('wallets' in msg) || ('orders' in msg);
+    if (!aop && !wo) return;
+    if (String(msg.type || '') === 'snapshot') {
+      // Full-truth frame: removals ride ABSENCE, which an upsert lane cannot
+      // express. Ask the panel for a signed read instead of inventing rows.
+      const now = Date.now();
+      if (now - (sess.laneT || 0) >= PH_PUSH_LANE_MIN_GAP_MS) {
+        sess.laneT = now;
+        phPushLane(slot, 'up');
+      }
+      return;
+    }
+    const PF = sess.fu, PS = sess.sp;
+    if (aop) {
+      for (const a of (msg.accounts_p || [])) {
+        if (a && typeof a === 'object') { krLseq(PF); phPushSc(PF, 'bal', null, a); }
+      }
+      for (const p of (msg.positions_p || [])) {
+        if (p && typeof p === 'object' && p.symbol) {
+          krLseq(PF); phPushSc(PF, 'pos', null, p);
+          phSymHint(slot, 'futures', p.symbol);   // #2385 live-poll symbol bound
+        }
+      }
+      for (const o of (msg.orders_p || [])) {
+        if (!o || typeof o !== 'object') continue;
+        const oid = o.orderID != null ? String(o.orderID) : '';
+        if (!oid) continue;
+        phSymHint(slot, 'futures', o.symbol);   // #2385 live-poll symbol bound
+        if (phOrdOpen(o.ordStatus)) {
+          // RAW aop_p row rides the push — the panel's pure twin shapes it
+          // (WS rows use orderQty/cumQty where REST uses the Rq names).
+          krLseq(PF); phPushSc(PF, 'order', null, o);
+        } else {
+          krLseq(PF); phPushSc(PF, 'ordgone', oid);
+        }
+        const ex = String(o.execStatus || '');
+        if (ex === 'TakerFill' || ex === 'MakerFill') {
+          const eid = String(o.execID || o.execId || '') + '|' + String(o.side || '');
+          if (phSeenFill(sess, eid)) continue;
+          // #2385 the RAW execution row now rides the device-local fill ring
+          // too (the ring de-dupes on its own side-inclusive key, so a slot
+          // without a ring — i.e. no local blotter — allocates nothing).
+          const Rf = phFillRings[String(slot)];
+          if (Rf) phFillPush(Rf.fu, [o], o.symbol);
+          // kind-only: a fill moves the position row and retires a badge.
+          krLseq(PF); phPushSc(PF, 'fill', null, null);
+        }
+      }
+    }
+    if (wo) {
+      for (const w of (msg.wallets || [])) {
+        if (w && typeof w === 'object' && w.currency) { krLseq(PS); phPushSc(PS, 'bal', null, w); }
+      }
+      const ords = (msg.orders && typeof msg.orders === 'object' && !Array.isArray(msg.orders))
+        ? msg.orders : {};
+      for (const o of (ords.open || [])) {
+        if (!o || typeof o !== 'object') continue;
+        const oid = o.orderID != null ? String(o.orderID) : '';
+        if (!oid) continue;
+        const st = String(o.ordStatus || '');
+        phSymHint(slot, 'spot', o.symbol);   // #2385 live-poll symbol bound
+        // engine wo_apply parity: an EMPTY status on the open list stays open.
+        if (st && !phOrdOpen(st)) { krLseq(PS); phPushSc(PS, 'ordgone', oid); continue; }
+        krLseq(PS); phPushSc(PS, 'order', null, o);
+      }
+      for (const o of (ords.closed || [])) {
+        const oid = o && o.orderID != null ? String(o.orderID) : '';
+        if (oid) { krLseq(PS); phPushSc(PS, 'ordgone', oid); }
+      }
+      for (const f of (ords.fills || [])) {
+        if (!f || typeof f !== 'object') continue;
+        const eid = String(f.execID || f.execId || '') + '|' + String(f.side || '');
+        if (phSeenFill(sess, eid)) continue;
+        // #2385 the RAW spot fill row rides the device-local ring too.
+        const Rs = phFillRings[String(slot)];
+        if (Rs) { phFillPush(Rs.sp, [f], f.symbol); phSymHint(slot, 'spot', f.symbol); }
+        krLseq(PS); phPushSc(PS, 'fill', null, null);
+      }
+    }
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Bybit/Gate
+  // pattern): the WS echo lands ~100ms later, but the local bump makes the
+  // badge/posrow read fire immediately after the REST ack.
+  function phMutKick(slot, kind, oid, market) {
+    const sess = phPushSessions[String(slot || 'phemex')];
+    if (!sess) return;
+    const PS = market === 'spot' ? sess.sp : sess.fu;
+    if (kind === 'ordgone' && oid) {
+      krLseq(PS); phPushSc(PS, 'ordgone', String(oid));
+    } else {
+      krLseq(PS); phPushSc(PS, 'order');
+    }
+  }
+
   // Phemex native account read (#1713): signed GETs mirroring the engine's
   // REST builders — futures account+positions (accountPositions), open orders
   // BOTH markets (g-orders/activeList incl. its code-30000 per-symbol
@@ -14037,6 +14624,22 @@ function createTradeNative(opts) {
     const creds = credsGet(intent.credSlot || 'phemex');
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     const route = routeNorm(intent.route);
+    // #2384: acct reads keep the private push socket warm (push-driven
+    // display) — no-op while the loop already runs.
+    try { phPushEnsure(intent.credSlot || 'phemex', creds, route); } catch (e) { /* REST path */ }
+    // #2385 pump the LIVE fill lane on the account beat. The account read is
+    // the one beat that ALWAYS runs, so it is the honest place to drive the
+    // device-local fill poll: without it a normal trading session (trades
+    // panel closed, no backfill in flight) would record nothing but the push
+    // rows and lose every fill the socket missed. Gated on intent.lblot (the
+    // panel sends it only while the local blotter is ACTIVE for Phemex),
+    // started in PARALLEL with the account legs and awaited just before the
+    // reply: a slot that never uses the local blotter pays exactly zero extra
+    // REST calls, and one that does pays no extra wall-clock. lbPhLive keeps
+    // its own single-flight + TTL, so N windows on one slot cost ONE pass.
+    const lbPump = intent.lblot
+      ? lbPhLive('phemex', intent.credSlot || 'phemex', route).catch(() => {})
+      : null;
     // #2281 read DEADLINE. This read is four-plus SEQUENTIAL signed legs, so at
     // the generic 12 s transport timeout one hung leg could hold Phemex's share
     // of the shared pool for most of a minute (observed max 16,828 ms). Every
@@ -14158,12 +14761,18 @@ function createTradeNative(opts) {
         for (const s in (pr.spot || {})) spotBaseScales[s] = pr.spot[s].value_scale;
       }
     } catch (e) { /* scales default to 8 renderer-side — majors byte-identical */ }
+    // #2385 additive: recent LOCAL fills for this credential slot (empty
+    // unless the local blotter lane has warmed the rings for this slot). The
+    // panel only reads it while the local blotter is ACTIVE for Phemex —
+    // capability alone must never suppress the server fills.
+    if (lbPump) await lbPump;   // fills polled alongside the acct legs
     const out = { ok: true,
              acct: acct.data || {},
              futOrders: futRows,
              spotOrders: spotRows,
              wallets: wallets,
              curScales: curScales, spotBaseScales: spotBaseScales };
+    if (lbPump) out.lbFills = phLiveFills(intent.credSlot || 'phemex');
     // additive — absent on clean reads so legacy payloads stay byte-identical
     if (partialErrors.length) out.partialErrors = partialErrors;
     return out;
@@ -14214,6 +14823,271 @@ function createTradeNative(opts) {
       }
       return { ok: true, futures: futures, spot: spot };
     } finally { _phFillsBusy = false; }
+  }
+
+  // ── #2385 Phemex device-local blotter live lane ──────────────────────────
+  // TWO sources feed ONE pair of per-slot raw rings (the Bitget/KuCoin shape):
+  //   (a) the private push lane's execution rows (instant — see phPushEvApply)
+  //   (b) a paced signed /api-data trades poll, so a session whose socket was
+  //       down still records its fills.
+  // lbDrain consumes the rings through the normal incremental cursor /
+  // exactly-once merge / journal / prune path — nothing downstream needs a
+  // Phemex special case. The poll is single-flight + TTL-gated and is driven
+  // ONLY by the lblot ops and by an acct read that explicitly asked for it, so
+  // a slot that never uses the local blotter pays zero extra REST traffic.
+  const PH_FILL_RING_CAP = 600;
+  const PH_LIVE_TTL_MS = 1200;                 // ≥1 fetch per panel lblot beat
+  const PH_LIVE_OVERLAP_MS = 90000;            // per-SYMBOL re-ask window
+  const PH_LIVE_COLD_MS = 15 * 60 * 1000;      // first poll of a session
+  const PH_LIVE_SYM_CAP = 8;                   // signed calls per market per pass
+  const PH_LIVE_LIMIT = 200;                   // venue page max on these feeds
+  const PH_PAGE_GAP_MS = 250;                  // HIST_CALL_SPACING_S twin
+  const PH_MAX_SPAN_MS = 26 * 3600 * 1000;     // the fills feed's own window cap
+  const phFillRings = {};   // slot → { sp, fu, cur, hint, t, busy }
+  function phFillRing(slot) {
+    let R = phFillRings[String(slot)];
+    if (!R) {
+      R = phFillRings[String(slot)] = {
+        sp: { rows: [], seen: {}, rev: 0 }, fu: { rows: [], seen: {}, rev: 0 },
+        // PER-SYMBOL cursors (never one global mark): the feed is symbol-scoped,
+        // so a busy symbol's high-water mark would truncate a quiet symbol's
+        // re-ask window and its fills would never be asked for again.
+        cur: { spot: {}, futures: {} },
+        hint: { spot: {}, futures: {} },
+        t: 0, busy: null, route: null,
+      };
+    }
+    return R;
+  }
+  // Ring key is side-INCLUSIVE: a Phemex self-match returns TWO rows sharing
+  // one execID (opposite sides) and a side-less key silently drops a leg,
+  // leaving the trade stuck open (lbFillKey carries the same rule).
+  function phRingKey(f) {
+    const eid = String((f && (f.execID || f.execId)) || '');
+    return eid ? eid + '|' + String((f && f.side) || '').toLowerCase() : '';
+  }
+  // Push raw rows into one ring, stamping the symbol the page was asked for
+  // (the /api-data rows are symbol-scoped and some omit the field). Copies
+  // rather than mutating: a push-lane row is also handed to the renderer.
+  function phFillPush(F, rows, sym) {
+    let n = 0;
+    for (const f of (rows || [])) {
+      if (!f || typeof f !== 'object') continue;
+      const k = phRingKey(f);
+      if (!k || F.seen[k]) continue;
+      F.seen[k] = 1;
+      const s = String(sym || f.symbol || '');
+      F.rows.push(f._sym === s ? f : Object.assign({}, f, { _sym: s }));
+      lbSrcTouch(F);   // #2230 one touch per pushed row (drain cursor)
+      n++;
+    }
+    if (F.rows.length > PH_FILL_RING_CAP) {
+      const drop = F.rows.splice(0, F.rows.length - PH_FILL_RING_CAP);
+      for (const f of drop) { const k = phRingKey(f); if (k) delete F.seen[k]; }
+    }
+    return n;
+  }
+  // Symbols the push lane has just seen trading (positions/orders/fills) — the
+  // live poll's "what is this account touching right now" hint.
+  function phSymHint(slot, market, sym) {
+    const s = String(sym || '');
+    if (!s) return;
+    const R = phFillRings[String(slot)];
+    if (!R) return;   // no ring yet ⇒ the local blotter is not in play
+    R.hint[market === 'spot' ? 'spot' : 'futures'][s] = Date.now();
+  }
+  // BOUNDED symbol set for one market: locally recorded symbols (newest first)
+  // + everything the push lane has seen this session. This is a BOUND, not a
+  // proof of completeness — the backfill is the surface that must report that
+  // honestly (see the execLblotBackfill phemex arm).
+  function phLiveSyms(slot, R, market) {
+    const at = {};
+    const sc = lbScope(slot);
+    for (const f of ((sc && sc.rows) || [])) {
+      if (!f || f.venue !== 'phemex' || f.market !== market || !f.symbol) continue;
+      const t = Number(f.ts) || 0;
+      if (t > (at[f.symbol] || 0)) at[f.symbol] = t;
+    }
+    const hint = R.hint[market] || {};
+    for (const s in hint) if (hint[s] > (at[s] || 0)) at[s] = hint[s];
+    return Object.keys(at)
+      .filter((s) => s.length <= 32 && /^[A-Za-z0-9]+$/.test(s))
+      .sort((a, b) => (at[b] || 0) - (at[a] || 0))
+      .slice(0, PH_LIVE_SYM_CAP);
+  }
+  // ONE signed page of own-trades for ONE symbol. `full:true` = the page came
+  // back at the venue cap, so its depth cannot be proven from here — the
+  // caller decides whether that is a coverage note or a hard failure. The
+  // feeds are offset-paged (engine _hist_pages), so a caller that wants depth
+  // passes `offset`. Never throws.
+  async function phFillsPage(creds, market, symbol, frm, to, route, limit, offset) {
+    const lim = limit > 0 ? Math.min(limit, PH_LIVE_LIMIT) : PH_LIVE_LIMIT;
+    const path = market === 'spot' ? '/api-data/spots/trades'
+                                   : '/api-data/g-futures/trades';
+    let r;
+    try {
+      r = await signedRequest(creds, {
+        method: 'GET', path: path,
+        query: 'symbol=' + encodeURIComponent(symbol)
+             + '&start=' + Math.floor(frm) + '&end=' + Math.ceil(to)
+             + '&offset=' + Math.max(0, Math.floor(offset || 0))
+             + '&limit=' + lim,
+        body: null }, route);
+    } catch (e) {
+      r = { ok: false, message: (e && e.message) || 'Phemex fills fetch failed' };
+    }
+    if (!r || !r.ok) {
+      return { ok: false, rows: [], full: false,
+               message: (r && r.message) || ('Phemex ' + market + ' fills fetch failed') };
+    }
+    const d = r.data;
+    const lst = (d && d.rows) || (Array.isArray(d) ? d : []);
+    const rows = Array.isArray(lst) ? lst.filter((x) => x && typeof x === 'object') : [];
+    return { ok: true, rows: rows, full: rows.length >= lim };
+  }
+  // OFFSET walk over one symbol's own-trades feed (engine _hist_pages twin).
+  // `full:true` = the page budget ran out with a full page still pending, so
+  // the depth of this symbol's history could not be PROVEN — the caller turns
+  // that into covOk:false (backfill) or a hard failure (re-import). Never
+  // throws; a failed page returns what it has plus the message.
+  async function phFillsWalk(creds, market, symbol, frm, to, route, maxPages, gapMs) {
+    const rows = [];
+    let pages = 0;
+    const cap = maxPages > 0 ? maxPages : 1;
+    for (let page = 0; page < cap; page++) {
+      if (page && gapMs > 0) await new Promise((rs) => setTimeout(rs, gapMs));
+      const pg = await phFillsPage(creds, market, symbol, frm, to, route,
+                                   PH_LIVE_LIMIT, page * PH_LIVE_LIMIT);
+      pages++;
+      if (!pg.ok) {
+        return { ok: false, rows: rows, full: false, pages: pages, message: pg.message };
+      }
+      for (const f of pg.rows) rows.push(f);
+      if (!pg.full) return { ok: true, rows: rows, full: false, pages: pages };
+    }
+    return { ok: true, rows: rows, full: true, pages: pages };   // budget hit
+  }
+  // Symbols this account traded in the window, from the account-wide ORDER
+  // history feeds (no symbol param) — engine discover_symbols twin. This is
+  // the only way to learn about a symbol the local store has never seen, and
+  // a failure here is exactly the "unresolved symbol universe" case that must
+  // report coverage as UNKNOWN rather than activate on a short list.
+  const PH_SYM_MAX = 80;   // engine HIST_MAX_SYMBOLS twin
+  async function phHistSymbols(creds, market, frm, to, route, maxPages, gapMs) {
+    const path = market === 'spot' ? '/api-data/spots/orders'
+                                   : '/api-data/g-futures/orders/by-page';
+    const base = market === 'spot' ? '' : 'currency=USDT&';
+    const seen = {};
+    const out = [];
+    let pages = 0;
+    const cap = maxPages > 0 ? maxPages : 1;
+    for (let page = 0; page < cap; page++) {
+      if (page && gapMs > 0) await new Promise((rs) => setTimeout(rs, gapMs));
+      let r;
+      try {
+        r = await signedRequest(creds, {
+          method: 'GET', path: path,
+          query: base + 'start=' + Math.floor(frm) + '&end=' + Math.ceil(to)
+               + '&offset=' + (page * PH_LIVE_LIMIT) + '&limit=' + PH_LIVE_LIMIT,
+          body: null }, route);
+      } catch (e) {
+        r = { ok: false, message: (e && e.message) || 'Phemex order history fetch failed' };
+      }
+      pages++;
+      if (!r || !r.ok) {
+        return { ok: false, syms: out, full: false, pages: pages,
+                 message: (r && r.message) || ('Phemex ' + market + ' order history fetch failed') };
+      }
+      const d = r.data;
+      const lst = (d && d.rows) || (Array.isArray(d) ? d : []);
+      const prows = Array.isArray(lst) ? lst : [];
+      for (const o of prows) {
+        const s = String((o && o.symbol) || '');
+        if (!s || seen[s]) continue;
+        seen[s] = 1;
+        out.push(s);
+        if (out.length >= PH_SYM_MAX) {
+          return { ok: true, syms: out, full: true, pages: pages };
+        }
+      }
+      if (prows.length < PH_LIVE_LIMIT) {
+        return { ok: true, syms: out, full: false, pages: pages };
+      }
+    }
+    return { ok: true, syms: out, full: true, pages: pages };   // budget hit
+  }
+  // Paced live refresh for ONE Phemex slot. Single-flight + TTL-gated (N
+  // windows polling the same slot in one beat cost ONE pass). Best-effort by
+  // design: a failed leg means no new rows this beat — the next beat and the
+  // gap backfill recover.
+  async function lbPhLive(venue, slot, route) {
+    if (venue !== 'phemex') return;
+    const R = phFillRing(slot);
+    if (R.busy) { try { await R.busy; } catch (e) {} return; }
+    const now = Date.now();
+    if ((now - (R.t || 0)) < PH_LIVE_TTL_MS) return;
+    const creds = credsGet(slot);
+    if (!creds) return;
+    R.t = now;
+    R.route = routeNorm(route);
+    const p = (async () => {
+      let calls = 0;
+      for (const mk of ['futures', 'spot']) {
+        const F = mk === 'spot' ? R.sp : R.fu;
+        const cur = R.cur[mk];
+        for (const sym of phLiveSyms(slot, R, mk)) {
+          let frm = cur[sym] > 0 ? Math.max(0, cur[sym] - PH_LIVE_OVERLAP_MS)
+                                 : now - PH_LIVE_COLD_MS;
+          // The feed refuses a span wider than its own window cap, so ONE bad
+          // cursor would make every later poll of that symbol fail silently.
+          frm = Math.min(Math.max(frm, now - PH_MAX_SPAN_MS), now);
+          if (calls) await new Promise((rs) => setTimeout(rs, PH_PAGE_GAP_MS));
+          calls++;
+          const pg = await phFillsPage(creds, mk, sym, frm, now + 1000,
+                                       R.route, PH_LIVE_LIMIT, 0);
+          if (!pg.ok) continue;              // best-effort — next beat retries
+          phFillPush(F, pg.rows, sym);
+          let hwm = cur[sym] || 0;
+          for (const f of pg.rows) { const t = lbPhTsMs(f); if (t > hwm) hwm = t; }
+          cur[sym] = hwm > 0 ? hwm : Math.max(cur[sym] || 0, now - PH_LIVE_OVERLAP_MS);
+        }
+      }
+    })();
+    R.busy = p;
+    try { await p; } catch (e) { /* best-effort */ }
+    if (R.busy === p) R.busy = null;
+  }
+  // Spot spec for the drain's normalizer, read from the TTL-cached products
+  // catalog. A cold catalog skips the row THIS drain and fires a best-effort
+  // warm (the gate/HL/KuCoin recipe: the raw row stays ringed and the retry
+  // sweep re-normalizes it once the scales landed). Descaling a PEPE quantity
+  // at the default 8 instead of its own valueScale of 2 would replay a
+  // 1,000,000× position, so guessing is not an option.
+  function phSpotSpecSync(sym, route) {
+    const sp = (products.spot || {})[String(sym || '')];
+    if (sp) return sp;
+    if (!products.spot) phemexProducts(routeNorm(route)).catch(() => { /* warm */ });
+    return null;
+  }
+  // Recent normalized live rows for the panel's fill chime / fee store (the
+  // chart triangles read the local STORE). Read-only view of the rings — costs
+  // no REST call, so the account read stays exactly as expensive as before for
+  // slots that never touch the local blotter.
+  const PH_LIVE_SHARE_N = 200;
+  function phLiveFills(slot) {
+    const R = phFillRings[String(slot)];
+    if (!R) return [];
+    const out = [];
+    for (const f of R.fu.rows) {
+      const n = lbNormPhemexFut(f, f._sym); if (n) out.push(n);
+    }
+    for (const f of R.sp.rows) {
+      const sp = (products.spot || {})[String(f._sym || '')] || null;
+      const n = lbNormPhemexSpot(f, f._sym, sp, products.curScales);
+      if (n) out.push(n);
+    }
+    out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    return out.length > PH_LIVE_SHARE_N ? out.slice(out.length - PH_LIVE_SHARE_N) : out;
   }
 
   // OKX native account read (#1716): signed GETs mirroring OkxAdapter's REST
@@ -16110,7 +16984,10 @@ function createTradeNative(opts) {
   // the shared keep-alive agent cache inside httpJson). STRICT allowlist —
   // /public/products and the two public kline endpoints only, never an open
   // proxy. No creds involved.
-  const PHEMEX_KLINE_TFS = [60, 300, 900, 1800, 3600];
+  // NATIVE resolutions only, in lockstep with main.py DOM_KLINE_TFS (#2386
+  // added 14400/86400). 600 is deliberately absent — Phemex serves no 10m, so
+  // the panel folds 2×5m and never asks this bridge for it.
+  const PHEMEX_KLINE_TFS = [60, 300, 900, 1800, 3600, 14400, 86400];
   // Generic PUBLIC catalog/kline raw-GET bridge (#1716): the RELAY-ONLY /
   // CORS-closed venues (KuCoin, Gate, BitMEX, Kraken, MEXC, Arcus) whose
   // catalogs+klines the browser can only reach via the server relay. On the
@@ -16855,6 +17732,14 @@ function createTradeNative(opts) {
       const s = kcFillRings[slot];
       return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
     }
+    if (venue === 'phemex') {
+      // #2385: the SAME two per-market rings carry the paced REST fills poll
+      // and the private-WS execution rows (one side-inclusive execID|side
+      // seen-set), so the no-news gate and the incremental cursor work exactly
+      // as they do for the push venues. BARE RINGS — see the shape warning.
+      const s = phFillRings[slot];
+      return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
+    }
     return '-';
   }
   const _lbDrainAt = {};    // slot → { t, sig } (#2230 no-news gate)
@@ -16997,6 +17882,27 @@ function createTradeNative(opts) {
           return lbNormKucoinFill(r, 'futures', mult);
         });
       }
+    } else if (venue === 'phemex') {
+      // #2385: two per-market rings fed by BOTH the paced REST fills poll
+      // (lbPhLive) and the private-WS execution rows. Rows are RAW venue rows
+      // stamped with the symbol the page/frame carried — the market comes
+      // from the RING, never from the row, because a Phemex spot and futures
+      // trade row are shape-similar. Spot rows are e-scaled and the BASE
+      // quantity's scale is the base currency's own valueScale: a cold
+      // products catalog skips the row THIS drain and fires a best-effort
+      // warm (gate/HL/KuCoin recipe — the raw row stays ringed and the retry
+      // sweep re-normalizes it once the scales landed). Descaling PEPE at the
+      // default 8 instead of its own 2 would replay a 1,000,000× position.
+      const R = phFillRings[slot];
+      if (R) {
+        ring('ph.fu', R.fu, (r) => lbNormPhemexFut(r, r && r._sym));
+        ring('ph.sp', R.sp, (r) => {
+          const sym = String((r && (r._sym || r.symbol)) || '');
+          const sp = phSpotSpecSync(sym, R.route);
+          if (!sp) return null;
+          return lbNormPhemexSpot(r, sym, sp, products.curScales);
+        });
+      }
     } else if (venue === 'lighter') {
       // #2327: ONE account-wide raw ring on the private WS push session
       // (account_all `trades` — Lighter is perp-only, no spot leg). Rows are
@@ -17062,7 +17968,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex' || venue === 'lighter'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex' || venue === 'lighter' || venue === 'phemex'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -17077,6 +17983,7 @@ function createTradeNative(opts) {
     await lbHlWarm(venue, intent.route);
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
+    await lbPhLive(venue, slot, intent.route);   // #2385 Phemex REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const t0 = lbT();
@@ -17240,6 +18147,7 @@ function createTradeNative(opts) {
     await lbHlWarm(venue, intent.route);
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
+    await lbPhLive(venue, slot, intent.route);   // #2385 Phemex REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     if (venue === 'lighter') ltLblotRedialClear(slot, sc);   // #2327
@@ -17880,6 +18788,129 @@ function createTradeNative(opts) {
         _dgSpotRows = rawSpot.length;
         _dgFetched = fills.length;
         added = lbScopeMerge(sc, fills);
+      } else if (venue === 'phemex') {
+        // #2385: Phemex serves own-trades PER SYMBOL, so there is no
+        // account-wide walk that can prove completeness on its own. Coverage
+        // is assembled from three bounded sources and every one of them
+        // reports honestly when it cannot prove what it returned:
+        //   • the account-wide ORDER-history feed (engine discover_symbols
+        //     twin) — the only way to learn about a symbol the local store
+        //     has never seen. A failed or capped discovery is an UNRESOLVED
+        //     symbol universe ⇒ covOk:false.
+        //   • locally recorded symbols and the live ring's session hints.
+        //   • one offset walk per symbol per ≤7-day chunk (the engine's
+        //     proven HIST_WINDOW span). A walk that exhausts its page budget
+        //     with a full page pending ⇒ depth unproven ⇒ covOk:false.
+        // PER-SYMBOL cursors throughout: a symbol's own high-water mark sets
+        // its window. One shared mark would let a symbol traded this morning
+        // truncate the window of one last touched a week ago, and that
+        // symbol's older fills would never be asked for again.
+        const PH_BF_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const PH_BF_CALL_CAP = 60;
+        const PH_BF_SYM_PAGES = 6;
+        const PH_BF_DISC_PAGES = 4;
+        let calls = 0;
+        let failMsg = null;
+        const rawFut = [], rawSpot = [];   // [symbol, rawRow] pairs
+        // per-SYMBOL high-water marks out of the local store
+        const symHwm = { spot: {}, futures: {} };
+        for (const f of sc.rows) {
+          if (!f || f.venue !== 'phemex' || !f.symbol) continue;
+          const m = f.market === 'spot' ? 'spot' : 'futures';
+          const t = Number(f.ts) || 0;
+          if (t > (symHwm[m][f.symbol] || 0)) symHwm[m][f.symbol] = t;
+        }
+        const Rh = phFillRings[slot];
+        for (const mk of ['futures', 'spot']) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          const mFrm = Math.max(0, Math.floor(bfFrm(mk, mk)));
+          const symSet = {};
+          for (const s in symHwm[mk]) symSet[s] = 1;
+          if (Rh) for (const s in Rh.hint[mk]) symSet[s] = 1;
+          const dsc = await phHistSymbols(creds, mk, mFrm, now + 1000, route,
+            Math.min(PH_BF_DISC_PAGES, Math.max(1, PH_BF_CALL_CAP - calls)), HB_PAGE_GAP_MS);
+          calls += dsc.pages | 0;
+          if (!dsc.ok) {
+            gap = true; covOk = false;
+            notes.push(mk + ' symbol universe unresolved ('
+                       + (dsc.message || 'order history read failed')
+                       + ') — history is incomplete');
+          } else {
+            for (const s of dsc.syms) symSet[s] = 1;
+            if (dsc.full) {
+              gap = true; covOk = false;
+              notes.push(mk + ' order history exceeded the symbol discovery cap — history is incomplete');
+            }
+          }
+          const syms = Object.keys(symSet)
+            .filter((s) => /^[A-Za-z0-9]{1,32}$/.test(s)).sort();
+          for (const sym of syms) {
+            let w0 = symHwm[mk][sym] > 0
+              ? Math.max(0, symHwm[mk][sym] - LB_BF_OVERLAP_MS) : mFrm;
+            if (w0 < now - HB_MAX_SPAN_MS) w0 = now - HB_MAX_SPAN_MS + 60000;
+            let capped = false;
+            while (w0 < now) {
+              const left = PH_BF_CALL_CAP - calls;
+              if (left <= 0) {
+                gap = true; covOk = false; capped = true;
+                notes.push(mk + ' fill call cap reached — history is incomplete');
+                break;
+              }
+              const w1 = Math.min(now, w0 + PH_BF_SPAN_MS);
+              if (calls) await new Promise((rs) => setTimeout(rs, HB_PAGE_GAP_MS));
+              const wk = await phFillsWalk(creds, mk, sym, w0, w1 + 1, route,
+                                           Math.min(PH_BF_SYM_PAGES, left), HB_PAGE_GAP_MS);
+              calls += wk.pages | 0;
+              if (!wk.ok) {
+                failMsg = wk.message || ('Phemex ' + mk + ' fills fetch failed');
+                break;
+              }
+              for (const f of wk.rows) sink.push([sym, f]);
+              if (wk.full) {
+                gap = true; covOk = false;
+                notes.push(sym + ' ' + mk + ' fills deeper than the page budget — history is incomplete');
+              }
+              w0 = w1 + 1;
+            }
+            if (failMsg || capped) break;
+          }
+          if (failMsg) break;
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        // Spot rows are e-scaled and the BASE quantity's scale is the base
+        // currency's OWN valueScale — a missing product spec is a coverage
+        // HOLE, not a row to guess at (descaling PEPE at the default 8
+        // instead of its 2 would store a 1,000,000× quantity).
+        let phProd = null;
+        if (rawSpot.length) {
+          try { phProd = await phemexProducts(route); } catch (e) { phProd = null; }
+        }
+        const fills = [];
+        // Market comes from the FEED the row was fetched from, never the row.
+        for (const pr of rawFut) { const n = lbNormPhemexFut(pr[1], pr[0]); if (n) fills.push(n); }
+        const phMiss = {};
+        for (const pr of rawSpot) {
+          const sp = phProd && phProd.spot ? phProd.spot[pr[0]] : null;
+          if (!sp) { phMiss[pr[0]] = 1; continue; }
+          const n = lbNormPhemexSpot(pr[1], pr[0], sp, phProd.curScales);
+          if (n) fills.push(n);
+        }
+        const missN = Object.keys(phMiss);
+        if (missN.length) {
+          gap = true; covOk = false;
+          notes.push('spot product scales unavailable for ' + missN.slice(0, 4).join(', ')
+                     + (missN.length > 4 ? ' +' + (missN.length - 4) + ' more' : '')
+                     + ' — their fills could not be sized');
+        }
+        _dgFutRows = rawFut.length;
+        _dgSpotRows = rawSpot.length;
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else if (venue === 'asterdex') {
         // #2306 AsterDex is Binance-family over the wire — SAME window walk,
         // SAME exec-id space — but every signed call is EIP-712 through
@@ -18330,6 +19361,69 @@ function createTradeNative(opts) {
           }
         }
         for (const f of rawSpot) { const n = lbNormKucoinFill(f, 'spot', null); if (n) fills.push(n); }
+      } else if (venue === 'phemex') {
+        // #2385: the backfill's per-symbol walks over the EXPLICIT window.
+        // Venue-truth contract — a truncation of ANY kind fails VISIBLY
+        // (riFail), never a short history reported as complete venue truth.
+        // That includes the symbol universe: a re-import that silently missed
+        // a symbol would leave the tombstones it was meant to clear in place.
+        const PH_RI_SPAN_MS = 7 * 86400 * 1000 - 60000;
+        const PH_RI_CALL_CAP = 120;
+        const PH_RI_SYM_PAGES = 10;
+        const PH_RI_DISC_PAGES = 8;
+        let calls = 0;
+        const rawFut = [], rawSpot = [];   // [symbol, rawRow] pairs
+        const mks = market === 'spot' ? ['spot']
+          : market === 'futures' ? ['futures'] : ['futures', 'spot'];
+        const scRi = lbScope(slot);
+        const Rh = phFillRings[slot];
+        for (const mk of mks) {
+          const sink = mk === 'spot' ? rawSpot : rawFut;
+          const symSet = {};
+          for (const f of scRi.rows) {
+            if (!f || f.venue !== 'phemex' || !f.symbol) continue;
+            if ((f.market === 'spot' ? 'spot' : 'futures') === mk) symSet[f.symbol] = 1;
+          }
+          if (Rh) for (const s in Rh.hint[mk]) symSet[s] = 1;
+          const dsc = await phHistSymbols(creds, mk, w.frm, w.to, route,
+                                          PH_RI_DISC_PAGES, HB_PAGE_GAP_MS);
+          calls += dsc.pages | 0;
+          if (!dsc.ok) return riFail('Phemex ' + mk + ' order history: ' + (dsc.message || 'request failed'));
+          if (dsc.full) return riFail('Window too large — more traded symbols than the discovery cap; narrow the date range');
+          for (const s of dsc.syms) symSet[s] = 1;
+          const syms = Object.keys(symSet)
+            .filter((s) => /^[A-Za-z0-9]{1,32}$/.test(s)).sort();
+          for (const sym of syms) {
+            let w0 = Math.max(0, Math.floor(w.frm));
+            while (w0 < w.to) {
+              const left = PH_RI_CALL_CAP - calls;
+              if (left <= 0) return riFail('Window too large — fill history exceeds the call cap; narrow the date range');
+              const w1 = Math.min(w.to, w0 + PH_RI_SPAN_MS);
+              if (calls) await sleep(HB_PAGE_GAP_MS);
+              const wk = await phFillsWalk(creds, mk, sym, w0, w1 + 1, route,
+                                           Math.min(PH_RI_SYM_PAGES, left), HB_PAGE_GAP_MS);
+              calls += wk.pages | 0;
+              if (!wk.ok) return riFail(wk.message || ('Phemex ' + mk + ' fills fetch failed'));
+              for (const f of wk.rows) sink.push([sym, f]);
+              if (wk.full) return riFail('Phemex ' + sym + ' ' + mk + ' fills exceed the page budget in this window — narrow the date range');
+              w0 = w1 + 1;
+            }
+          }
+        }
+        riFutRows = rawFut.length;
+        riSpotRows = rawSpot.length;
+        for (const pr of rawFut) { const n = lbNormPhemexFut(pr[1], pr[0]); if (n) fills.push(n); }
+        if (rawSpot.length) {
+          let phProd = null;
+          try { phProd = await phemexProducts(route); } catch (e) { phProd = null; }
+          if (!phProd || !phProd.spot) return riFail('Phemex product scales unavailable — spot fills cannot be sized; retry shortly');
+          for (const pr of rawSpot) {
+            const sp = phProd.spot[pr[0]];
+            if (!sp) return riFail('Phemex product spec unavailable for ' + pr[0] + ' — cannot size its fills; retry shortly');
+            const n = lbNormPhemexSpot(pr[1], pr[0], sp, phProd.curScales);
+            if (n) fills.push(n);
+          }
+        }
       } else if (venue === 'asterdex') {
         // #2306 asterdex: the Binance-family time-window walk driven through
         // the EIP-712 signed helper. Without this arm the venue would fall
@@ -18597,6 +19691,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'bitget') return await execBitgetLeverage(intent);   // #2247
       if (intent.venue === 'kucoin') return await execKucoinLeverage(intent);   // #2272
       if (intent.venue === 'asterdex') return await execAsterLeverage(intent);   // #2307
+      if (intent.venue === 'phemex') return await execPhemexLeverage(intent);   // #2384
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -18900,6 +19995,18 @@ function createTradeNative(opts) {
           : await signedRequest(creds, step, route);
         if (!last.ok) return last;   // FAIL LOUD — no partial-success masking
       }
+      // #2384: a successful trade ack kicks the push lane awake (no-op while
+      // the loop runs) and stamps an optimistic mutation so the badge/posrow
+      // read fires immediately after the REST ack. Market-scoped — Phemex
+      // spot and futures order ids come from separate endpoints.
+      const pmk = intent.market === 'spot' ? 'spot' : 'futures';
+      try { phPushEnsure(intent.credSlot || 'phemex', creds, route); }
+      catch (e) { /* REST path */ }
+      try {
+        if (intent.op === 'cancel' && intent.orderID) {
+          phMutKick(intent.credSlot || 'phemex', 'ordgone', String(intent.orderID), pmk);
+        } else phMutKick(intent.credSlot || 'phemex', 'order', null, pmk);
+      } catch (e) { /* diag-only */ }
       if (intent.op === 'order') {
         const oid = last.data && (last.data.orderID || last.data.orderId);
         return { ok: true, orderID: oid || null, clOrdID: intent.clOrdID };
@@ -19446,6 +20553,13 @@ module.exports = {
   PING_RT_MIN_GAP_MS,
   phemexErrorMessage,
   phemexSymbolRequired,
+  // pure — #2384 Phemex private WS + native leverage (engine parity)
+  phWsAuthSig,
+  phWsAuthFrame,
+  phWsSubFrames,
+  phOrdOpen,
+  phLevCap,
+  phLevSigned,
   // shared keep-alive agent cache (used by main.js's native-WS bridge too)
   sharedKeepAliveAgent,
   flushKeepAliveAgents,
@@ -19725,6 +20839,12 @@ module.exports = {
   lbNormAstSpot,
   lbNormLtFills,
   lbNormLtFill,
+  // pure — #2385 Phemex device-local blotter normalizers (engine twins)
+  lbPhTsMs,
+  lbPhScaled,
+  lbPhCurScale,
+  lbNormPhemexFut,
+  lbNormPhemexSpot,
   lbFillKey,
   lbScopeMerge,
   lbHwm,
