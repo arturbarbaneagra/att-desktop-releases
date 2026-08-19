@@ -14849,6 +14849,14 @@ function createTradeNative(opts) {
     // byte-identical.
     const _lbSlot = intent.credSlot || 'phemex';
     if (lbPump || phFillRings[_lbSlot]) out.lbFills = phLiveFills(_lbSlot);
+    // #2415 …and HOW FAR those rows are known complete. lbPhLive is TTL-gated
+    // and single-flighted, so this reply can carry rows it did not refresh —
+    // the ledger's age is the live sweep's OWN start stamp, never this reply's
+    // time and never the account snapshot's (they are separate lanes with
+    // separate ages). The panel ranks a ledger against its own high-water, and
+    // a caller-clock stamp would claim a freshness the rows do not have and
+    // start refusing ledgers that really are newer. 0 ⇒ never swept.
+    if (out.lbFills) out.lbLiveT = (phFillRings[_lbSlot] || {}).okT || 0;
     // additive — absent on clean reads so legacy payloads stay byte-identical
     if (partialErrors.length) out.partialErrors = partialErrors;
     return out;
@@ -14930,7 +14938,14 @@ function createTradeNative(opts) {
         // re-ask window and its fills would never be asked for again.
         cur: { spot: {}, futures: {} },
         hint: { spot: {}, futures: {} },
-        t: 0, busy: null, route: null,
+        // #2415 TWO stamps, because they answer different questions. `t` paces
+        // the sweeps and is advanced BEFORE the first request, so it says only
+        // "a sweep was started then" — it stays advanced when every page fails.
+        // `okT` is completeness: how far these rows are known good. The panel
+        // ranks its fee-store replays against okT, and a boundary that moved on
+        // a failed sweep would make it refuse the genuinely newer rows that
+        // arrive once the venue recovers.
+        t: 0, okT: 0, busy: null, route: null,
       };
     }
     return R;
@@ -15192,10 +15207,10 @@ function createTradeNative(opts) {
     if ((now - (R.t || 0)) < PH_LIVE_TTL_MS) return;
     const creds = credsGet(slot);
     if (!creds) return;
-    R.t = now;
+    R.t = now;                       // #2415 pacing only — see phFillRing
     R.route = routeNorm(route);
     const p = (async () => {
-      let calls = 0;
+      let calls = 0, bad = 0;
       for (const mk of ['futures', 'spot']) {
         const F = mk === 'spot' ? R.sp : R.fu;
         const cur = R.cur[mk];
@@ -15209,13 +15224,19 @@ function createTradeNative(opts) {
           calls++;
           const pg = await phFillsPage(creds, mk, sym, frm, now + 1000,
                                        R.route, PH_LIVE_LIMIT, 0);
-          if (!pg.ok) continue;              // best-effort — next beat retries
+          if (!pg.ok) { bad++; continue; }   // best-effort — next beat retries
           phFillPush(F, pg.rows, sym);
           let hwm = cur[sym] || 0;
           for (const f of pg.rows) { const t = lbPhTsMs(f); if (t > hwm) hwm = t; }
           cur[sym] = hwm > 0 ? hwm : Math.max(cur[sym] || 0, now - PH_LIVE_OVERLAP_MS);
         }
       }
+      // #2415 completeness is claimed only by a sweep that actually completed:
+      // one failed page means some symbol's window was never covered, and this
+      // ring is not current for it. Stamped with the sweep's START, not its
+      // end — a fill created while the sweep ran may have missed its symbol's
+      // page, so the later stamp would claim rows the ring does not hold.
+      if (!bad) R.okT = now;
     })();
     R.busy = p;
     try { await p; } catch (e) { /* best-effort */ }
@@ -18176,6 +18197,11 @@ function createTradeNative(opts) {
     };
     if (intent.wantJson) out.fillsJson = JSON.stringify(rows);
     else out.fills = rows;
+    // #2415 the same completeness stamp the account read carries, for the same
+    // reason: the live REST sweep behind this reply is TTL-gated, so the reply
+    // time says nothing about how old the rows are. Phemex-scoped — the other
+    // local-blotter venues have their own live lanes and are not ranked.
+    if (venue === 'phemex') out.lbLiveT = (phFillRings[slot] || {}).okT || 0;
     lbTap('read.reply', t0);
     return out;
   }
