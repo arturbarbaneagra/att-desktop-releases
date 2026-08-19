@@ -14429,6 +14429,20 @@ function createTradeNative(opts) {
   // Bounded exec-id dedup. Phemex re-sends an order row on every state change,
   // so the SAME execution can ride two frames; a self-match ships both legs
   // under one execID with opposite sides (phemex-api-quirks) — key on both.
+  // #2408 canonical PANEL-side fill id: '<execID>:<side>' — the SAME namespace
+  // phLbFillsStateRows builds for the state rows (exec_id + ':' + lowercased
+  // side). Shipping it on the push frame lets the panel chime PER FILL at push
+  // time (tens of ms after the venue frame) instead of waiting out the local
+  // blotter's drain and then the state tick behind a signed read (measured
+  // 0.8-4.5s). Because the id is the same one the later re-detection derives,
+  // the bus seen-map collapses the two into ONE audible chime.
+  // Side-INCLUSIVE for the same reason phRingKey/lbFillKey are: a self-match
+  // returns TWO rows sharing one execID and a side-less id would drop a leg.
+  function phPushFillEvId(f) {
+    const eid = String((f && (f.execID || f.execId)) || '');
+    if (!eid) return null;   // no id ⇒ kind-only mark, exactly as before
+    return eid + ':' + String((f && f.side) || '').toLowerCase();
+  }
   function phSeenFill(sess, eid) {
     if (!eid) return true;
     if (sess.seen[eid]) return true;
@@ -14601,8 +14615,10 @@ function createTradeNative(opts) {
           // without a ring — i.e. no local blotter — allocates nothing).
           const Rf = phFillRings[String(slot)];
           if (Rf) phFillPush(Rf.fu, [o], o.symbol);
-          // kind-only: a fill moves the position row and retires a badge.
-          krLseq(PF); phPushSc(PF, 'fill', null, null);
+          // #2408 the fill IDENTITY rides the frame (bounded + deduped by
+          // krPushMark, no row — the rows keep travelling through the local
+          // blotter) so the panel rings this fill on the push beat.
+          krLseq(PF); phPushSc(PF, 'fill', phPushFillEvId(o), null);
         }
       }
     }
@@ -14633,7 +14649,8 @@ function createTradeNative(opts) {
         // #2385 the RAW spot fill row rides the device-local ring too.
         const Rs = phFillRings[String(slot)];
         if (Rs) { phFillPush(Rs.sp, [f], f.symbol); phSymHint(slot, 'spot', f.symbol); }
-        krLseq(PS); phPushSc(PS, 'fill', null, null);
+        // #2408 same per-fill identity on the spot lane (see phPushFillEvId).
+        krLseq(PS); phPushSc(PS, 'fill', phPushFillEvId(f), null);
       }
     }
   }
