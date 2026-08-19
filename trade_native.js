@@ -14810,7 +14810,19 @@ function createTradeNative(opts) {
              spotOrders: spotRows,
              wallets: wallets,
              curScales: curScales, spotBaseScales: spotBaseScales };
-    if (lbPump) out.lbFills = phLiveFills(intent.credSlot || 'phemex');
+    // #2404 …and once the rings EXIST for this slot the payload carries them
+    // on every read, whether or not THIS intent asked to pump. The guard
+    // acctReadGuard memoises on venue|credSlot ALONE, so one window whose local
+    // blotter has not warmed yet asks without intent.lblot and its lbFills-less
+    // reply is then served from that memo to every window that DID ask — which
+    // is why a live session's spot rows lost their cost basis and a whole
+    // futures window produced no fill chime. Reading the rings is a pure
+    // in-memory read (phLiveFills makes no request), and the rings only exist
+    // once the local blotter lane has run for this slot, so a slot that never
+    // uses it still pays exactly zero extra traffic and its payload is
+    // byte-identical.
+    const _lbSlot = intent.credSlot || 'phemex';
+    if (lbPump || phFillRings[_lbSlot]) out.lbFills = phLiveFills(_lbSlot);
     // additive — absent on clean reads so legacy payloads stay byte-identical
     if (partialErrors.length) out.partialErrors = partialErrors;
     return out;
