@@ -14618,7 +14618,14 @@ function createTradeNative(opts) {
           // #2408 the fill IDENTITY rides the frame (bounded + deduped by
           // krPushMark, no row — the rows keep travelling through the local
           // blotter) so the panel rings this fill on the push beat.
-          krLseq(PF); phPushSc(PF, 'fill', phPushFillEvId(o), null);
+          // #2411 …but ONLY for a live delta. The subscribe snapshot carries
+          // the account's recent executions as history, and round 6 rang every
+          // one of them at launch (field log: 24 ids on one mark, 5-6 audible
+          // chimes, no trade). phSeenFill above has already marked them seen,
+          // so the later fills-read re-detection stays silent as well; the row
+          // still reached the device-local ring one line up. Same rule the
+          // position rows on this very frame already follow (_snap).
+          if (!_snap) { krLseq(PF); phPushSc(PF, 'fill', phPushFillEvId(o), null); }
         }
       }
     }
@@ -14650,7 +14657,9 @@ function createTradeNative(opts) {
         const Rs = phFillRings[String(slot)];
         if (Rs) { phFillPush(Rs.sp, [f], f.symbol); phSymHint(slot, 'spot', f.symbol); }
         // #2408 same per-fill identity on the spot lane (see phPushFillEvId).
-        krLseq(PS); phPushSc(PS, 'fill', phPushFillEvId(f), null);
+        // #2411 …and the same snapshot-is-history silence as the futures lane
+        // above: the wo snapshot's fills are already-known executions.
+        if (!_snap) { krLseq(PS); phPushSc(PS, 'fill', phPushFillEvId(f), null); }
       }
     }
   }
