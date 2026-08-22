@@ -2331,6 +2331,56 @@ function lbNormPhemexSpot(r, symbol, spec, curScales) {
     exec_id: eid,
   };
 }
+// #2506 norm_okx_fill twin. ONE function reads BOTH device shapes, exactly
+// like the engine's: a REST /trade/fills(-history) row (fillSz/fillPx/
+// tradeId/fee/feeCcy/fillPnl/ts) and a private `orders`-channel fill delta
+// (fillSz/fillPx/tradeId/fillFee/fillFeeCcy/fillPnl/fillTime). exec_id =
+// tradeId — the ONE id present on both paths (billId never rides the orders
+// channel) — so the pushed copy and the deep-synced copy of one fill land on
+// the same key, here AND in the engine's dedupe space.
+// ⚠️ EVERY SWAP size OKX reports is in CONTRACTS; base units = sz × ctVal,
+// converted HERE at the boundary. A row stored in contracts misprices
+// everything downstream (value, break-even, PnL). A futures row with no
+// cached contract spec therefore returns null — the caller WARMS the spec and
+// retries on the next drain rather than recording a contract-sized fill
+// (gate/kucoin cold-spec rule).
+// Fees arrive NEGATIVE when charged → cost-positive flip; a spot fee charged
+// in the RECEIVED currency (base on buys) converts to quote units ×price.
+function lbNormOkxFill(f, market, ctVal) {
+  if (!f || typeof f !== 'object') return null;
+  const sym = String(f.instId || '');
+  const sz = lbNum(f.fillSz);
+  if (!sym || sz == null || !(Number(sz) > 0)) return null;
+  let mk = String(market || '');
+  if (!mk) mk = String(f.instType || '') === 'SPOT' ? 'spot' : 'futures';
+  mk = mk === 'spot' ? 'spot' : 'futures';
+  if (mk === 'futures' && !ctVal) return null;   // cold spec — warm and retry
+  const qty = okxBaseQty(sz, mk === 'futures' ? ctVal : null) || '0';
+  const px = lbNum(f.fillPx) || '0';
+  const side = String(f.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
+  let feeRaw = lbNum(f.fee);
+  if (feeRaw == null) feeRaw = lbNum(f.fillFee);
+  if (feeRaw == null) feeRaw = '0';
+  let feeN = -Number(feeRaw);
+  const feeCcy = String(f.feeCcy || f.fillFeeCcy || '');
+  if (mk === 'spot' && feeCcy && sym.slice(-(feeCcy.length + 1)) !== '-' + feeCcy) {
+    feeN = feeN * Number(px);
+  }
+  return {
+    venue: 'okx',
+    market: mk, symbol: sym,
+    side: side, posSide: '',
+    order_px: '',
+    exec_px: px,
+    qty: qty,
+    value: lbFmt(Number(px) * Number(qty)),
+    fee: lbFmt(feeN),
+    closed_pnl: lbNum(f.fillPnl) || '0',
+    kind: 'trade', funding: '0',
+    ts: Math.floor(Number(f.ts || f.fillTime || 0)) || 0,
+    exec_id: String(f.tradeId || ''),
+  };
+}
 // Exactly-once merge key: the fill's market + venue exec id (funding rows
 // have no exec id → ts-keyed like the engine's funding handling).
 function lbFillKey(f) {
@@ -3326,6 +3376,16 @@ function okxTs(nowMs) {
   return d.toISOString().slice(0, 23) + 'Z';
 }
 
+// #2505 private-WS login signature — base64(HMAC-SHA256(secret,
+// epochSECONDS + 'GET' + '/users/self/verify')), engine okx_ws_login_sig
+// twin. NOT the REST construction: okxRequest stamps an ISO-MILLISECOND
+// okxTs() over the full request path, so the two signers must never be
+// swapped (a REST stamp here is rejected as a bad signature, not a clock
+// skew, which reads as "wrong API key" in the field).
+function okxWsLoginSig(secret, tsSec) {
+  return okxSign(secret, String(tsSec), 'GET', '/users/self/verify', '');
+}
+
 const OKX_ERRORS = {
   50111: 'Invalid API key',
   50113: 'Invalid request signature — re-enter your API keys',
@@ -3444,6 +3504,40 @@ function okxPositionRows(data, ctMap) {
     } catch (e) { /* skip */ }
   }
   return rows;
+}
+
+// #2508 OKX leverage helpers (pure — the three inputs the set-leverage call
+// needs). mgnMode is REQUIRED on both the read and the write: there is no
+// "the account's leverage" on OKX, only cross leverage and isolated leverage.
+// The symbol's OWN open position is the only honest source of which one is in
+// force; FLAT falls back to cross — the tdMode every terminal order carries
+// and the mode the engine's set_leverage twin writes.
+function okxPosMgnMode(data, sym) {
+  const want = String(sym || '');
+  for (const p of ((data || {}).data) || []) {
+    if (!p || (want && String(p.instId || '') !== want)) continue;
+    if (Number(bnNum(p.pos) || '0') === 0) continue;   // flat row: no mode in force
+    const m = String(p.mgnMode || '').toLowerCase();
+    if (m === 'isolated' || m === 'cross') return m;
+  }
+  return 'cross';
+}
+// /api/v5/account/config → is the account in long/short (hedge) position mode?
+// OKX accepts posSide on set-leverage ONLY for isolated margin in this mode,
+// and applies the write to that leg alone.
+function okxHedgeMode(data) {
+  const row = (((data || {}).data) || [])[0] || {};
+  return String(row.posMode || '').toLowerCase() === 'long_short_mode';
+}
+// /api/v5/account/leverage-info → the configured leverage (first POSITIVE
+// lever; isolated long/short answers one row per leg). Null = the venue
+// reports no configuration for the mode — never a guessed number.
+function okxLevInfoPick(data) {
+  for (const r of ((data || {}).data) || []) {
+    const v = bnNum((r || {}).lever);
+    if (v != null && Number(v) > 0) return v;
+  }
+  return null;
 }
 
 function okxCancelGone(errText) {
@@ -6382,6 +6476,7 @@ function createTradeNative(opts) {
     try { krWsCloseAll(venue); } catch (e) { /* no session */ }
     try { bnUdsClose(venue); } catch (e) { /* no session */ }
     try { hlPushClose(venue); } catch (e) { /* no session */ }
+    try { okxPushClose(venue); } catch (e) { /* no session */ }  // #2505
     try { astUdsClose(venue); } catch (e) { /* no session */ }   // #2306
     try { ltPushClose(venue); } catch (e) { /* no session */ }   // #2326
     try { phPushClose(venue); } catch (e) { /* no session */ }   // #2384
@@ -6395,6 +6490,7 @@ function createTradeNative(opts) {
     try { if (venue) bnUdsClose(venue); else bnUdsCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) hlPushClose(venue); else hlPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bybPushClose(venue); else bybPushCloseAll(); } catch (e) { /* no session */ }
+    try { if (venue) okxPushClose(venue); else okxPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) gatePushClose(venue); else gatePushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) bgPushClose(venue); else bgPushCloseAll(); } catch (e) { /* no session */ }
     try { if (venue) kcPushClose(venue); else kcPushCloseAll(); } catch (e) { /* no session */ }
@@ -8065,6 +8161,356 @@ function createTradeNative(opts) {
                           { reduceOnly: true, trigger: intent.trigger, closeOnTrigger: true });
     if (!r.ok) return r;
     return { ok: true, kind: intent.kind, orderID: r.orderID, clOrdID: intent.clOrdID };
+  }
+
+  // ── #2505 OKX private push lane ───────────────────────────────────────────
+  // OKX was the last venue on the native trading axis with no private socket:
+  // orders, stops, positions and balances only moved on the next account
+  // poll. This lane gives it the same event-time display the other ten have.
+  //
+  // TWO sockets, because OKX splits its private channels across endpoints:
+  //  • PRIVATE (`/ws/v5/private`) — `orders` (instType ANY, so ONE
+  //    subscription covers spot + swap), `positions` (SWAP) and `account`.
+  //  • BUSINESS (`/ws/v5/business`) — `orders-algo`, i.e. every stop /
+  //    take-profit / conditional order. It is UNREACHABLE from the private
+  //    endpoint, so a lane that skips this socket leaves stops exactly as
+  //    slow as before while making plain orders instant.
+  // The two run as INDEPENDENT loops: the business socket is DEGRADED, never
+  // fatal. If it will not connect (endpoint down, key without the right
+  // permission) the private lane keeps running and pending algo orders keep
+  // arriving on the acct read's /trade/orders-algo-pending leg — the REST
+  // reconcile stays the safety net behind the socket, exactly as before.
+  //
+  // The `orders` channel CARRIES THE FILL (fillSz/fillPx/tradeId/fillFee), so
+  // this lane is also the device-held OKX fill stream the local blotter needs
+  // — emitted here as fids/frows; the blotter/arrows/chime that consume them
+  // are their own task (there is deliberately no lbDrain call below, since
+  // no OKX local-blotter normalizer exists yet).
+  //
+  // Snapshot discipline (push-snapshot-vs-delta): OKX pushes a subscribe
+  // SNAPSHOT on `positions` and `account` only — `orders` and `orders-algo`
+  // are documented as "data will not be pushed when first subscribed", so
+  // gating THEIR first frame would silently swallow the first real order
+  // event of every connection. Snapshot rows therefore ride a `_snap` flag
+  // (Phemex precedent) and the panel MARKS them: only a live delta may
+  // remove a symbol or a currency.
+  // Keepalive is the literal text 'ping' → 'pong' (OKX drops a conn quiet for
+  // 30s). Rides the proxy agent like all shell traffic (krWsDial).
+  const OKX_PUSH_WS_URL = 'wss://ws.okx.com:8443/ws/v5/private';
+  const OKX_PUSH_BIZ_URL = 'wss://ws.okx.com:8443/ws/v5/business';
+  const OKX_PUSH_PING_MS = 20000;      // engine OKX_WS_PING_S twin
+  const OKX_PUSH_STALL_MS = 60000;
+  // engine okx_order_apply twin — anything else removes the badge.
+  const OKX_PUSH_OPEN_ST = { live: 1, partially_filled: 1 };
+  // orders-algo lifecycle: an algo that TRIGGERS goes `effective` and its
+  // real order shows up on the `orders` channel, so only these keep a chip.
+  const OKX_PUSH_ALGO_OPEN_ST = { live: 1, pause: 1, partially_effective: 1 };
+  // How much of a fill's own timestamp still counts as "live" at connect —
+  // insurance against a replayed row raising a fill event on redial.
+  const OKX_PUSH_FRESH_MS = 120000;
+  const OKX_PUSH_SEEN_CAP = 512;
+  const okxPushSessions = {};
+  const okxPushPend = {};
+  let okxPushTimer = null;
+  function okxPushFlush() {
+    okxPushTimer = null;
+    const evs = krPushDrain(okxPushPend, (key) => {
+      const sess = okxPushSessions[key.slice(0, key.indexOf('|'))];
+      if (!sess) return 0;
+      return key.slice(key.indexOf('|') + 1) === 'spot' ? sess.sp.lseq : sess.fu.lseq;
+    }, Date.now(), 'okx');
+    for (const ev of evs) {
+      try { pushLedgerCb(ev); } catch (e) { /* window gone */ }
+      // a mutation observed on the push beat invalidates the acct-read memo
+      // (Binance flush pattern) so the push-kicked read never serves stale.
+      try { execAcctRead.bust('okx', ev.slot); } catch (e) { /* no memo */ }
+      try { execAcctRead.markHot('okx'); } catch (e) { /* #2131 hot lane */ }
+      tdiag('acct', 'okx_push', { s: ev.scope, q: ev.seq, k: ev.kinds.join(',') });
+    }
+  }
+  function okxPushSc(scope, kind, id, row) {
+    if (!pushLedgerCb || !scope || !scope._pk) return;
+    krPushMark(okxPushPend, scope._pk, kind, id, row);
+    if (!okxPushTimer) {
+      okxPushTimer = setTimeout(okxPushFlush, KR_PUSH_COALESCE_MS);
+      if (okxPushTimer && typeof okxPushTimer.unref === 'function') okxPushTimer.unref();
+    }
+  }
+  function okxPushScope(pk) {
+    return { lseq: 0, _pk: pk };
+  }
+  // Per-CONNECTION lane state. The two sockets redial independently, so the
+  // subscribe-snapshot bookkeeping (fseen) and the venue-clock connect stamp
+  // (connT) live here, NOT on the shared session.
+  function okxPushLaneSt(lane) {
+    return { lane: lane, running: false, up: false, ws: null, err: null,
+             lastMsg: 0, fseen: null, connT: 0 };
+  }
+  function okxPushLane(sess, lane) { return lane === 'biz' ? sess.bz : sess.pv; }
+  function okxPushClose(slot) {
+    const sess = okxPushSessions[slot];
+    if (!sess) return;
+    sess.closed = true;
+    for (const L of [sess.pv, sess.bz]) {
+      try { if (L && L.ws) L.ws.terminate(); } catch (e) { /* gone */ }
+      if (L) { L.ws = null; L.up = false; }
+    }
+    delete okxPushSessions[slot];
+  }
+  function okxPushCloseAll() {
+    for (const k of Object.keys(okxPushSessions)) okxPushClose(k);
+  }
+  function okxPushEnsure(slot, creds, route) {
+    // OKX credentials are THREE fields; a key without its passphrase cannot
+    // sign a login frame, so there is nothing to keep warm.
+    if (!WSC || !creds || !creds.key || !creds.pass) return null;
+    slot = String(slot || 'okx');
+    let sess = okxPushSessions[slot];
+    if (sess && sess.tail !== creds.key) { okxPushClose(slot); sess = null; }
+    if (!sess) {
+      sess = okxPushSessions[slot] = {
+        slot: slot, tail: creds.key, closed: false, route: route, creds: creds,
+        tOff: 0, seenF: null,
+        pv: okxPushLaneSt('priv'),
+        bz: okxPushLaneSt('biz'),
+        sp: okxPushScope(slot + '|spot'),
+        fu: okxPushScope(slot + '|fut'),
+      };
+    }
+    sess.route = route;   // latest route pick wins for the next (re)dial
+    sess.creds = creds;
+    if (!sess.pv.running) okxPushLoop(slot, sess, 'priv');
+    if (!sess.bz.running) okxPushLoop(slot, sess, 'biz');
+    return sess;
+  }
+  function okxPushLoop(slot, sess, lane) {
+    const L = okxPushLane(sess, lane);
+    L.running = true;
+    (async () => {
+      let backoff = 2000;
+      while (okxPushSessions[slot] === sess && !sess.closed) {
+        const t0 = Date.now();
+        try {
+          // signer clock discipline (native-venue-time-sync): the login
+          // frame stamps venue-synced SECONDS, never raw Date.now().
+          sess.tOff = await ensureVenueTime('okx', null, sess.route);
+          await okxPushConn(slot, sess, lane);
+          if (Date.now() - t0 > 60000) backoff = 2000;   // productive conn resets
+        } catch (e) {
+          L.err = 'OKX push (' + lane + '): ' + ((e && e.message) || 'error');
+          tdiag('acct', 'okx_push_err', { l: lane, m: String(L.err).slice(0, 120) });
+        }
+        L.up = false; L.ws = null;
+        if (sess.closed || okxPushSessions[slot] !== sess) break;
+        await krWsSleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      L.running = false;
+    })().catch(() => { L.running = false; });
+  }
+  function okxPushConn(slot, sess, lane) {
+    const L = okxPushLane(sess, lane);
+    return new Promise((resolve, reject) => {
+      const ws = krWsDial(lane === 'biz' ? OKX_PUSH_BIZ_URL : OKX_PUSH_WS_URL, sess.route);
+      if (!ws) { reject(new Error('proxy agent unavailable')); return; }
+      L.ws = ws;
+      let settled = false;
+      let acked = 0;
+      // OKX subscribe acks carry no request id (terminal-okx-venue) — they
+      // are matched by channel, so plain COUNTING is what marks the lane up.
+      const expect = lane === 'biz' ? 1 : 3;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(kaT);
+        L.up = false;
+        try { ws.terminate(); } catch (e) { /* closed */ }
+        if (err) reject(err); else resolve();
+      };
+      const kaT = setInterval(() => {
+        try { ws.send('ping'); } catch (e) { /* dying */ }
+        if (Date.now() - (L.lastMsg || 0) > OKX_PUSH_STALL_MS) done(new Error('stream stalled'));
+      }, OKX_PUSH_PING_MS);
+      if (kaT && typeof kaT.unref === 'function') kaT.unref();
+      ws.on('open', () => {
+        L.lastMsg = Date.now();
+        L.fseen = {};
+        L.connT = Date.now() + (sess.tOff || 0);   // venue clock, for fill age
+        try {
+          const tsec = String(venueStampSec(sess.tOff));
+          ws.send(JSON.stringify({ op: 'login', args: [{
+            apiKey: sess.creds.key, passphrase: String(sess.creds.pass || ''),
+            timestamp: tsec, sign: okxWsLoginSig(sess.creds.secret, tsec),
+          }] }));
+        } catch (e) { done(e); return; }
+      });
+      ws.on('ping', () => { L.lastMsg = Date.now(); });
+      ws.on('message', (buf) => {
+        L.lastMsg = Date.now();
+        const txt = buf.toString();
+        if (txt === 'pong' || txt === 'ping') return;   // literal keepalive
+        let msg = null;
+        try { msg = JSON.parse(txt); } catch (e) { return; }
+        const evn = String((msg && msg.event) || '');
+        if (evn === 'login') {
+          // OKX reports a rejected login as code!=='0' on an event:'login'
+          // frame, not as an error frame (terminal-okx-venue code:'0' rule).
+          if (String((msg && msg.code) != null ? msg.code : '0') !== '0') {
+            done(new Error('login ' + String((msg && msg.msg) || 'rejected')));
+            return;
+          }
+          try {
+            for (const a of (lane === 'biz'
+              ? [{ channel: 'orders-algo', instType: 'SWAP' }]
+              : [{ channel: 'account' },
+                 { channel: 'positions', instType: 'SWAP' },
+                 { channel: 'orders', instType: 'ANY' }]))
+              ws.send(JSON.stringify({ op: 'subscribe', args: [a] }));
+          } catch (e) { done(e); return; }
+          return;
+        }
+        if (evn === 'subscribe') {
+          acked++;
+          if (acked >= expect && !L.up) {
+            L.up = true; L.err = null;
+            tdiag('acct', 'okx_push_up', { s: slot, l: lane });
+          }
+          return;
+        }
+        if (evn === 'error') {
+          done(new Error(String((msg && msg.msg) || (msg && msg.code) || 'error')));
+          return;
+        }
+        if (evn) return;   // channel-conn-count / notice control frames
+        try { okxPushEvApply(sess, L, msg); } catch (e) { /* row skipped */ }
+      });
+      ws.on('error', (e) => done(e || new Error('ws error')));
+      ws.on('close', () => done(new Error('closed')));
+    });
+  }
+  // Bounded per-session seen-set of fill ids. OKX repeats an order's LAST
+  // fill on the `state:'filled'` frame that follows a `partially_filled`
+  // one, so the same tradeId can arrive twice on one connection.
+  function okxSeenFill(sess, eid) {
+    if (!eid) return true;
+    if (!sess.seenF) sess.seenF = { m: {}, q: [] };
+    const S = sess.seenF;
+    if (S.m[eid]) return true;
+    S.m[eid] = 1; S.q.push(eid);
+    if (S.q.length > OKX_PUSH_SEEN_CAP) {
+      for (const k of S.q.splice(0, S.q.length - OKX_PUSH_SEEN_CAP)) delete S.m[k];
+    }
+    return false;
+  }
+  // Does this `orders` row carry an execution? (engine okx_order_apply /
+  // norm_okx_fill twin: tradeId is the ONE exec id on both the REST and WS
+  // paths, and fillSz is the size of THIS fill, not the cumulative one.)
+  function okxPushIsFill(o) {
+    return !!(o && o.tradeId != null && String(o.tradeId) !== ''
+              && (parseFloat(o.fillSz) || 0) > 0);
+  }
+  function okxPushEvApply(sess, L, msg) {
+    const arg = (msg && msg.arg) || {};
+    const ch = String(arg.channel || '');
+    if (!ch) return;
+    const rows = Array.isArray(msg && msg.data) ? msg.data : [];
+    if (!L.fseen) L.fseen = {};
+    const snap = !L.fseen[ch];
+    L.fseen[ch] = 1;
+    if (ch === 'orders') {
+      for (const o of rows) {
+        if (!o || typeof o !== 'object') continue;
+        // instType ANY covers both markets on ONE subscription — route by
+        // the row's own instType, never by a per-subscription assumption.
+        const mk = String(o.instType || '').toUpperCase() === 'SPOT' ? 'spot' : 'futures';
+        const sc = mk === 'spot' ? sess.sp : sess.fu;
+        if (okxPushIsFill(o)) {
+          const fid = String(o.tradeId) + ':' + String(o.side || '').toLowerCase();
+          const fts = parseInt(o.fillTime || o.uTime || 0, 10) || 0;
+          const stale = !!(fts && fts < ((L.connT || 0) - OKX_PUSH_FRESH_MS));
+          if (!stale && !okxSeenFill(sess, fid)) {
+            // #2506 the device-local blotter's LIVE source: this raw row into
+            // the slot's fill ring BEFORE the display event, so a drain
+            // triggered by the event already sees it. Side-inclusive key —
+            // a self-match returns two rows sharing one tradeId.
+            okxPushFillRing(sess.slot, mk, o);
+            // #2507 …and the FEE rides that same frame. Ship the normalized,
+            // fee-complete row so the panel folds the break-even on this beat
+            // instead of waiting out the TTL-paced signed read — the quantity
+            // and the pool that divides it are then adopted from ONE frame,
+            // never a new quantity over an old pool. Spot ships no row: its
+            // fee currency and scale cannot be resolved on this lane.
+            const ffr = mk === 'futures' ? okxPushFeeRow(o, sess.route) : null;
+            krLseq(sc); okxPushSc(sc, 'fill', fid, ffr);
+            // a futures execution moved the position — bump the posrow with
+            // it so the row does not wait for the `positions` frame.
+            if (mk === 'futures') { krLseq(sc); okxPushSc(sc, 'pos'); }
+          }
+        }
+        const oid = o.ordId != null ? String(o.ordId) : '';
+        if (!oid) continue;
+        const st = String(o.state || '').toLowerCase();
+        if (OKX_PUSH_OPEN_ST[st]) { krLseq(sc); okxPushSc(sc, 'order', null, o); }
+        else { krLseq(sc); okxPushSc(sc, 'ordgone', oid); }
+      }
+      return;
+    }
+    if (ch === 'orders-algo') {
+      for (const o of rows) {
+        if (!o || typeof o !== 'object') continue;
+        const aid = o.algoId != null ? String(o.algoId) : '';
+        if (!aid) continue;
+        // SWAP-only subscription; algo chips are a futures-market concept
+        // here (the acct read drops non-SWAP algo rows the same way).
+        const sc = sess.fu;
+        const st = String(o.state || '').toLowerCase();
+        if (OKX_PUSH_ALGO_OPEN_ST[st]) {
+          // Explicit marker rather than "has algoId": a PLAIN order row also
+          // carries algoId once the algo that spawned it has triggered, so
+          // field presence cannot tell the two row shapes apart and the
+          // renderer would pick the wrong builder.
+          krLseq(sc); okxPushSc(sc, 'order', null, Object.assign({}, o, { _algo: 1 }));
+        } else {
+          // engine okx_row_from_algo namespaces algo ids so a cancel routes
+          // to /trade/cancel-algos — the gone id must match that namespace.
+          krLseq(sc); okxPushSc(sc, 'ordgone', 'algo:' + aid);
+        }
+      }
+      return;
+    }
+    if (ch === 'positions') {
+      for (const p of rows) {
+        if (!p || typeof p !== 'object' || !p.instId) continue;
+        krLseq(sess.fu);
+        okxPushSc(sess.fu, 'pos', null, snap ? Object.assign({}, p, { _snap: 1 }) : p);
+      }
+      return;
+    }
+    if (ch === 'account') {
+      for (const a of rows) {
+        if (!a || typeof a !== 'object') continue;
+        // Balances hang off the spot scope (the acct read's wallets come
+        // from the same /account/balance details list).
+        krLseq(sess.sp);
+        okxPushSc(sess.sp, 'bal', null, snap ? Object.assign({}, a, { _snap: 1 }) : a);
+      }
+    }
+  }
+  // Optimistic mutation stamp at the order-send/cancel ack sites (Kraken/
+  // Binance/Bybit/Gate/Bitget pattern): the WS echo lands ~100ms later, but
+  // the local bump makes the badge/posrow read fire immediately after the
+  // REST ack — and it is the ONLY lane algo orders have while the business
+  // socket is degraded. Market-scoped: OKX plain and algo ids are separate
+  // sequences and spot/swap rows land in different scopes.
+  function okxMutKick(slot, kind, oid, market) {
+    const sess = okxPushSessions[String(slot || 'okx')];
+    if (!sess) return;
+    const sc = market === 'spot' ? sess.sp : sess.fu;
+    if (kind === 'ordgone' && oid) {
+      krLseq(sc); okxPushSc(sc, 'ordgone', String(oid));
+    } else {
+      krLseq(sc); okxPushSc(sc, 'order');
+    }
   }
 
   // --- OKX ---------------------------------------------------------------------
@@ -14443,6 +14889,38 @@ function createTradeNative(opts) {
     if (!eid) return null;   // no id ⇒ kind-only mark, exactly as before
     return eid + ':' + String((f && f.side) || '').toLowerCase();
   }
+  // #2497 …and the fill's own FEE rides the same frame. The break-even entry is
+  // "average paid + fees over what is open", so the panel cannot paint it until
+  // the fee lands — and the fee used to come ONLY from the signed /api-data
+  // trades feed, TTL-paced at 1.2 s behind a single-flight gate. The field log
+  // of 2026-08-22 measured what that costs: the quantity painted on the push
+  // frame and the entry followed 1.0-2.6 s later, showing the raw venue average
+  // in between. Every one of the 72 fills in that log carried its fee on the WS
+  // frame itself, and the REST pages covering the opens came back EMPTY — the
+  // number was already here and was being thrown away.
+  // So the execution row goes through the SAME normalizer the poll lane uses
+  // (lbNormPhemexFut already reads the WS execQty/execFeeRv spellings as well
+  // as the REST Rq ones — one reader, one exec-id space, no second parser) and
+  // rides the fill event as a row, exactly like Kraken's #1878 posrow seed.
+  // FUTURES only: the spot normalizer needs the product spec and the
+  // per-currency scale maps to descale a row at all, and this lane has neither.
+  // Ships ONLY a row that can complete the fold on its own — exec id, side,
+  // size, price AND a positive fee. A partial row is worse than the short wait
+  // it saves: a qty with no fee folds a pool of 0 (a break-even that reads as
+  // the venue average, i.e. the very flicker this removes) and a price of 0
+  // poisons the basis to "unknowable". Anything short of complete returns null,
+  // the fee keeps its existing lane, and phLiveExpedite hurries that lane up.
+  function phPushFeeRow(o) {
+    let r = null;
+    try { r = lbNormPhemexFut(o, o && o.symbol); } catch (e) { return null; }
+    if (!r || r.kind !== 'trade' || !r.exec_id) return null;
+    if (r.side !== 'buy' && r.side !== 'sell') return null;
+    const fee = parseFloat(r.fee), qty = parseFloat(r.qty), px = parseFloat(r.exec_px);
+    if (!(Number.isFinite(fee) && fee > 0)) return null;      // no fee on this frame
+    if (!(Number.isFinite(qty) && qty > 0)) return null;
+    if (!(Number.isFinite(px) && px > 0)) return null;
+    return r;
+  }
   function phSeenFill(sess, eid) {
     if (!eid) return true;
     if (sess.seen[eid]) return true;
@@ -14625,7 +15103,16 @@ function createTradeNative(opts) {
           // so the later fills-read re-detection stays silent as well; the row
           // still reached the device-local ring one line up. Same rule the
           // position rows on this very frame already follow (_snap).
-          if (!_snap) { krLseq(PF); phPushSc(PF, 'fill', phPushFillEvId(o), null); }
+          // #2497 …and the fill's FEE now rides with that identity whenever the
+          // frame carries one, so the panel folds the break-even on the SAME
+          // beat it moves the quantity. When it does not, the fee is still a
+          // signed read away — so that read is expedited for this one symbol
+          // instead of waiting out the live lane's freshness window.
+          if (!_snap) {
+            const fr = phPushFeeRow(o);
+            krLseq(PF); phPushSc(PF, 'fill', phPushFillEvId(o), fr);
+            if (!fr) phLiveExpedite(slot, 'futures', o.symbol);
+          }
         }
       }
     }
@@ -14924,6 +15411,9 @@ function createTradeNative(opts) {
   const PH_LIVE_OVERLAP_MS = 90000;            // per-SYMBOL re-ask window
   const PH_LIVE_COLD_MS = 15 * 60 * 1000;      // first poll of a session
   const PH_LIVE_SYM_CAP = 8;                   // signed calls per market per pass
+  const PH_LIVE_EXP_MIN_MS = 400;              // #2497 floor between expedited passes
+  const PH_LIVE_EXP_CAP = 2;                   // #2497 symbols one expedited pass asks for
+  const PH_LIVE_EXP_PEND_CAP = 8;              // #2497 marks held while one is in flight
   const PH_LIVE_LIMIT = 200;                   // venue page max on these feeds
   const PH_PAGE_GAP_MS = 250;                  // HIST_CALL_SPACING_S twin
   const PH_MAX_SPAN_MS = 26 * 3600 * 1000;     // the fills feed's own window cap
@@ -14945,7 +15435,9 @@ function createTradeNative(opts) {
         // ranks its fee-store replays against okT, and a boundary that moved on
         // a failed sweep would make it refuse the genuinely newer rows that
         // arrive once the venue recovers.
-        t: 0, okT: 0, busy: null, route: null,
+        // #2497 symbols a push fill has asked to be read AHEAD of the pace
+        // (market|symbol → 1) and the stamp of the last expedited pass.
+        t: 0, okT: 0, busy: null, route: null, exp: null, expT: 0,
       };
     }
     return R;
@@ -14986,6 +15478,45 @@ function createTradeNative(opts) {
     const R = phFillRings[String(slot)];
     if (!R) return;   // no ring yet ⇒ the local blotter is not in play
     R.hint[market === 'spot' ? 'spot' : 'futures'][s] = Date.now();
+  }
+  // #2497 ONE-SHOT pace bypass for the symbol that just filled. The live poll's
+  // TTL is the pace of a periodic SWEEP over everything the account touches; it
+  // is not meant to be a wall in front of a fill that has just happened. A push
+  // fill whose frame carried no usable fee (phPushFeeRow) marks its symbol here,
+  // and that mark buys ONE reduced pass — those symbols only, at most
+  // PH_LIVE_EXP_CAP of them, floored at PH_LIVE_EXP_MIN_MS between passes and
+  // still behind the ring's single-flight gate. So the wait becomes one REST
+  // round trip rather than up to a freshness window plus the panel's kick floor,
+  // and a burst of fills still cannot turn into a poll flood: marks coalesce per
+  // symbol, the pending set is capped, and the periodic sweep keeps its own
+  // schedule either way.
+  function phLiveExpedite(slot, market, sym) {
+    const s = String(sym || '');
+    if (!s) return;
+    const R = phFillRings[String(slot)];
+    if (!R) return;                    // no ring ⇒ the local blotter is not in play
+    const k = (market === 'spot' ? 'spot' : 'futures') + '|' + s;
+    if (!R.exp) R.exp = {};
+    if (R.exp[k]) return;              // already asked for — one read, not one per fill
+    if (Object.keys(R.exp).length >= PH_LIVE_EXP_PEND_CAP) return;
+    R.exp[k] = 1;
+  }
+  // #2497 claim the pending marks for ONE expedited pass, or null when there is
+  // nothing to claim / the floor has not elapsed. Claimed marks are removed:
+  // the pass that takes them owes the read, and a mark that is not claimed here
+  // stays pending for the next call rather than being dropped.
+  function phExpTake(R, now) {
+    if (!R || !R.exp) return null;
+    const keys = Object.keys(R.exp);
+    if (!keys.length) return null;
+    if ((now - (R.expT || 0)) < PH_LIVE_EXP_MIN_MS) return null;
+    const take = keys.slice(0, PH_LIVE_EXP_CAP);
+    for (const k of take) delete R.exp[k];
+    R.expT = now;
+    return take.map((k) => {
+      const i = k.indexOf('|');
+      return { market: k.slice(0, i), sym: k.slice(i + 1) };
+    });
   }
   // BOUNDED symbol set for one market: locally recorded symbols (newest first)
   // + everything the push lane has seen this session. This is a BOUND, not a
@@ -15204,17 +15735,31 @@ function createTradeNative(opts) {
     const R = phFillRing(slot);
     if (R.busy) { try { await R.busy; } catch (e) {} return; }
     const now = Date.now();
-    if ((now - (R.t || 0)) < PH_LIVE_TTL_MS) return;
+    // #2497 a push fill that arrived without its fee may claim ONE reduced pass
+    // through the freshness window (phLiveExpedite): the symbols it named, and
+    // nothing else. Such a pass does not advance `t` — the periodic sweep keeps
+    // its own schedule instead of being replaced by a partial one — and cannot
+    // claim `okT`, because it covered a subset of the symbols and completeness
+    // is what that stamp means.
+    const paced = (now - (R.t || 0)) < PH_LIVE_TTL_MS;
+    const exp = paced ? phExpTake(R, now) : null;
+    if (paced && !exp) return;
     const creds = credsGet(slot);
     if (!creds) return;
-    R.t = now;                       // #2415 pacing only — see phFillRing
+    if (!exp) { R.t = now; R.exp = null; }   // #2415 pacing only — see phFillRing
     R.route = routeNorm(route);
     const p = (async () => {
       let calls = 0, bad = 0;
-      for (const mk of ['futures', 'spot']) {
+      // full sweep: both markets, each one's bounded symbol set. Expedited: the
+      // named symbols, in the order they were claimed.
+      const lanes = exp
+        ? exp.map((e) => ({ mk: e.market === 'spot' ? 'spot' : 'futures', syms: [e.sym] }))
+        : ['futures', 'spot'].map((mk) => ({ mk: mk, syms: phLiveSyms(slot, R, mk) }));
+      for (const ln of lanes) {
+        const mk = ln.mk;
         const F = mk === 'spot' ? R.sp : R.fu;
         const cur = R.cur[mk];
-        for (const sym of phLiveSyms(slot, R, mk)) {
+        for (const sym of ln.syms) {
           let frm = cur[sym] > 0 ? Math.max(0, cur[sym] - PH_LIVE_OVERLAP_MS)
                                  : now - PH_LIVE_COLD_MS;
           // The feed refuses a span wider than its own window cap, so ONE bad
@@ -15236,7 +15781,9 @@ function createTradeNative(opts) {
       // ring is not current for it. Stamped with the sweep's START, not its
       // end — a fill created while the sweep ran may have missed its symbol's
       // page, so the later stamp would claim rows the ring does not hold.
-      if (!bad) R.okT = now;
+      // #2497 …and an EXPEDITED pass never claims it at all: it asked about one
+      // symbol on purpose, so it says nothing about the others.
+      if (!bad && !exp) R.okT = now;
     })();
     R.busy = p;
     try { await p; } catch (e) { /* best-effort */ }
@@ -15275,6 +15822,269 @@ function createTradeNative(opts) {
     return out.length > PH_LIVE_SHARE_N ? out.slice(out.length - PH_LIVE_SHARE_N) : out;
   }
 
+  // ── OKX device-local blotter fill lane (#2506) ───────────────────────────
+  // OKX becomes the ELEVENTH local-blotter venue, and its device-held fill
+  // stream is the #2505 private `orders` channel: every execution arrives
+  // there carrying tradeId/fillSz/fillPx/fillFee — exactly what the store
+  // needs. This ring is the raw-row buffer between that push lane and
+  // lbDrain: the same per-slot shape every other push venue uses, so the
+  // drain consumes it through the normal incremental-cursor / exactly-once /
+  // journal / prune path with no OKX special case downstream.
+  //
+  // Behind the socket sits a paced REST lane over the venue's account-wide
+  // /trade/fills walk. It is NOT redundant: `orders` pushes NO subscribe
+  // snapshot (documented: "data will not be pushed when first subscribed"),
+  // so a fill that lands while the socket is redialling can never be
+  // replayed by the socket and would otherwise exist nowhere on this device.
+  // Both sources feed ONE ring and the store's exactly-once merge absorbs
+  // the overlap.
+  const OKX_FILL_RING_CAP = 600;
+  const OKX_LIVE_TTL_MS = 1200;                // ≥1 fetch per panel lblot beat
+  const OKX_LIVE_OVERLAP_MS = 90000;           // per-market re-ask window
+  const OKX_LIVE_COLD_MS = 15 * 60 * 1000;     // first poll of a session
+  const OKX_LIVE_PAGES = 4;                    // bounded — backfill owns depth
+  const OKX_PAGE_GAP_MS = 450;                 // HB_PAGE_GAP_MS twin (own scope)
+  // /api/v5/trade/fills serves the last ~7 days; /trade/fills-history reaches
+  // ~3 months with an identical row shape and identical params. The live lane
+  // only ever asks the recent endpoint, so its window is clamped to what that
+  // endpoint can actually answer — an over-wide `begin` returns nothing.
+  const OKX_RECENT_SPAN_MS = 7 * 86400 * 1000 - 60000;
+  const OKX_ARCH_SPAN_MS = 89 * 86400 * 1000;
+  const OKX_LIVE_CT_WARM_N = 20;               // cold specs warmed per sweep
+  const okxFillRings = {};   // slot → { sp, fu, spTs, fuTs, t, busy }
+  function okxFillRing(slot) {
+    let R = okxFillRings[String(slot)];
+    if (!R) {
+      R = okxFillRings[String(slot)] = {
+        sp: { rows: [], seen: {}, rev: 0 }, fu: { rows: [], seen: {}, rev: 0 },
+        spTs: 0, fuTs: 0, t: 0, busy: null,
+      };
+    }
+    return R;
+  }
+  // Ring key is side-INCLUSIVE, matching the engine's dedupe key and
+  // lbFillKey: an OKX self-match returns TWO rows sharing ONE tradeId
+  // (opposite sides), and a side-less key silently drops one leg — the trade
+  // then stays open forever.
+  function okxRingKey(f) {
+    const eid = String((f && f.tradeId) || '');
+    return eid ? eid + '|' + String((f && f.side) || '').toLowerCase() : '';
+  }
+  function okxFillPush(F, rows) {
+    let n = 0;
+    for (const f of (rows || [])) {
+      const k = okxRingKey(f);
+      if (!k || F.seen[k]) continue;
+      F.seen[k] = 1;
+      F.rows.push(f);
+      lbSrcTouch(F);   // #2230 one touch per pushed row (drain cursor)
+      n++;
+    }
+    if (F.rows.length > OKX_FILL_RING_CAP) {
+      const drop = F.rows.splice(0, F.rows.length - OKX_FILL_RING_CAP);
+      // evicted rows are far older than any re-ask window, so forgetting
+      // their keys cannot resurrect them; the store-level dedupe is the real
+      // exactly-once guard either way.
+      for (const f of drop) { const k = okxRingKey(f); if (k) delete F.seen[k]; }
+    }
+    return n;
+  }
+  // #2507 A WS `orders` frame and a REST /trade/fills row are NOT the same
+  // shape where the fee is concerned. On the orders channel `fee`/`feeCcy` are
+  // the ORDER-CUMULATIVE fee and `fillFee`/`fillFeeCcy` are THIS fill's; the
+  // normalizer (and the engine twin it is pinned against) reads the REST
+  // names, so a partially filled order handed over raw folds the whole order's
+  // running fee onto its first clip and a larger one again onto the next.
+  // Rename the per-fill pair onto the REST names at the ring door — the one
+  // place every device consumer comes through — so the local blotter and the
+  // break-even fold read the same number for the same tradeId, and
+  // lbNormOkxFill keeps its byte-for-byte engine parity. A row that carries no
+  // per-fill pair (every REST row) is passed through untouched.
+  function okxFillFillRow(o) {
+    if (!o || typeof o !== 'object') return o;
+    if (o.fillFee == null || o.fillFee === '') return o;
+    const r = Object.assign({}, o);
+    r.fee = o.fillFee;
+    if (o.fillFeeCcy != null && o.fillFeeCcy !== '') r.feeCcy = o.fillFeeCcy;
+    return r;
+  }
+  // #2507 the fee-bearing row the panel's break-even store folds. OKX reports
+  // the fee ON the execution frame, so a break-even that waits for the signed
+  // read waits for a number the socket handed it a second earlier. Through the
+  // SAME normalizer the poll lane uses: one reader, one exec-id space, no
+  // second parser — it owns the two conventions that quietly produce a
+  // plausible wrong number (a fee is NEGATIVE when charged → flipped to a
+  // positive cost, and `sz` is CONTRACTS on SWAP → × ctVal into the base units
+  // the divisor needs).
+  // FUTURES only: a spot fee is denominated in its own currency at that
+  // currency's scale and this lane holds no scale maps.
+  // Returns null unless the row can complete the fold ON ITS OWN — exec id,
+  // side, qty > 0, price > 0 AND a fee. A quantity with no fee folds a pool of
+  // zero and paints the venue average, which is the exact flicker this removes
+  // arriving from the other side; a cold contract spec is the same honest skip
+  // (okxCtSync fires the warm, the row still rings, and the ledger lane lands
+  // it a beat later).
+  function okxPushFeeRow(o, route) {
+    const sym = String((o && o.instId) || '');
+    if (!sym) return null;
+    const fr = okxFillFillRow(o);
+    // The pool is spread over base units and added to a PRICE, so it has to be
+    // quote-denominated. A linear USDT/USDC swap pays its fee in the quote
+    // currency; an inverse contract pays in the base coin, which would scale
+    // every break-even by a price — left to the ledger lane rather than
+    // guessed at here (the boards' catalog is linear-USDT-settled anyway).
+    const q = String(sym.split('-')[1] || '').toUpperCase();
+    const fc = String((fr && (fr.feeCcy || fr.fillFeeCcy)) || '').toUpperCase();
+    if (!q || !fc || fc !== q) return null;
+    // The side is read from the RAW frame: the normalizer defaults an unknown
+    // side to 'sell' (it is a display normalizer, not a validator), and folding
+    // a buy as a sell does not fail — it silently inverts the position.
+    const rs = String((fr && fr.side) || '').toLowerCase();
+    if (rs !== 'buy' && rs !== 'sell') return null;
+    let r = null;
+    try { r = lbNormOkxFill(fr, 'futures', okxCtSync(sym, route)); } catch (e) { return null; }
+    if (!r || r.kind !== 'trade' || !r.exec_id) return null;
+    if (r.side !== 'buy' && r.side !== 'sell') return null;
+    const fee = parseFloat(r.fee), qty = parseFloat(r.qty), px = parseFloat(r.exec_px);
+    if (!(Number.isFinite(fee) && fee > 0)) return null;   // no fee / a rebate
+    if (!(Number.isFinite(qty) && qty > 0)) return null;
+    if (!(Number.isFinite(px) && px > 0)) return null;
+    return r;
+  }
+  // Push-lane entry point: ONE raw `orders` fill row into this slot's ring.
+  // Called from okxPushEvApply, which has already applied the connection
+  // freshness guard and its per-session tradeId dedupe.
+  function okxPushFillRing(slot, mk, o) {
+    try {
+      const R = okxFillRing(String(slot || 'okx'));
+      okxFillPush(mk === 'spot' ? R.sp : R.fu, [okxFillFillRow(o)]);
+    } catch (e) { /* ring only — the display path already landed */ }
+  }
+  function okxFillTs(f) {
+    return parseInt((f && (f.ts || f.fillTime)) || 0, 10) || 0;
+  }
+  // Cached contract size for the drain's normalizer. A cold spec SKIPS the
+  // row this drain and fires a best-effort warm (the gate/KuCoin recipe —
+  // the raw row stays ringed and the next sweep normalizes it once the spec
+  // landed). Sizing a SWAP fill as if one contract were one coin would
+  // replay a position off by the whole multiplier, so guessing is not an
+  // option.
+  function okxCtSync(sym, route) {
+    const s = String(sym || '');
+    if (!s) return null;
+    const c = okxCtCache[s];
+    if (c && Date.now() - c.ts < PRODUCTS_TTL_MS) return c.v;
+    try { okxCtVal(s, route).catch(() => { /* warm */ }); } catch (e) {}
+    return null;
+  }
+  // Warm the contract specs a batch of raw SWAP rows needs, bounded per call
+  // (okxCtVal is TTL-cached, so a warm cache costs nothing).
+  async function okxCtWarm(rows, route, cap) {
+    const need = {};
+    for (const f of (rows || [])) {
+      const s = String((f && f.instId) || '');
+      if (!s) continue;
+      const c = okxCtCache[s];
+      if (c && Date.now() - c.ts < PRODUCTS_TTL_MS) continue;
+      need[s] = 1;
+    }
+    const syms = Object.keys(need).slice(0, cap > 0 ? cap : OKX_LIVE_CT_WARM_N);
+    for (const s of syms) { try { await okxCtVal(s, route); } catch (e) { /* next sweep */ } }
+  }
+  // ONE cursor walk for every OKX fill consumer (live poll, backfill,
+  // re-import): engine OkxAdapter._fills_walk twin. `after=billId` pages
+  // OLDER inside [begin,end]; `hist` selects the ~3-month archive endpoint
+  // over the ~7-day recent one. `full:true` = the page cap was hit with a
+  // full page still pending — the caller decides whether that is a gap note
+  // or a hard failure. Never throws.
+  async function okxFillsWalk(creds, instType, frm, to, route, maxPages, gapMs, hist) {
+    const rows = [];
+    let after = '';
+    let pages = 0;
+    const cap = maxPages > 0 ? maxPages : 1;
+    const path = hist ? '/api/v5/trade/fills-history' : '/api/v5/trade/fills';
+    for (let page = 0; page < cap; page++) {
+      const params = [['instType', instType], ['begin', String(Math.floor(frm))],
+                      ['end', String(Math.ceil(to))], ['limit', '100']];
+      if (after) params.push(['after', after]);
+      if (page && gapMs > 0) await new Promise((rs) => setTimeout(rs, gapMs));
+      let r;
+      try { r = await okxRequest(creds, 'GET', path, params, null, route); }
+      catch (e) { r = { ok: false, message: (e && e.message) || 'OKX fills fetch failed' }; }
+      pages++;
+      if (!r || !r.ok) {
+        return { ok: false, rows: rows, full: false, pages: pages,
+                 message: (r && r.message) || 'OKX ' + instType + ' fills fetch failed' };
+      }
+      const lst = (r.data || {}).data;
+      const pageRows = Array.isArray(lst) ? lst.filter((x) => x && typeof x === 'object') : [];
+      for (const f of pageRows) rows.push(f);
+      if (pageRows.length < 100) return { ok: true, rows: rows, full: false, pages: pages };
+      after = String((pageRows[pageRows.length - 1] || {}).billId || '');
+      // A FULL page with no usable cursor is a truncation, not the end of
+      // history — reporting it as complete is exactly how a partial history
+      // gets activated. `full` is the honest verdict either way.
+      if (!after) return { ok: true, rows: rows, full: true, pages: pages };
+    }
+    return { ok: true, rows: rows, full: true, pages: pages };   // cap hit
+  }
+  // Paced live refresh for ONE OKX slot. Single-flight + TTL-gated (N windows
+  // polling the same slot in one beat cost ONE fetch). Best-effort by design:
+  // a failed poll means no new rows this beat — the next beat and the gap
+  // backfill recover. PER-MARKET high-water marks: one shared mark would let
+  // a recent SWAP fill truncate the SPOT re-ask window.
+  async function lbOkxLive(venue, slot, route) {
+    if (venue !== 'okx') return;
+    const R = okxFillRing(slot);
+    if (R.busy) { try { await R.busy; } catch (e) {} return; }
+    const now = Date.now();
+    if ((now - (R.t || 0)) < OKX_LIVE_TTL_MS) return;
+    const creds = credsGet(slot);
+    if (!creds || !creds.key || !creds.pass) return;
+    R.t = now;
+    const p = (async () => {
+      for (const mk of ['spot', 'futures']) {
+        const key = mk === 'spot' ? 'spTs' : 'fuTs';
+        const F = mk === 'spot' ? R.sp : R.fu;
+        let frm = R[key] > 0 ? Math.max(0, R[key] - OKX_LIVE_OVERLAP_MS)
+                             : now - OKX_LIVE_COLD_MS;
+        frm = Math.min(Math.max(frm, now - OKX_RECENT_SPAN_MS), now);
+        const w = await okxFillsWalk(creds, mk === 'spot' ? 'SPOT' : 'SWAP',
+                                     frm, now + 1000, routeNorm(route),
+                                     OKX_LIVE_PAGES, OKX_PAGE_GAP_MS, false);
+        if (!w.ok) continue;                   // best-effort — next beat retries
+        okxFillPush(F, w.rows);
+        // the specs those SWAP rows need, fetched HERE rather than left to
+        // the drain's cold-skip: a symbol whose spec never warms is a row the
+        // drain skips on every pass until the ring evicts it.
+        if (mk === 'futures' && w.rows.length) await okxCtWarm(w.rows, routeNorm(route));
+        let hwm = R[key] || 0;
+        for (const f of w.rows) { const t = okxFillTs(f); if (t > hwm) hwm = t; }
+        R[key] = hwm > 0 ? hwm : Math.max(R[key] || 0, now - OKX_LIVE_OVERLAP_MS);
+      }
+    })();
+    R.busy = p;
+    try { await p; } catch (e) { /* best-effort */ }
+    if (R.busy === p) R.busy = null;
+  }
+  // Recent normalized live rows for the panel's fill chime / spot cost basis
+  // (the chart triangles read the local STORE). Read-only view of the ring —
+  // costs no REST call, so the account read stays exactly as expensive as
+  // before for slots that never touch the local blotter.
+  const OKX_LIVE_SHARE_N = 200;
+  function okxLiveFills(slot) {
+    const R = okxFillRings[String(slot)];
+    if (!R) return [];
+    const out = [];
+    for (const f of R.sp.rows) { const n = lbNormOkxFill(f, 'spot', null); if (n) out.push(n); }
+    for (const f of R.fu.rows) {
+      const n = lbNormOkxFill(f, 'futures', okxCtSync(f && f.instId, null));
+      if (n) out.push(n);
+    }
+    out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    return out.length > OKX_LIVE_SHARE_N ? out.slice(out.length - OKX_LIVE_SHARE_N) : out;
+  }
+
   // OKX native account read (#1716): signed GETs mirroring OkxAdapter's REST
   // state seed — one /account/balance (spot wallets + the unified USDT that
   // backs the futures account), /account/positions?instType=SWAP, pending
@@ -15289,6 +16099,26 @@ function createTradeNative(opts) {
     if (!creds) return { ok: false, message: 'No API key on this device — provision Native trading first' };
     if (!creds.pass) return { ok: false, message: 'OKX API passphrase missing — re-provision Native trading on this device' };
     const route = routeNorm(intent.route);
+    // #2505: acct reads keep the private + business push sockets warm (push-
+    // driven display) — no-op while the loops already run. The read then
+    // RE-ATTACHES push fills to the fresh snapshot panel-side, and its
+    // /trade/orders-algo-pending leg below stays the reconcile that covers a
+    // degraded business socket.
+    try { okxPushEnsure(intent.credSlot || 'okx', creds, route); } catch (e) { /* REST-only */ }
+    // #2506 pump the LIVE fill lane on the account beat. The account read is
+    // the one beat that ALWAYS runs, so it is the honest place to drive the
+    // device-local fill poll: without it a normal trading session (trades
+    // panel closed, no backfill in flight) would record only the push rows
+    // and lose every fill the socket missed. Gated on intent.lblot (the panel
+    // sends it only while the local blotter is ACTIVE for OKX), started in
+    // PARALLEL with the account legs and awaited just before the reply: a
+    // slot that never uses the local blotter pays exactly zero extra REST
+    // calls, and one that does pays no extra wall-clock. lbOkxLive keeps its
+    // own single-flight + TTL, so N windows on one slot cost ONE pass.
+    const _lbSlot = intent.credSlot || 'okx';
+    const lbPump = intent.lblot
+      ? lbOkxLive('okx', _lbSlot, route).catch(() => {})
+      : null;
     const bal = await okxRequest(creds, 'GET', '/api/v5/account/balance', null, null, route);
     if (!bal.ok) return bal;
     const pos = await okxRequest(creds, 'GET', '/api/v5/account/positions',
@@ -15332,10 +16162,25 @@ function createTradeNative(opts) {
         if (!after) break;
       }
     }
-    return { ok: true,
+    // #2506 additive: recent LOCAL fills for this credential slot (empty
+    // unless the local blotter lane has warmed the rings for this slot). The
+    // panel only reads it while the local blotter is ACTIVE for OKX —
+    // capability alone must never suppress the server fills.
+    if (lbPump) await lbPump;   // fills polled alongside the acct legs
+    const out = { ok: true,
              balance: ((bal.data || {}).data) || [],
              positions: ((pos.data || {}).data) || [],
              futOrders: fo.rows, spotOrders: so.rows, algoOrders: algos };
+    // …and once the rings EXIST for this slot the payload carries them on
+    // EVERY read, whether or not THIS intent asked to pump (acct-read memo
+    // rule: the shell guard memoises on venue|credSlot ALONE, so a window
+    // that has not warmed its local blotter would otherwise serve its
+    // lbFills-less reply to every window that DID ask — blanking their fill
+    // chime and spot cost basis). Reading the rings is a pure in-memory read,
+    // and they only exist once the local lane has run for this slot, so a
+    // slot that never uses it keeps a byte-identical payload.
+    if (lbPump || okxFillRings[_lbSlot]) out.lbFills = okxLiveFills(_lbSlot);
+    return out;
   }
 
   // Gate native account read (#1716): signed GETs mirroring GateAdapter's
@@ -17016,6 +17861,97 @@ function createTradeNative(opts) {
     return _dgLine(out);
   }
 
+  // #2508 OKX futures leverage GET/SET, device-signed through okxRequest (the
+  // OkxAdapter.leverage_config / set_leverage twin). Three things OKX asks for
+  // that its siblings do not:
+  //   • mgnMode is REQUIRED on the read AND the write — OKX has no single
+  //     "account leverage", only cross leverage and isolated leverage, and it
+  //     rejects the call outright without one. The mode comes from the
+  //     symbol's own open position; flat falls back to cross (okxPosMgnMode).
+  //   • in long/short (hedge) position mode an ISOLATED write also needs
+  //     posSide, and OKX applies it to that leg ALONE — so both legs are
+  //     written and the chip's single per-symbol number stays true for
+  //     whichever leg is traded next. Cross covers both legs in one call, and
+  //     net mode has no posSide at all.
+  //   • success is the STRING code '0'; okxRequest already enforces exactly
+  //     that and folds sCode/sMsg into its message, so a venue rejection
+  //     reaches the chip as text instead of a silent no-op.
+  // The reply's leverage is READ BACK off the venue after the write, never
+  // echoed from the request: the chip must show what OKX now holds.
+  async function execOkxLeverage(intent) {
+    const _dgT0 = Date.now();
+    const _dgLine = (res) => {
+      tdiag('lev', 'native_op', { v: 'okx',
+        k: String(intent.symbol || ''),
+        what: intent.what === 'set' ? 'set' : 'get',
+        sym: String(intent.symbol || '').toUpperCase(),
+        mgn: res && res.mgnMode ? String(res.mgnMode) : undefined,
+        ok: res && res.ok ? 1 : 0,
+        lev: res && res.ok ? String(res.leverage || '') : undefined,
+        err: res && !res.ok ? String(res.message || 'error') : undefined,
+        ms: Date.now() - _dgT0 });
+      return res;
+    };
+    const creds = credsGet(intent.credSlot || 'okx');
+    if (!creds) return _dgLine({ ok: false, message: 'No API key on this device — provision Native trading first' });
+    if (!creds.pass) return _dgLine({ ok: false, message: 'OKX API passphrase missing — re-provision Native trading on this device' });
+    const route = routeNorm(intent.route);
+    const sym = String(intent.symbol || '');
+    if (!sym) return _dgLine({ ok: false, message: 'symbol required' });
+    // Which margin mode is in force for THIS instrument (see okxPosMgnMode).
+    const mgnRead = async () => {
+      const r = await okxRequest(creds, 'GET', '/api/v5/account/positions',
+                                 [['instType', 'SWAP'], ['instId', sym]], null, route);
+      if (!r.ok) return r;
+      return { ok: true, mgn: okxPosMgnMode(r.data, sym) };
+    };
+    // …and what the venue holds for that mode right now (engine leverage_config
+    // parity: the first positive lever, null when it reports none).
+    const levRead = async (mgn) => {
+      const r = await okxRequest(creds, 'GET', '/api/v5/account/leverage-info',
+                                 [['instId', sym], ['mgnMode', mgn]], null, route);
+      if (!r.ok) return r;
+      return { ok: true, lev: okxLevInfoPick(r.data) };
+    };
+    const m = await mgnRead();
+    if (!m.ok) return _dgLine(m);
+    const mgn = m.mgn;
+    if (intent.what !== 'set') {
+      const c = await levRead(mgn);
+      if (!c.ok) return _dgLine(c);
+      return _dgLine({ ok: true, symbol: sym, leverage: c.lev, mgnMode: mgn });
+    }
+    const lev = parseFloat(intent.leverage);
+    if (!isFinite(lev) || lev < 1) return _dgLine({ ok: false, message: 'Leverage must be at least 1x' });
+    if (Math.floor(lev) !== lev) return _dgLine({ ok: false, message: 'Leverage must be a whole number' });
+    // posSide rides ONLY an isolated write in long/short mode — sending it in
+    // net mode is a rejection, omitting it there changes one leg silently.
+    let sides = [null];
+    if (mgn === 'isolated') {
+      const cf = await okxRequest(creds, 'GET', '/api/v5/account/config', null, null, route);
+      if (!cf.ok) return _dgLine(cf);
+      if (okxHedgeMode(cf.data)) sides = ['long', 'short'];
+    }
+    for (const ps of sides) {
+      const body = { instId: sym, lever: String(lev), mgnMode: mgn };
+      if (ps) body.posSide = ps;
+      const w = await okxRequest(creds, 'POST', '/api/v5/account/set-leverage', null, body, route);
+      // Stop on the first rejection and say so: a half-applied pair that
+      // reported success would leave the chip claiming a leverage one leg is
+      // not using.
+      if (!w.ok) return _dgLine(w);
+    }
+    const c = await levRead(mgn);
+    if (!c.ok) return _dgLine(c);
+    // An accepted write is NOT a confirmed leverage. The chip paints the
+    // leverage AND the two figures derived from it, so substituting the
+    // requested number when the venue reports none would show a position limit
+    // nothing confirmed — say so instead and leave the chip alone.
+    if (!c.lev) return _dgLine({ ok: false, mgnMode: mgn,
+      message: 'OKX took the change but did not report the new leverage — chip left as it was; check the leverage on OKX' });
+    return _dgLine({ ok: true, symbol: sym, leverage: c.lev, mgnMode: mgn });
+  }
+
   // #1844 own-trade HISTORY BACKFILL (device-keyed re-import source): page
   // the venue's own-trades REST over a caller-supplied [frm, to] window and
   // return the RAW rows in the SAME shapes the live ingest posts (Kraken:
@@ -17925,6 +18861,15 @@ function createTradeNative(opts) {
       const s = phFillRings[slot];
       return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
     }
+    if (venue === 'okx') {
+      // #2506: the SAME two per-market rings carry the private-WS `orders`
+      // executions and the paced REST fills poll (one side-inclusive
+      // tradeId|side seen-set), so the no-news gate and the incremental
+      // cursor work exactly as they do for the push venues. BARE RINGS —
+      // see the shape warning above; `rn` here would freeze the signature.
+      const s = okxFillRings[slot];
+      return s ? lbSrcVer(s.sp) + '/' + lbSrcVer(s.fu) : '-';
+    }
     return '-';
   }
   const _lbDrainAt = {};    // slot → { t, sig } (#2230 no-news gate)
@@ -18111,6 +19056,24 @@ function createTradeNative(opts) {
           return lbNormLtFill(r, sym);
         });
       }
+    } else if (venue === 'okx') {
+      // #2506: two per-market rings fed by BOTH the private-WS `orders`
+      // executions and the paced REST fills poll (lbOkxLive). Rows are RAW
+      // venue rows and the market comes from the RING, never from the row:
+      // the WS delta and the REST row are shape-identical apart from
+      // instType, and a wrong market would size a SWAP row as spot.
+      // ⚠️ EVERY SWAP size OKX reports is in CONTRACTS. ctVal comes from the
+      // shell instrument cache and a cold entry SKIPS the row this drain and
+      // fires a best-effort warm (gate/HL/KuCoin recipe — the raw row stays
+      // ringed and the retry sweep normalizes it once the spec landed).
+      // Storing a contract count as a coin quantity would misprice the whole
+      // downstream chain.
+      const R = okxFillRings[slot];
+      if (R) {
+        ring('okx.sp', R.sp, (r) => lbNormOkxFill(r, 'spot', null));
+        ring('okx.fu', R.fu, (r) => lbNormOkxFill(r, 'futures',
+                                                  okxCtSync(r && r.instId, null)));
+      }
     }
     cur.skip = skipped;
     if (aid) for (const f of fills) f.aid = aid;
@@ -18153,7 +19116,7 @@ function createTradeNative(opts) {
     }
     return added;
   }
-  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex' || venue === 'lighter' || venue === 'phemex'; }
+  function lbVenueOk(venue) { return venue === 'kraken' || venue === 'binance' || venue === 'hyperliquid' || venue === 'bybit' || venue === 'gate' || venue === 'bitget' || venue === 'kucoin' || venue === 'asterdex' || venue === 'lighter' || venue === 'phemex' || venue === 'okx'; }
   // #2012 HL spot symbol map warm-up: best-effort, TTL-cached, never fatal —
   // an unmapped '@N' spot coin stores raw this drain and self-heals on the
   // next one (drain re-normalizes the cached raw rows every poll).
@@ -18169,6 +19132,7 @@ function createTradeNative(opts) {
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
     await lbPhLive(venue, slot, intent.route);   // #2385 Phemex REST live lane
+    await lbOkxLive(venue, slot, intent.route);   // #2506 OKX REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     const t0 = lbT();
@@ -18338,6 +19302,7 @@ function createTradeNative(opts) {
     await lbBgLive(venue, slot, intent.route);   // #2246 Bitget REST live lane
     await lbKcLive(venue, slot, intent.route);   // #2272 KuCoin REST live lane
     await lbPhLive(venue, slot, intent.route);   // #2385 Phemex REST live lane
+    await lbOkxLive(venue, slot, intent.route);   // #2506 OKX REST live lane
     const added = lbDrain(slot, venue);
     const sc = lbScope(slot);
     if (venue === 'lighter') ltLblotRedialClear(slot, sc);   // #2327
@@ -19217,6 +20182,110 @@ function createTradeNative(opts) {
         _dgFutRows = cl.raw;
         _dgFetched = cl.fills.length;
         added = lbScopeMerge(sc, cl.fills);
+      } else if (venue === 'okx') {
+        // #2506 OKX: fills are ACCOUNT-WIDE (every row carries its instId),
+        // so there is no symbol universe to resolve — ONE cursor walk per
+        // instType covers the whole market. TWO endpoints, because OKX splits
+        // its own history:
+        //   • /trade/fills          — the recent window (~7 days). The only
+        //     place a fill from the last few minutes is guaranteed to be.
+        //   • /trade/fills-history  — the archive (~3 months), where anything
+        //     older than that window lives. Same params, same row shape.
+        // Both are walked whenever the window reaches past the recent
+        // horizon; the store's exactly-once merge absorbs the overlap.
+        // Coverage honesty: a call cap hit, a walk that could not prove it
+        // reached the end of history, or a SWAP row the shell cannot size in
+        // base units is covOk:false — the panel then KEEPS the server blotter
+        // and shows the warning chip instead of activating over a hole.
+        // Budgets sized for the FIRST SYNC, which is the ~3-month walk below:
+        // four walks (2 markets x 2 endpoints) of 100-row pages, paced. A
+        // budget that cannot cover a normal 3-month history would report
+        // covOk:false forever and the venue would never activate.
+        const OKX_BF_PAGE_CAP = 120;  // across both markets AND both endpoints
+        const OKX_BF_PAGES = 40;      // per walk (~4000 fills)
+        let pages = 0;
+        let failMsg = null;
+        const raw = [];               // [market, rawRow] pairs
+        for (const mkt of ['futures', 'spot']) {
+          if (failMsg) break;
+          const it = mkt === 'spot' ? 'SPOT' : 'SWAP';
+          // PER-MARKET window, and a first sync anchored on the ARCHIVE
+          // horizon — NOT the shared 7-day empty-store default the other
+          // venues use. Activation hides the server blotter, so seeding one
+          // week and calling coverage OK would take three months of trades
+          // and chart arrows off the screen the moment OKX went local.
+          const hwm = lbHwm(sc.rows.filter((f) => f.market === mkt), null);
+          let frm;
+          if (!(hwm > 0)) {
+            frm = now - OKX_ARCH_SPAN_MS;
+            gap = true;
+            notes.push('no local ' + mkt + ' history — seeded the full OKX ~3-month archive');
+          } else {
+            frm = hwm - LB_BF_OVERLAP_MS;
+            if (frm < now - OKX_ARCH_SPAN_MS) {
+              frm = now - OKX_ARCH_SPAN_MS + 60000;
+              gap = true;
+              notes.push(mkt + ' history older than the OKX 3-month archive horizon — a gap is possible');
+            }
+          }
+          frm = Math.max(0, Math.floor(frm));
+          // recent endpoint first (freshest), then the archive for the part
+          // of the window the recent one cannot answer.
+          const legs = [{ hist: false, frm: Math.max(frm, now - OKX_RECENT_SPAN_MS) }];
+          if (frm < now - OKX_RECENT_SPAN_MS) legs.push({ hist: true, frm: frm });
+          for (const lg of legs) {
+            if (pages >= OKX_BF_PAGE_CAP) {
+              gap = true; covOk = false;
+              notes.push(mkt + ' fill history exceeded the call cap — history is incomplete');
+              break;
+            }
+            const w = await okxFillsWalk(creds, it, lg.frm, now + 1000, route,
+                                         Math.min(OKX_BF_PAGES, OKX_BF_PAGE_CAP - pages),
+                                         HB_PAGE_GAP_MS, lg.hist);
+            pages += w.pages | 0;
+            if (!w.ok) { failMsg = w.message || 'OKX fills fetch failed'; break; }
+            for (const f of w.rows) raw.push([mkt, f]);
+            if (w.full) {
+              // the walk stopped on a FULL page it could not page past: the
+              // depth of this window is unproven, so the history is not
+              // provably complete. Never a silent success.
+              gap = true; covOk = false;
+              notes.push(mkt + ' fill history deeper than the page budget — history is incomplete');
+            }
+          }
+        }
+        if (failMsg) {
+          sc.bf = { ts: now, ok: false, msg: failMsg };
+          lbSaveSoon();
+          tdiag('lblot', 'backfill', { k: slot, v: venue, ok: 0, ms: Date.now() - now, err: String(failMsg) });
+          return { ok: false, message: failMsg };
+        }
+        // contract specs for every SWAP symbol the walk returned. A row the
+        // shell cannot size in BASE units is NEVER stored in contracts — it
+        // is dropped and named, and coverage goes not-OK.
+        const rawFut = [];
+        for (const p of raw) if (p[0] === 'futures') rawFut.push(p[1]);
+        if (rawFut.length) await okxCtWarm(rawFut, route, 40);
+        const fills = [];
+        const noSpec = {};
+        for (const p of raw) {
+          const mkt = p[0], f = p[1];
+          const cv = mkt === 'futures' ? okxCtSync(f && f.instId, route) : null;
+          const n = lbNormOkxFill(f, mkt, cv);
+          if (n) fills.push(n);
+          else if (mkt === 'futures' && !cv) noSpec[String((f && f.instId) || '?')] = 1;
+        }
+        const missing = Object.keys(noSpec);
+        if (missing.length) {
+          gap = true; covOk = false;
+          notes.push('contract size unavailable for ' + missing.slice(0, 4).join(', ')
+                     + (missing.length > 4 ? ' +' + (missing.length - 4) + ' more' : '')
+                     + ' — those fills could not be sized');
+        }
+        _dgFutRows = rawFut.length;
+        _dgSpotRows = raw.length - rawFut.length;
+        _dgFetched = fills.length;
+        added = lbScopeMerge(sc, fills);
       } else {
         const futFrm = bfFrm('futures', 'futures');
         // spot watermarks: max numeric exec id per locally-known spot symbol
@@ -19770,6 +20839,60 @@ function createTradeNative(opts) {
         for (const n of cl.notes) notes.push(n);
         riFutRows = cl.raw;
         for (const f of cl.fills) fills.push(f);
+      } else if (venue === 'okx') {
+        // #2506 OKX: the backfill's walks over the EXPLICIT window. Fills are
+        // account-wide, so one cursor walk per instType covers a market; the
+        // recent (~7d) and archive (~3-month) endpoints are both walked when
+        // the window spans them. Venue-truth contract — a truncated fetch of
+        // ANY kind fails VISIBLY (riFail), never a short history reported as
+        // a success, because a re-import REPLACES the window's rows.
+        const OKX_RI_PAGE_CAP = 80;
+        const OKX_RI_PAGES = 40;
+        let pages = 0;
+        const rawOkx = [];   // [market, rawRow] pairs
+        let okxFutN = 0, okxSpotN = 0;
+        const mkts = market === 'spot' ? ['spot']
+          : market === 'futures' ? ['futures'] : ['futures', 'spot'];
+        for (const mkt of mkts) {
+          const it = mkt === 'spot' ? 'SPOT' : 'SWAP';
+          const frm0 = Math.max(0, Math.floor(w.frm));
+          if (frm0 < Date.now() - OKX_ARCH_SPAN_MS) {
+            return riFail('Window starts before the OKX 3-month fill archive — narrow the date range');
+          }
+          const legs = [{ hist: true, frm: frm0 }];
+          // the recent endpoint is the only one guaranteed to hold a fill
+          // from the last few minutes, so a window that reaches into the
+          // recent horizon walks it too (the merge absorbs the overlap).
+          if (w.to > Date.now() - OKX_RECENT_SPAN_MS) {
+            legs.push({ hist: false, frm: Math.max(frm0, Date.now() - OKX_RECENT_SPAN_MS) });
+          }
+          for (const lg of legs) {
+            if (pages >= OKX_RI_PAGE_CAP) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            if (pages) await sleep(HB_PAGE_GAP_MS);
+            const wk = await okxFillsWalk(creds, it, lg.frm, w.to, route,
+                                          Math.min(OKX_RI_PAGES, OKX_RI_PAGE_CAP - pages),
+                                          HB_PAGE_GAP_MS, lg.hist);
+            pages += wk.pages | 0;
+            if (!wk.ok) return riFail(wk.message || 'OKX fills fetch failed');
+            if (wk.full) return riFail('Window too large — fill history exceeds the page cap; narrow the date range');
+            for (const f of wk.rows) rawOkx.push([mkt, f]);
+            if (mkt === 'spot') okxSpotN += wk.rows.length; else okxFutN += wk.rows.length;
+          }
+        }
+        const riFut = [];
+        for (const p of rawOkx) if (p[0] === 'futures') riFut.push(p[1]);
+        if (riFut.length) await okxCtWarm(riFut, route, 60);
+        for (const p of rawOkx) {
+          const mkt = p[0], f = p[1];
+          const cv = mkt === 'futures' ? okxCtSync(f && f.instId, route) : null;
+          if (mkt === 'futures' && !cv) {
+            return riFail('OKX contract size unavailable for ' + String((f && f.instId) || '?')
+                          + ' — cannot size its fills; retry shortly');
+          }
+          const n = lbNormOkxFill(f, mkt, cv);
+          if (n) fills.push(n);
+        }
+        riFutRows = okxFutN; riSpotRows = okxSpotN;
       } else {
         // binance: shell-signed time-window paging (never a raw host request
         // — bnRequest rides the httpJson bnBan freeze latch). bnReq twin of
@@ -19932,6 +21055,7 @@ function createTradeNative(opts) {
       if (intent.venue === 'kucoin') return await execKucoinLeverage(intent);   // #2272
       if (intent.venue === 'asterdex') return await execAsterLeverage(intent);   // #2307
       if (intent.venue === 'phemex') return await execPhemexLeverage(intent);   // #2384
+      if (intent.venue === 'okx') return await execOkxLeverage(intent);   // #2508
       return { ok: false, message: 'leverage not supported for this venue' };
     }
     // #1844 own-trade history backfill (re-import source) — kraken/phemex
@@ -20074,7 +21198,25 @@ function createTradeNative(opts) {
         }
         return r;
       }
-      if (intent.venue === 'okx') return await execOkx(creds, intent, route);
+      if (intent.venue === 'okx') {
+        const r = await execOkx(creds, intent, route);
+        // #2505: a successful trade ack kicks the push lanes awake (no-op
+        // while the loops run) and stamps an optimistic mutation so the
+        // badge/posrow read fires immediately after the REST ack. Market-
+        // scoped — OKX spot and swap rows land in different push scopes, and
+        // an algo cancel carries the 'algo:<algoId>' namespace its badge uses.
+        if (r && r.ok) {
+          try { okxPushEnsure(intent.credSlot || 'okx', creds, route); }
+          catch (e) { /* REST path */ }
+          try {
+            const omk = intent.market === 'spot' ? 'spot' : 'futures';
+            if (intent.op === 'cancel' && intent.orderID) {
+              okxMutKick(intent.credSlot || 'okx', 'ordgone', String(intent.orderID), omk);
+            } else okxMutKick(intent.credSlot || 'okx', 'order', null, omk);
+          } catch (e) { /* diag-only */ }
+        }
+        return r;
+      }
       if (intent.venue === 'gate') {
         const r = await execGate(creds, intent, route);
         // #2153: a successful trade ack kicks the push lane awake (no-op
@@ -20332,6 +21474,21 @@ function createTradeNative(opts) {
             if (!sn2 || sn2.base !== 'hyperliquid') continue;
             const c = credsGet(k);
             if (c) { try { hlPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // #2505: same one-time kick for the OKX private push sockets (TWO
+      // conns — orders/positions/account on the private endpoint, orders-algo
+      // on the business one); loops self-maintain and the business half is
+      // degraded-not-fatal.
+      if (venue === 'okx') {
+        try {
+          const all = credsLoadAll();
+          for (const k of Object.keys(all)) {
+            const sn2 = tnSlotNorm(k);
+            if (!sn2 || sn2.base !== 'okx') continue;
+            const c = credsGet(k);
+            if (c) { try { okxPushEnsure(k, c, route); } catch (e) { /* REST path */ } }
           }
         } catch (e) { /* non-fatal */ }
       }
@@ -20855,6 +22012,7 @@ module.exports = {
   bybPositionRows,
   okxSign,
   okxTs,
+  okxWsLoginSig,
   okxErrorMessage,
   okxContracts,
   okxClOrdId,
@@ -20862,6 +22020,9 @@ module.exports = {
   okxAlgoBody,
   okxBaseQty,
   okxPositionRows,
+  okxPosMgnMode,
+  okxHedgeMode,
+  okxLevInfoPick,
   okxCancelGone,
   gateBodyHash,
   gateSign,
@@ -21085,6 +22246,8 @@ module.exports = {
   lbPhCurScale,
   lbNormPhemexFut,
   lbNormPhemexSpot,
+  // pure — #2506 OKX device-local blotter normalizer (engine norm_okx_fill twin)
+  lbNormOkxFill,
   lbFillKey,
   lbScopeMerge,
   lbHwm,
